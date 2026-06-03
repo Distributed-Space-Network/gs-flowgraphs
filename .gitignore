@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# CMake / build
+build/
+*.o
+*.so
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
