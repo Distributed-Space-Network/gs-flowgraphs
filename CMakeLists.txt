@@ -44,11 +44,23 @@ install(
     apps/stub_tx.py
     apps/amateur_fm_narrowband_rx.py
     apps/amateur_fm_narrowband_tx.py
+    apps/cubesat_gfsk_ax25_rx.py
+    apps/cubesat_gfsk_ax25_tx.py
   DESTINATION ${GS_APPS_INSTALL_DIR}
 )
 install(
-  FILES apps/_spawn_contract.py
+  FILES
+    apps/_spawn_contract.py
+    apps/gnuradio_gfsk.py            # bench engine helper (imported only by --engine gnuradio)
   DESTINATION ${GS_APPS_INSTALL_DIR}
+)
+# Shared pure-Python DSP + AX.25 protocol library used by the cubesat apps
+# (and by the gnuradio engine's deframer). Staged next to the app scripts so
+# ``from gfsk_ax25 import ...`` resolves at runtime, like ``_spawn_contract``.
+install(
+  DIRECTORY apps/gfsk_ax25
+  DESTINATION ${GS_APPS_INSTALL_DIR}
+  FILES_MATCHING PATTERN "*.py"
 )
 
 # add_subdirectory(lib) — reserved for future C++ blocks

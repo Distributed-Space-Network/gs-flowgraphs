@@ -1,0 +1,44 @@
+# gs-flowgraphs Python tooling.
+#
+# The flowgraphs themselves are plain scripts under apps/ (installed via CMake,
+# run by GNU Radio / numpy at the bench). This file exists only to declare the
+# dev/test toolchain for the pure-Python DSP library (apps/gfsk_ax25) so the
+# modulate->demodulate->deframe chain can be unit-tested without an SDR.
+#
+# License: GPLv3 (see COPYING).
+
+[project]
+name = "gs-flowgraphs-dsp"
+version = "0.1.0"
+description = "Pure-numpy DSP + AX.25 protocol library for the DSN ground-station flowgraphs"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+pythonpath = ["apps"]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Legacy Phase-3/5 apps predate this tooling (and the GR ones aren't import-safe
+# without gnuradio); left untouched here. The new gfsk_ax25 library + cubesat
+# apps + tests are linted.
+extend-exclude = [
+  "build",
+  "apps/stub_rx.py",
+  "apps/stub_tx.py",
+  "apps/_spawn_contract.py",
+  "apps/amateur_fm_narrowband_rx.py",
+  "apps/amateur_fm_narrowband_tx.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["gfsk_ax25"]

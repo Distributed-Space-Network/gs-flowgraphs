@@ -21,12 +21,46 @@ gs-flowgraphs/
 ├── README.md
 ├── COPYING                       # GPLv3 full text
 ├── CMakeLists.txt                # ``install``-only at present
+├── pyproject.toml                # dev/test toolchain for the pure-Python DSP lib
+├── tests/                        # pytest suite for apps/gfsk_ax25 (numpy/scipy)
 └── apps/
     ├── _spawn_contract.py        # NDJSON sockets, argparse, command loop
     ├── stub_rx.py                # Python placeholder for orchestrator E2E tests
     ├── stub_tx.py                # Python placeholder for orchestrator E2E tests
     ├── amateur_fm_narrowband_rx.py   # real NBFM receive (Phase 5)
-    └── amateur_fm_narrowband_tx.py   # real NBFM transmit (Phase 5, test-tone)
+    ├── amateur_fm_narrowband_tx.py   # real NBFM transmit (Phase 5, test-tone)
+    ├── cubesat_gfsk_ax25_rx.py   # 2-GFSK/AX.25 9k6 receive (dsp | gnuradio engines)
+    ├── cubesat_gfsk_ax25_tx.py   # 2-GFSK/AX.25 9k6 transmit (dsp | gnuradio engines)
+    ├── gnuradio_gfsk.py          # GNU Radio front-end for the cubesat apps (bench engine)
+    └── gfsk_ax25/                # shared, unit-tested DSP + AX.25 protocol library
+```
+
+## Cubesat 2-GFSK / AX.25 (9k6) waveform
+
+`cubesat_gfsk_ax25_{rx,tx}.py` implement an EnduroSat-class UHF link: 2-GFSK
+(h≈0.5, BT≈0.5), a 12 480 sym/s channel (~9 600 bps user, no FEC), G3RUH
+scrambling + NRZI, AX.25 UI framing over HDLC, ~18.7 kHz occupied bandwidth at
+401.5 MHz. The link parameters live in
+[`apps/gfsk_ax25/endurosat.py`](apps/gfsk_ax25/endurosat.py).
+
+**Two interchangeable engines**, chosen by `--engine {dsp,gnuradio}`, the
+`GS_FLOWGRAPH_ENGINE` env var, or a params-file `engine` key (default `dsp`):
+
+* **`dsp`** — pure numpy/scipy modem in `apps/gfsk_ax25` (modulate, demodulate,
+  Gardner timing recovery, scramble/NRZI/HDLC/AX.25). Needs no SDR or GNU Radio;
+  IQ comes from SoapySDR (`--sdr-args driver=...`) or a `cf32` file
+  (`--sdr-args file:/path.cf32`). The whole chain is unit-tested.
+* **`gnuradio`** — GNU Radio front-end (`gnuradio_gfsk.py`) for the bench, which
+  hands the recovered bitstream to the **same** `gfsk_ax25.framing` deframer, so
+  both engines decode identically. Bench-validate as in the NBFM recipe below.
+
+Run the DSP library tests (proves a frame survives modulate → channel with
+AWGN/Doppler/timing → demodulate → deframe):
+
+```bash
+python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+pytest
 ```
 
 Reserved for later phases:
