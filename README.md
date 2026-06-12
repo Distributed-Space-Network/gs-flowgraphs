@@ -32,8 +32,23 @@ gs-flowgraphs/
     ├── cubesat_gfsk_ax25_rx.py   # 2-GFSK/AX.25 9k6 receive (dsp | gnuradio engines)
     ├── cubesat_gfsk_ax25_tx.py   # 2-GFSK/AX.25 9k6 transmit (dsp | gnuradio engines)
     ├── gnuradio_gfsk.py          # GNU Radio front-end for the cubesat apps (bench engine)
+    ├── satellite_rx.py           # multi-mission gr-satellites receiver (bench)
+    ├── gnuradio_satellites.py    # gr-satellites bridge -> spawn contract (bench)
     └── gfsk_ax25/                # shared, unit-tested DSP + AX.25 protocol library
 ```
+
+## Multi-mission decoding (gr-satellites)
+
+To be "prepared for everything", non-EnduroSat missions decode via **gr-satellites**
+(GPLv3) — the canonical library of public satellite framers/deframers across
+AFSK/FSK/GFSK/BPSK/GMSK/… with AX.25/AX.100/Mobitex/CCSDS/… framings. We *integrate*
+it rather than reimplement it: `satellite_rx.py` is a spawn-contract app that runs
+gr-satellites for a selected `satellite` (SatYAML id) and emits decoded frames, via
+the `gnuradio_satellites.py` bridge. **Bench-pending** (needs GNU Radio +
+gr-satellites + gr-soapy). Design + licensing (gr-satellites GPLv3; *not* the AGPL
+gr-satnogs/satnogs-client): see `../docs/07-multi-mission-framing.md`. The EnduroSat
+mission keeps its dedicated, tested `dsp` path (`cubesat_gfsk_ax25_rx.py
+--framing endurosat`).
 
 ## Cubesat 2-GFSK / AX.25 (9k6) waveform
 

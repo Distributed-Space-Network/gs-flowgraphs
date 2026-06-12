@@ -46,12 +46,14 @@ install(
     apps/amateur_fm_narrowband_tx.py
     apps/cubesat_gfsk_ax25_rx.py
     apps/cubesat_gfsk_ax25_tx.py
+    apps/satellite_rx.py             # multi-mission gr-satellites receiver (bench)
   DESTINATION ${GS_APPS_INSTALL_DIR}
 )
 install(
   FILES
     apps/_spawn_contract.py
     apps/gnuradio_gfsk.py            # bench engine helper (imported only by --engine gnuradio)
+    apps/gnuradio_satellites.py      # gr-satellites bridge (imported by satellite_rx at decode time)
   DESTINATION ${GS_APPS_INSTALL_DIR}
 )
 # Shared pure-Python DSP + AX.25 protocol library used by the cubesat apps
