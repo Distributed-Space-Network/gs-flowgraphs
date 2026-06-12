@@ -35,7 +35,7 @@ from _spawn_contract import (
     send_event,
 )
 
-from gfsk_ax25 import ax25, endurosat
+from gfsk_ax25 import ax25, endurosat, endurosat_link
 
 VERSION = "0.1.0"
 _DEFAULT_SAMPLE_RATE = 96_000
@@ -51,6 +51,17 @@ def _select_engine(args, params: dict[str, object]) -> str:
     return engine if engine in ("dsp", "gnuradio") else "dsp"
 
 
+def _select_framing(params: dict[str, object]) -> str:
+    """ax25 (default) | endurosat (chip-packet). For endurosat the uplink payload
+    is the already-built (encrypted AirMAC) frame, sent verbatim in the packet."""
+    framing = (
+        os.environ.get("GS_FLOWGRAPH_FRAMING", "")
+        or (str(params.get("framing", "")) if isinstance(params, dict) else "")
+        or "ax25"
+    ).lower()
+    return framing if framing in ("ax25", "endurosat") else "ax25"
+
+
 def _uplink_payload(args, params: dict[str, object]) -> bytes:
     b64 = params.get("uplink_b64")
     if isinstance(b64, str) and b64:
@@ -63,13 +74,24 @@ def _uplink_payload(args, params: dict[str, object]) -> bytes:
 
 def _build_frame_iq(args, params: dict[str, object], profile) -> np.ndarray:
     payload = _uplink_payload(args, params)
-    payload = payload[: endurosat.AX25_INFO_MAX_BYTES]
+    sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
+    if _select_framing(params) == "endurosat":
+        # Uplink payload is the already-built (encrypted AirMAC) frame; wrap it in
+        # the EnduroSat chip packet (preamble + sync + len + CRC-16) at 9600 sym/s
+        # (endurosat_link defaults), honouring params overrides if present.
+        sym_hz = float(params.get("symbol_rate_hz", endurosat_link.DEFAULT_SYMBOL_RATE_HZ))
+        return endurosat_link.transmit(
+            payload[: endurosat_link.MAX_PAYLOAD],
+            sample_rate,
+            symbol_rate_hz=sym_hz,
+            mod_index=float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
+            bt=float(params.get("bt", endurosat_link.DEFAULT_BT)),
+        )
     body = ax25.encode_ui(
         dest=str(params.get("dest", "CQ")),
         src=str(params.get("src", "DSN")),
-        info=payload,
+        info=payload[: endurosat.AX25_INFO_MAX_BYTES],
     )
-    sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
     return endurosat.transmit(body, sample_rate, profile=profile)
 
 

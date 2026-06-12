@@ -19,4 +19,14 @@ License: GPLv3 (see ``../../COPYING``).
 
 from __future__ import annotations
 
-__all__ = ["ax25", "endurosat", "fcs", "framing", "g3ruh", "gfsk", "hdlc"]
+__all__ = [
+    "ax25",
+    "crc",
+    "endurosat",
+    "endurosat_link",
+    "fcs",
+    "framing",
+    "g3ruh",
+    "gfsk",
+    "hdlc",
+]

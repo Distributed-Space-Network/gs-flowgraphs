@@ -39,7 +39,7 @@ from _spawn_contract import (
     send_event,
 )
 
-from gfsk_ax25 import ax25, endurosat
+from gfsk_ax25 import ax25, endurosat, endurosat_link
 
 VERSION = "0.1.0"
 
@@ -61,6 +61,20 @@ def _select_engine(args, params: dict[str, object]) -> str:
     return engine
 
 
+def _select_framing(params: dict[str, object]) -> str:
+    """ax25 (default, compat) | endurosat (chip-packet, the real Gen-2 link).
+
+    Via GS_FLOWGRAPH_FRAMING env or a params ``framing`` key. EnduroSat payloads
+    are the opaque (encrypted) AirMAC frames — the orchestrator handles those.
+    """
+    framing = (
+        os.environ.get("GS_FLOWGRAPH_FRAMING", "")
+        or (str(params.get("framing", "")) if isinstance(params, dict) else "")
+        or "ax25"
+    ).lower()
+    return framing if framing in ("ax25", "endurosat") else "ax25"
+
+
 def _profile_from_params(params: dict[str, object]) -> endurosat.LinkProfile:
     return endurosat.LinkProfile(
         scramble=bool(params.get("scramble", True)),
@@ -71,11 +85,16 @@ def _profile_from_params(params: dict[str, object]) -> endurosat.LinkProfile:
     )
 
 
-async def _emit_frame(sockets, body: bytes) -> None:
-    """Send a frame_received status event + raw frame bytes on the data socket."""
-    ui = ax25.decode_ui(body)
+async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25") -> None:
+    """Send a frame_received status event + raw frame bytes on the data socket.
+
+    For ``endurosat`` framing the body is the opaque (encrypted AirMAC) payload,
+    so we do not attempt an AX.25 parse — the orchestrator decodes it.
+    """
+    ui = ax25.decode_ui(body) if framing == "ax25" else None
     event: dict[str, object] = {
         "event": "frame_received",
+        "framing": framing,
         "frame": {
             "bytes_b64": base64.b64encode(body).decode("ascii"),
             "len": len(body),
@@ -138,7 +157,19 @@ def _soapy_iq_chunks(args):  # pragma: no cover (needs hardware/SoapySDR)
 async def _run_dsp_engine(args, sockets, params, started, stop_requested, profile, doppler) -> None:
     log = logging.getLogger("cubesat_gfsk_ax25_rx")
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
-    decoder = endurosat.StreamDecoder(sample_rate, profile=profile, recover_timing=True)
+    framing = _select_framing(params)
+    if framing == "endurosat":
+        # The EnduroSat chip link is 9600 sym/s (endurosat_link defaults), not the
+        # 12480 the AX.25 LinkProfile assumes; honour params overrides if present.
+        sym_hz = float(params.get("symbol_rate_hz", endurosat_link.DEFAULT_SYMBOL_RATE_HZ))
+        decoder: object = endurosat_link.StreamDecoder(
+            sample_rate,
+            symbol_rate_hz=sym_hz,
+            mod_index=float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
+            bt=float(params.get("bt", endurosat_link.DEFAULT_BT)),
+        )
+    else:
+        decoder = endurosat.StreamDecoder(sample_rate, profile=profile, recover_timing=True)
 
     # Digital Doppler NCO. ``doppler`` is shared with the command handler, so a
     # set_doppler mid-pass is picked up here on the next chunk; nco_phase keeps
@@ -153,6 +184,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             "sample_rate": int(sample_rate),
             "symbol_rate": int(profile.symbol_rate_hz),
             "engine": "dsp",
+            "framing": framing,
             "flowgraph_version": VERSION,
         },
     )
@@ -178,7 +210,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
         while not stop_requested.is_set():
             await asyncio.sleep(_DECODE_PERIOD_S)
             for body in decoder.decode_new():
-                await _emit_frame(sockets, body)
+                await _emit_frame(sockets, body, framing=framing)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
     try:
@@ -197,7 +229,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
         stop_requested.set()
         decode_task.cancel()
         for body in decoder.flush():
-            await _emit_frame(sockets, body)
+            await _emit_frame(sockets, body, framing=framing)
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
 
 
@@ -239,7 +271,7 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
                 ctx.set_doppler(last_doppler)  # retune the SoapySDR source
             bits = ctx.drain_bits()  # np.uint8 hard bits recovered by GR
             for body in framing.decode(bits, scramble=profile.scramble, nrzi=profile.nrzi):
-                await _emit_frame(sockets, body)
+                await _emit_frame(sockets, body, framing="ax25")
     finally:
         ctx.stop()
         ctx.wait()

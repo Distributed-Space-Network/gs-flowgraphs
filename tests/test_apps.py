@@ -12,8 +12,9 @@ import json
 
 import cubesat_gfsk_ax25_rx as rxapp
 import cubesat_gfsk_ax25_tx as txapp
+import numpy as np
 
-from gfsk_ax25 import ax25, endurosat
+from gfsk_ax25 import ax25, endurosat, endurosat_link
 
 _SR = 99_840  # integer sps for the modulator
 
@@ -54,6 +55,36 @@ def test_version(capsys):
     assert rxapp.main(["--version"]) == 0
     assert txapp.main(["--version"]) == 0
     assert "0." in capsys.readouterr().out
+
+
+def test_framing_selection(monkeypatch):
+    monkeypatch.delenv("GS_FLOWGRAPH_FRAMING", raising=False)
+    assert rxapp._select_framing({}) == "ax25"  # default
+    assert rxapp._select_framing({"framing": "endurosat"}) == "endurosat"
+    assert rxapp._select_framing({"framing": "bogus"}) == "ax25"  # fallback (no env)
+    monkeypatch.setenv("GS_FLOWGRAPH_FRAMING", "endurosat")
+    assert rxapp._select_framing({}) == "endurosat"  # env override
+
+
+def test_tx_endurosat_to_rx_endurosat(tmp_path):
+    # TX app builds an EnduroSat chip packet around an opaque payload; RX app's
+    # endurosat StreamDecoder recovers it (file stands in for the radio).
+    cap = tmp_path / "es.cf32"
+    payload = bytes(range(28))  # stand-in for an (encrypted) AirMAC frame
+    params = {"framing": "endurosat", "uplink_b64": base64.b64encode(payload).decode()}
+    tx_args = argparse.Namespace(
+        sample_rate=96_000, output_dir=str(tmp_path), sdr_args=f"file:{cap}",
+        center_freq_hz=endurosat.CENTER_FREQUENCY_HZ, engine="dsp",
+    )
+    iq = txapp._build_frame_iq(tx_args, params, endurosat.LinkProfile())
+    iq = np.concatenate([np.zeros(2000, np.complex64), iq, np.zeros(2000, np.complex64)])
+    txapp._sink_iq(tx_args, iq)
+
+    rx_args = argparse.Namespace(sample_rate=96_000, sdr_args=f"file:{cap}")
+    dec = endurosat_link.StreamDecoder(96_000.0, symbol_rate_hz=9600.0)
+    for chunk in rxapp._open_iq_source(rx_args):
+        dec.push(chunk)
+    assert payload in dec.flush()
 
 
 def test_engine_selection_precedence(monkeypatch):

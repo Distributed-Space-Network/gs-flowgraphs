@@ -43,6 +43,18 @@ scrambling + NRZI, AX.25 UI framing over HDLC, ~18.7 kHz occupied bandwidth at
 401.5 MHz. The link parameters live in
 [`apps/gfsk_ax25/endurosat.py`](apps/gfsk_ax25/endurosat.py).
 
+**Two framings**, chosen by `--`/`GS_FLOWGRAPH_FRAMING` env / params `framing`
+(default `ax25`):
+
+* **`ax25`** — AX.25 UI over HDLC with G3RUH/NRZI (generic; for AX.25 satellites).
+* **`endurosat`** — the EnduroSat chip packet in
+  [`apps/gfsk_ax25/endurosat_link.py`](apps/gfsk_ax25/endurosat_link.py):
+  `0xAA` preamble + `0x7E` sync + length + payload + CRC-16/CCITT, **9 600 sym/s**
+  (dev ±2400, h=0.5, BT=0.5). This is the real Gen-2 link (matches gr-satellites'
+  `endurosat_deframer`). The payload is the EnduroSat **AirMAC** frame, which is
+  AES-encrypted and parsed by the closed orchestrator — this repo only
+  receives/transmits the link packet. Capture analysis: `tools/iq_analyze.py`.
+
 **Two interchangeable engines**, chosen by `--engine {dsp,gnuradio}`, the
 `GS_FLOWGRAPH_ENGINE` env var, or a params-file `engine` key (default `dsp`):
 
