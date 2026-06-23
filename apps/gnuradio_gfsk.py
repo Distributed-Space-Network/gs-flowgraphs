@@ -23,6 +23,7 @@ import math
 import queue
 
 import numpy as np
+from _soapy import configure_soapy_source
 from gnuradio import analog, blocks, digital, gr, soapy
 
 from gfsk_ax25 import ax25, endurosat, framing
@@ -72,7 +73,9 @@ class _RxContext:
         self.src.set_frequency(0, self._center + offset_hz)
 
 
-def build_rx_top_block(args, profile: endurosat.LinkProfile, sample_rate: float) -> _RxContext:
+def build_rx_top_block(
+    args, profile: endurosat.LinkProfile, sample_rate: float, params: dict | None = None
+) -> _RxContext:
     sps = sample_rate / profile.symbol_rate_hz
     deviation = profile.mod_index * profile.symbol_rate_hz / 2.0
 
@@ -80,6 +83,7 @@ def build_rx_top_block(args, profile: endurosat.LinkProfile, sample_rate: float)
     src = soapy.source(args.sdr_args, "fc32", 1, "", [""], [""], [""], [""])
     src.set_sample_rate(0, float(sample_rate))
     src.set_frequency(0, float(args.center_freq_hz))
+    configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
 
     # Quadrature demod: output is instantaneous frequency scaled so +/- deviation
     # maps to ~+/-1 (gain = fs / (2*pi*deviation)).
@@ -129,6 +133,7 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
     sink = soapy.sink(args.sdr_args, "fc32", 1, "", [""], [""], [""], [""])
     sink.set_sample_rate(0, sample_rate)
     sink.set_frequency(0, float(args.center_freq_hz))
+    configure_soapy_source(sink, params)  # TX antenna + gain (PA drive)
     tb.connect(src, mod, sink)
     tb.run()
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import queue
 
+from _soapy import configure_soapy_source
 from gnuradio import gr, soapy
 
 # gr-satellites flowgraph component. Import name/shape may vary by version
@@ -81,7 +82,9 @@ class _SatContext:
         self.src.set_frequency(0, self._center + offset_hz)
 
 
-def build_satellites_rx(args, satellite: str, sample_rate: float) -> _SatContext:
+def build_satellites_rx(
+    args, satellite: str, sample_rate: float, params: dict | None = None
+) -> _SatContext:
     """Build a gr-satellites RX flowgraph for ``satellite`` (a SatYAML name/id).
 
     BENCH-PENDING: confirm the gr_satellites_flowgraph constructor signature and
@@ -92,6 +95,7 @@ def build_satellites_rx(args, satellite: str, sample_rate: float) -> _SatContext
     src = soapy.source(args.sdr_args, "fc32", 1, "", [""], [""], [""], [""])
     src.set_sample_rate(0, float(sample_rate))
     src.set_frequency(0, float(args.center_freq_hz))
+    configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
 
     flowgraph = gr_satellites_flowgraph.make(
         name=satellite,

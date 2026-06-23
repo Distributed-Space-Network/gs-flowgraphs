@@ -81,6 +81,18 @@ scrambling + NRZI, AX.25 UI framing over HDLC, ~18.7 kHz occupied bandwidth at
   hands the recovered bitstream to the **same** `gfsk_ax25.framing` deframer, so
   both engines decode identically. Bench-validate as in the NBFM recipe below.
 
+### SDR front-end parameters (gnuradio engine + `satellite_rx.py`)
+
+GNU Radio gives the demod, not the SDR front-end, so the gr-soapy source must be
+told its gain/antenna or it sits near 0 dB and hears nothing. These
+`waveform_parameters` (params-file) keys configure it (`apps/_soapy.py`); if none
+are given, a 30 dB manual gain is applied so the front-end is never silent:
+
+* `sdr_antenna` (str) — antenna port, e.g. `"LNAL"`, `"RX2"`.
+* `sdr_agc` (bool) — hardware AGC on/off (when on, no manual gain is forced).
+* `sdr_gain_db` (number) — overall manual gain in dB.
+* `sdr_gains` (table) — per-element gains, e.g. `{ LNA = 20, TIA = 6, PGA = 0 }`.
+
 Run the DSP library tests (proves a frame survives modulate → channel with
 AWGN/Doppler/timing → demodulate → deframe):
 

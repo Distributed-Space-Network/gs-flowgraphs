@@ -97,7 +97,7 @@ async def amain(args) -> int:
         if not satellite:
             log.error("no 'satellite' selected (params 'satellite' / --satellite); nothing to do")
             return
-        ctx = build_satellites_rx(args, satellite, sample_rate)
+        ctx = build_satellites_rx(args, satellite, sample_rate, params)
         await started.wait()
         ctx.start()
         last_doppler = 0.0

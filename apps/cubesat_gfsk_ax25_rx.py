@@ -249,7 +249,7 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     from gfsk_ax25 import framing
 
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
-    ctx = build_rx_top_block(args, profile, sample_rate)
+    ctx = build_rx_top_block(args, profile, sample_rate, params)
     await send_event(
         sockets.status_writer,
         {

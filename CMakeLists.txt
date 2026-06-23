@@ -52,6 +52,7 @@ install(
 install(
   FILES
     apps/_spawn_contract.py
+    apps/_soapy.py                   # SoapySDR gain/antenna config, shared by the GR engines
     apps/gnuradio_gfsk.py            # bench engine helper (imported only by --engine gnuradio)
     apps/gnuradio_satellites.py      # gr-satellites bridge (imported by satellite_rx at decode time)
   DESTINATION ${GS_APPS_INSTALL_DIR}
