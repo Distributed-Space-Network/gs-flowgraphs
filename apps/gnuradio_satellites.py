@@ -85,7 +85,12 @@ class _SatContext:
 def build_satellites_rx(
     args, satellite: str, sample_rate: float, params: dict | None = None
 ) -> _SatContext:
-    """Build a gr-satellites RX flowgraph for ``satellite`` (a SatYAML name/id).
+    """Build a gr-satellites RX flowgraph for ``satellite``.
+
+    ``satellite`` may be a NORAD id (all digits) or a SatYAML name. The orchestrator
+    passes the pass's NORAD id (from the command's ``satellite.noradId``), so the
+    common path is NORAD selection — gr-satellites resolves the bird from its catalog
+    by NORAD.
 
     BENCH-PENDING: confirm the gr_satellites_flowgraph constructor signature and
     the decoded-frame message port name against the installed gr-satellites
@@ -97,11 +102,13 @@ def build_satellites_rx(
     src.set_frequency(0, float(args.center_freq_hz))
     configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
 
+    # NORAD id (e.g. "40071") -> norad=; otherwise treat it as a SatYAML name.
+    sat_sel = {"norad": int(satellite)} if str(satellite).isdigit() else {"name": satellite}
     flowgraph = gr_satellites_flowgraph.make(
-        name=satellite,
         samp_rate=float(sample_rate),
         iq=True,
         grc_block=True,  # construct as an embeddable hier block
+        **sat_sel,
     )
     sink = _FrameSink()
     tb.connect(src, flowgraph)
