@@ -25,12 +25,14 @@ set(GS_FLOWGRAPHS_VERSION_PATCH 0)
 set(GS_FLOWGRAPHS_VERSION
     "${GS_FLOWGRAPHS_VERSION_MAJOR}.${GS_FLOWGRAPHS_VERSION_MINOR}.${GS_FLOWGRAPHS_VERSION_PATCH}")
 
-# Install path. Bench expectation per docs/04-implementation-plan.md
-# is ``/opt/gs-flowgraphs/bin/<binary>``; the path is configurable
-# via -DCMAKE_INSTALL_PREFIX=...
-include(GNUInstallDirs)
-set(GS_APPS_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/opt/gs-flowgraphs/bin"
-    CACHE PATH "Install dir for flowgraph executables")
+# Install path. These scripts are NOT compiled (project LANGUAGES NONE);
+# ``make install`` only stages them. ``/opt/gs-flowgraphs`` is the application's
+# own tree (FHS ``/opt/<pkg>``) and matches the binary paths in the client's
+# waveforms.toml, so it is an ABSOLUTE path, not derived from
+# CMAKE_INSTALL_PREFIX (which would give the nonsensical /usr/local/opt/...).
+# Override with -DGS_APPS_INSTALL_DIR=... ; staged/packaged installs use DESTDIR=.
+set(GS_APPS_INSTALL_DIR "/opt/gs-flowgraphs/bin"
+    CACHE PATH "Install dir for flowgraph scripts (matches waveforms.toml)")
 
 # All four apps in ``apps/`` are Python scripts honoring the spawn
 # contract (Document A §A.7.2):

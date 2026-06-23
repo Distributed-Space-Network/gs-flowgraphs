@@ -119,19 +119,23 @@ Install on Debian/Ubuntu::
     sudo apt install gnuradio gr-soapy soapysdr-tools \
         soapysdr-module-lms7 soapysdr-module-loopback python3-numpy
 
-## Build / install
+## Install (staging, not compiling)
+
+Nothing here is compiled — the CMake project is ``LANGUAGES NONE``, so
+``make install`` just *copies* the scripts (and the shared ``gfsk_ax25/`` lib +
+``_spawn_contract.py``/``_soapy.py`` helpers) into one directory. You can also run
+a script straight from ``apps/``; installing only fixes the path.
 
 ```bash
 mkdir build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local
-make
-sudo make install
+cmake ..
+sudo make install        # -> /opt/gs-flowgraphs/bin/
 ```
 
-This installs the Python scripts to
-``${CMAKE_INSTALL_PREFIX}/opt/gs-flowgraphs/bin/`` (default
-``/usr/local/opt/gs-flowgraphs/bin/``). The bench ``waveforms.toml``
-points ``binary`` at this path.
+It installs to ``/opt/gs-flowgraphs/bin/`` — the path the client's
+``waveforms.toml`` points at (``/opt/<pkg>`` is the app's own FHS tree). Override
+with ``-DGS_APPS_INSTALL_DIR=...``; staged/packaged installs use ``make install
+DESTDIR=/tmp/stage`` (lands under ``/tmp/stage/opt/gs-flowgraphs/bin``).
 
 ## Verification on Linux (Phase 6 bench prep)
 
@@ -167,15 +171,6 @@ python3 apps/amateur_fm_narrowband_rx.py \
 
 Same shape for the TX flowgraph; the data socket receives nothing
 (TX first-cut emits a tone, not a data stream).
-
-## Build
-
-```bash
-mkdir build && cd build
-cmake ..
-make
-sudo make install
-```
 
 ## Spawn contract
 
