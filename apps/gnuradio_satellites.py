@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import queue
 
+from _recorder import PassRecorder
 from _soapy import configure_soapy_source
 from gnuradio import gr, soapy
 
@@ -60,17 +61,23 @@ class _FrameSink(gr.basic_block):
 
 
 class _SatContext:
-    def __init__(self, tb: gr.top_block, src, sink: _FrameSink, center_hz: float) -> None:
+    def __init__(
+        self, tb: gr.top_block, src, sink: _FrameSink, center_hz: float, recorder=None
+    ) -> None:
         self.tb = tb
         self.src = src
         self._sink = sink
         self._center = center_hz
+        self._recorder = recorder
 
     def start(self) -> None:
         self.tb.start()
 
     def stop(self) -> None:
         self.tb.stop()
+        self.tb.wait()  # let the SDF sink flush + close before we derive CSV/PNG
+        if self._recorder is not None:
+            self._recorder.finalize()
 
     def wait(self) -> None:
         self.tb.wait()
@@ -114,7 +121,9 @@ def build_satellites_rx(
     tb.connect(src, flowgraph)
     # gr-satellites exposes decoded frames on a message output port; forward them.
     tb.msg_connect(flowgraph, "out", sink, "in")
-    return _SatContext(tb, src, sink, float(args.center_freq_hz))
+    # Pre-demod IQ capture taps the SAME source, in parallel with the decoder.
+    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
+    return _SatContext(tb, src, sink, float(args.center_freq_hz), recorder)
 
 
 __all__ = ["build_satellites_rx"]

@@ -1,0 +1,73 @@
+"""Pre-demod IQ recorder — pure (numpy-only) artifact generation.
+
+Covers the SDF byte format (Keysight N5106A: int16 big-endian interleaved I/Q), the
+SDF round-trip, and deriving the VSA CSV + waterfall PNG. The real-time GNU Radio
+sink (``make_sdf_sink`` / ``PassRecorder.maybe_start``) is bench-only and not
+exercised here; ``PassRecorder.finalize`` (pure) is.
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+from pathlib import Path
+
+import numpy as np
+from _recorder import (
+    PassRecorder,
+    finalize_recording,
+    iq_to_sdf_bytes,
+    parse_formats,
+    read_sdf_iq,
+)
+
+_UTC = _dt.datetime(2026, 6, 25, 13, 30, tzinfo=_dt.UTC)
+
+
+def _tone(n: int = 4096, fs: float = 48000.0, freq: float = 1000.0) -> np.ndarray:
+    t = np.arange(n) / fs
+    return (0.5 * np.exp(2j * np.pi * freq * t)).astype(np.complex64)
+
+
+def test_parse_formats_normalizes() -> None:
+    assert parse_formats("sdf, csv ,PNG") == ("sdf", "csv", "png")
+    assert parse_formats("") == ()
+
+
+def test_sdf_is_int16_be_interleaved_and_roundtrips(tmp_path: Path) -> None:
+    iq = _tone()
+    raw = iq_to_sdf_bytes(iq)
+    assert len(raw) == iq.size * 4  # two int16 (I,Q) per complex sample
+    assert np.frombuffer(raw, dtype=">i2").size == iq.size * 2  # big-endian int16
+
+    sdf = tmp_path / "cap.sdf"
+    sdf.write_bytes(raw)
+    back = read_sdf_iq(sdf)
+    assert back.size == iq.size
+    np.testing.assert_allclose(back, iq, atol=2e-4)  # int16 quantization only
+
+
+def test_finalize_derives_vsa_csv_and_waterfall_png(tmp_path: Path) -> None:
+    sdf = tmp_path / "cmd_31_31.sdf"
+    sdf.write_bytes(iq_to_sdf_bytes(_tone()))
+    finalize_recording(
+        sdf,
+        center_hz=401_200_000.0,
+        sample_rate_hz=48000.0,
+        formats=("sdf", "csv", "png"),
+        started_utc=_UTC,
+    )
+    csv, png = sdf.with_suffix(".csv"), sdf.with_suffix(".png")
+    assert csv.exists() and png.exists()
+    lines = csv.read_text(encoding="ascii").splitlines()
+    assert any(ln.startswith("InputCenter,401200000") for ln in lines)
+    assert "Y" in lines  # VSA data marker
+    assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"  # PNG signature
+
+
+def test_passrecorder_finalize_drops_unrequested_sdf(tmp_path: Path) -> None:
+    sdf = tmp_path / "cmd_42.sdf"
+    sdf.write_bytes(iq_to_sdf_bytes(_tone()))
+    PassRecorder(sdf, 401_200_000.0, 48000.0, ("csv", "png")).finalize()  # no "sdf"
+    assert not sdf.exists()  # raw SDF removed since it wasn't a requested format
+    assert sdf.with_suffix(".csv").exists()
+    assert sdf.with_suffix(".png").exists()

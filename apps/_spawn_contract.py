@@ -56,6 +56,10 @@ def build_argparser(*, prog: str, description: str) -> argparse.ArgumentParser:
     p.add_argument("--data-socket", default="")
     p.add_argument("--output-dir", default="")
     p.add_argument("--params-file", default="")
+    # Pre-demod IQ capture (gs-client [recording]). When set, the engine taps the SDR
+    # stream before demod and writes capture artifacts into --output-dir.
+    p.add_argument("--record-iq", action="store_true")
+    p.add_argument("--record-formats", default="")  # comma list: sdf,csv,png
     return p
 
 

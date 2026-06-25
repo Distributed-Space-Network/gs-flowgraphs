@@ -23,6 +23,7 @@ import math
 import queue
 
 import numpy as np
+from _recorder import PassRecorder
 from _soapy import configure_soapy_source
 from gnuradio import analog, blocks, digital, gr, soapy
 
@@ -51,17 +52,23 @@ class _BitSink(gr.sync_block):
 
 
 class _RxContext:
-    def __init__(self, tb: gr.top_block, src, sink: _BitSink, center_hz: float) -> None:
+    def __init__(
+        self, tb: gr.top_block, src, sink: _BitSink, center_hz: float, recorder=None
+    ) -> None:
         self.tb = tb
         self.src = src
         self._sink = sink
         self._center = center_hz
+        self._recorder = recorder
 
     def start(self) -> None:
         self.tb.start()
 
     def stop(self) -> None:
         self.tb.stop()
+        self.tb.wait()  # flush + close the SDF sink before deriving CSV/PNG
+        if self._recorder is not None:
+            self._recorder.finalize()
 
     def wait(self) -> None:
         self.tb.wait()
@@ -106,7 +113,9 @@ def build_rx_top_block(
     slicer = digital.binary_slicer_fb()  # float -> 0/1 bytes
     sink = _BitSink()
     tb.connect(src, quad, ted, slicer, sink)
-    return _RxContext(tb, src, sink, float(args.center_freq_hz))
+    # Pre-demod IQ capture taps the SAME source, in parallel with the demod chain.
+    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
+    return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder)
 
 
 def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile) -> None:
