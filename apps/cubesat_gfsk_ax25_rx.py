@@ -210,14 +210,25 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
         with contextlib.suppress(Exception):
             dev.setDCOffsetMode(SOAPY_SDR_RX, ch, True)
 
-    # Front-end gain: GS_SDR_AGC enables hardware AGC; otherwise explicit
-    # ``sdr_gain_db`` wins, else AGC off + a sane manual default (a 0 dB front-end is
-    # effectively deaf and was never set before). Mirrors the gnuradio engines.
+    # Front-end gain (mirrors the gnuradio engines / configure_soapy_source):
+    # GS_SDR_AGC → hardware AGC; else per-element staging (GS_SDR_GAINS, e.g.
+    # LNA=30,TIA=9,PGA=3) wins; else overall sdr_gain_db; else AGC off + a sane manual
+    # default (a 0 dB front-end is effectively deaf and was never set before).
     gain_db = params.get("sdr_gain_db")
+    gains = params.get("sdr_gains")
     if params.get("sdr_agc"):
         with contextlib.suppress(Exception):
             dev.setGainMode(SOAPY_SDR_RX, ch, True)  # hardware AGC
         gain_str = "AGC"
+    elif isinstance(gains, dict) and gains:
+        with contextlib.suppress(Exception):
+            dev.setGainMode(SOAPY_SDR_RX, ch, False)
+        for gname, gval in gains.items():
+            if not isinstance(gname, str) or isinstance(gval, bool):
+                continue
+            if isinstance(gval, (int, float)):
+                dev.setGain(SOAPY_SDR_RX, ch, gname, float(gval))  # per-element
+        gain_str = ",".join(f"{k}={v:g}" for k, v in gains.items())
     elif isinstance(gain_db, (int, float)) and not isinstance(gain_db, bool):
         dev.setGain(SOAPY_SDR_RX, ch, float(gain_db))
         gain_str = f"{float(gain_db):.1f} dB"

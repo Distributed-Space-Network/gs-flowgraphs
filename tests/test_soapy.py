@@ -130,6 +130,7 @@ def test_channel_override() -> None:
 _SDR_ENV_VARS = (
     "GS_SDR_ANTENNA",
     "GS_SDR_GAIN_DB",
+    "GS_SDR_GAINS",
     "GS_SDR_AGC",
     "GS_SDR_LO_OFFSET",
     "GS_SDR_PPM",
@@ -148,6 +149,7 @@ def test_sdr_env_defaults_when_unset(monkeypatch) -> None:
     assert env == {
         "antenna": None,
         "gain_db": None,
+        "gains": None,
         "agc": False,
         "lo_offset_hz": 0.0,
         "ppm": 0.0,
@@ -198,6 +200,32 @@ def test_merge_sdr_params_per_pass_wins(monkeypatch) -> None:
     merged = merge_sdr_params({"sdr_antenna": "LNAW", "sdr_gain_db": 12.0})
     assert merged["sdr_antenna"] == "LNAW"  # per-pass overrides station env
     assert merged["sdr_gain_db"] == 12.0
+
+
+def test_sdr_env_parses_per_element_gains(monkeypatch) -> None:
+    # The SatNOGS GAIN_MODE="Settings Field" / OTHER_SETTINGS="LNA=30,TIA=9,PGA=3" surface.
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_GAINS", "LNA=30,TIA=9,PGA=3")
+    assert sdr_env()["gains"] == {"LNA": 30.0, "TIA": 9.0, "PGA": 3.0}
+
+
+def test_sdr_env_gains_skips_malformed(monkeypatch) -> None:
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_GAINS", "LNA=30, bogus ,TIA=loud,PGA=3")
+    assert sdr_env()["gains"] == {"LNA": 30.0, "PGA": 3.0}
+
+
+def test_merge_sdr_params_injects_per_element_gains(monkeypatch) -> None:
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_GAINS", "LNA=30,TIA=9,PGA=3")
+    merged = merge_sdr_params(None)
+    assert merged["sdr_gains"] == {"LNA": 30.0, "TIA": 9.0, "PGA": 3.0}
+    # And configure_soapy_source consumes that dict as per-element set_gain calls.
+    src = FakeSoapy()
+    configure_soapy_source(src, merged)
+    assert (0, "LNA", 30.0) in src.gains
+    assert (0, "TIA", 9.0) in src.gains
+    assert (0, "PGA", 3.0) in src.gains
 
 
 def test_tune_source_no_offset_is_plain_tune() -> None:

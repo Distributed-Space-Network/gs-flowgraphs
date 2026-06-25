@@ -134,6 +134,25 @@ def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_gains(name: str) -> dict[str, float] | None:
+    """Parse a SatNOGS-style per-element gain string ``"LNA=30,TIA=9,PGA=3"`` into a
+    ``{name: dB}`` dict. Returns None when unset/empty; skips malformed entries."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    out: dict[str, float] = {}
+    for pair in raw.split(","):
+        if "=" not in pair:
+            continue
+        key, _, val = pair.partition("=")
+        key = key.strip()
+        try:
+            out[key] = float(val.strip())
+        except ValueError:
+            _log.warning("ignoring bad gain element %r in %s", pair.strip(), name)
+    return out or None
+
+
 def sdr_env() -> dict[str, Any]:
     """Station-wide SDR settings from the environment (SatNOGS-style ``GS_SDR_*``),
     applied by every engine on top of any per-pass params. All optional — unset keys
@@ -141,6 +160,9 @@ def sdr_env() -> dict[str, Any]:
 
     * ``GS_SDR_ANTENNA``    — RX antenna name (e.g. ``LNAW``); else auto / per-pass.
     * ``GS_SDR_GAIN_DB``    — overall RF gain in dB; else engine default.
+    * ``GS_SDR_GAINS``      — per-element gain staging ``"LNA=30,TIA=9,PGA=3"`` (the
+      SatNOGS ``GAIN_MODE="Settings Field"`` / ``OTHER_SETTINGS`` equivalent); wins
+      over ``GS_SDR_GAIN_DB`` when both are set.
     * ``GS_SDR_AGC``        — ``1/true`` to enable hardware AGC.
     * ``GS_SDR_LO_OFFSET``  — Hz to shift the LO off the carrier (dodge the DC spike).
     * ``GS_SDR_PPM``        — oscillator frequency-error correction, ppm.
@@ -149,6 +171,7 @@ def sdr_env() -> dict[str, Any]:
     return {
         "antenna": os.environ.get("GS_SDR_ANTENNA", "").strip() or None,
         "gain_db": _env_float("GS_SDR_GAIN_DB"),
+        "gains": _env_gains("GS_SDR_GAINS"),
         "agc": _env_bool("GS_SDR_AGC"),
         "lo_offset_hz": _env_float("GS_SDR_LO_OFFSET") or 0.0,
         "ppm": _env_float("GS_SDR_PPM") or 0.0,
@@ -163,6 +186,8 @@ def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
     merged: dict[str, Any] = dict(params or {})
     if env["antenna"] and "sdr_antenna" not in merged:
         merged["sdr_antenna"] = env["antenna"]
+    if env["gains"] and "sdr_gains" not in merged:
+        merged["sdr_gains"] = env["gains"]
     if env["gain_db"] is not None and "sdr_gain_db" not in merged:
         merged["sdr_gain_db"] = env["gain_db"]
     if "sdr_agc" not in merged:
