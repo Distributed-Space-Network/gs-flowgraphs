@@ -60,6 +60,7 @@ from _spawn_contract import (
     send_event,
 )
 from _recorder import PassRecorder
+from _soapy import make_source
 from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
@@ -164,15 +165,7 @@ def build_top_block(
     # SoapySDR source via gr-soapy. ``driver`` keyword string from
     # --sdr-args is parsed by gr-soapy itself; pass ``soapy_args``
     # exactly as the orchestrator built it.
-    src = soapy.source(
-        args.sdr_args,
-        "fc32",
-        1,  # nchan
-        "",  # dev_args
-        [""] * 1,  # stream_args
-        [""] * 1,  # tune_args
-        [""] * 1,  # other_args
-    )
+    src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, float(args.sample_rate))
     src.set_frequency(0, float(args.center_freq_hz))
     src.set_gain(0, sdr_gain_db)

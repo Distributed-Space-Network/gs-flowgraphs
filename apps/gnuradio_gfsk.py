@@ -24,8 +24,8 @@ import queue
 
 import numpy as np
 from _recorder import PassRecorder
-from _soapy import configure_soapy_source
-from gnuradio import analog, blocks, digital, gr, soapy
+from _soapy import configure_soapy_source, make_sink, make_source
+from gnuradio import analog, blocks, digital, gr
 
 from gfsk_ax25 import ax25, endurosat, framing
 
@@ -87,7 +87,7 @@ def build_rx_top_block(
     deviation = profile.mod_index * profile.symbol_rate_hz / 2.0
 
     tb = gr.top_block("cubesat_gfsk_ax25_rx_gr")
-    src = soapy.source(args.sdr_args, "fc32", 1, "", [""], [""], [""], [""])
+    src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, float(sample_rate))
     src.set_frequency(0, float(args.center_freq_hz))
     configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
@@ -139,7 +139,7 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
     tb = gr.top_block("cubesat_gfsk_ax25_tx_gr")
     src = blocks.vector_source_b(bits.astype(np.uint8).tolist(), repeat=False)
     mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=profile.bt)
-    sink = soapy.sink(args.sdr_args, "fc32", 1, "", [""], [""], [""], [""])
+    sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, sample_rate)
     sink.set_frequency(0, float(args.center_freq_hz))
     configure_soapy_source(sink, params)  # TX antenna + gain (PA drive)

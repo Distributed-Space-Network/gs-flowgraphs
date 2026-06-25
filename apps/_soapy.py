@@ -94,4 +94,24 @@ def configure_soapy_source(
     return applied
 
 
-__all__ = ["configure_soapy_source"]
+def make_source(device_args: str, *, dtype: str = "fc32", nchan: int = 1) -> Any:
+    """Build a gr-soapy RX **source** with the installed gr-soapy signature —
+    ``source(device, type, nchan, dev_args: str, stream_args: str,
+    tune_args: Seq[str], other_settings: Seq[str])``. Centralized here so a gr-soapy
+    API change is ONE edit, not one per engine (the per-engine calls had drifted:
+    they passed a list for ``stream_args`` and an extra positional, which raised
+    TypeError at construction → the flowgraph never reached 'ready'). Lazy gnuradio
+    import keeps this module import-safe; the caller still sets rate/freq/gain."""
+    from gnuradio import soapy  # noqa: PLC0415 — bench-only; keeps the module GR-free
+
+    return soapy.source(device_args, dtype, nchan, "", "", [""] * nchan, [""] * nchan)
+
+
+def make_sink(device_args: str, *, dtype: str = "fc32", nchan: int = 1) -> Any:
+    """Build a gr-soapy TX **sink** (same signature as :func:`make_source`)."""
+    from gnuradio import soapy  # noqa: PLC0415 — bench-only
+
+    return soapy.sink(device_args, dtype, nchan, "", "", [""] * nchan, [""] * nchan)
+
+
+__all__ = ["configure_soapy_source", "make_sink", "make_source"]

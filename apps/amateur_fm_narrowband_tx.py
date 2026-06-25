@@ -45,6 +45,7 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
+from _soapy import make_sink
 from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
@@ -122,15 +123,7 @@ def build_top_block(
     interp_filter = gr_filter.interp_fir_filter_ccf(interp, interp_taps)
 
     # ----------------------------------------------------- soapy sink
-    sink = soapy.sink(
-        args.sdr_args,
-        "fc32",
-        1,  # nchan
-        "",  # dev_args
-        [""] * 1,  # stream_args
-        [""] * 1,  # tune_args
-        [""] * 1,  # other_args
-    )
+    sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, float(args.sample_rate))
     sink.set_frequency(0, float(args.center_freq_hz))
     sink.set_gain(0, sdr_gain_db)

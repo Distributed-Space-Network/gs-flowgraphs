@@ -28,8 +28,8 @@ from __future__ import annotations
 import queue
 
 from _recorder import PassRecorder
-from _soapy import configure_soapy_source
-from gnuradio import gr, soapy
+from _soapy import configure_soapy_source, make_source
+from gnuradio import gr
 
 # gr-satellites flowgraph component. Import name/shape may vary by version
 # (e.g. ``satellites.core.gr_satellites_flowgraph``); confirm on the bench.
@@ -104,7 +104,7 @@ def build_satellites_rx(
     version. The shape below follows the documented embedding pattern.
     """
     tb = gr.top_block("gr_satellites_rx")
-    src = soapy.source(args.sdr_args, "fc32", 1, "", [""], [""], [""], [""])
+    src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, float(sample_rate))
     src.set_frequency(0, float(args.center_freq_hz))
     configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
