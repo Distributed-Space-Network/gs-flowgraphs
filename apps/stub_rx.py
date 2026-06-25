@@ -60,6 +60,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--data-socket", default="")
     p.add_argument("--output-dir", default="")
     p.add_argument("--params-file", default="")
+    p.add_argument("--record-iq", action="store_true")
+    p.add_argument("--record-formats", default="")
     p.add_argument("--signal-events", type=int, default=3)
     p.add_argument("--audio-chunks", type=int, default=4)
     p.add_argument("--audio-chunk-bytes", type=int, default=512)
@@ -112,6 +114,28 @@ async def _read_commands(reader: asyncio.StreamReader) -> object:
             return obj
 
 
+def _write_stub_capture(args: argparse.Namespace) -> None:
+    """Synthetic pre-demod IQ capture so ``--record-iq`` exercises the full
+    SDF/CSV/PNG path end-to-end without hardware (the stub has no real SDR). Lazy
+    imports keep numpy off the default stub path; the seed makes it deterministic."""
+    from _recorder import StreamRecorder  # noqa: PLC0415 — lazy: only when capturing
+    import numpy as np  # noqa: PLC0415
+
+    rec = StreamRecorder.maybe_start(args, sample_rate_hz=float(args.sample_rate or 48000))
+    if rec is None:
+        return
+    fs = float(args.sample_rate or 48000)
+    n = int(fs * 0.5)  # ~0.5 s of synthetic capture
+    rng = np.random.default_rng(0)
+    t = np.arange(n) / fs
+    iq = (
+        0.05 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        + 0.3 * np.exp(2j * np.pi * 1200.0 * t)
+    ).astype(np.complex64)
+    rec.write(iq)
+    rec.finalize()
+
+
 async def amain(args: argparse.Namespace) -> int:
     log = logging.getLogger("stub_rx")
     ctrl = parse_tcp_url(args.control_socket)
@@ -139,6 +163,14 @@ async def amain(args: argparse.Namespace) -> int:
                 json.dump(received_params, f, separators=(",", ":"), sort_keys=True)
         except OSError:
             log.exception("could not write params_received.json to %r", out)
+
+    # Pre-demod IQ capture (uniform with the real RX engines). Synthetic, since the
+    # stub has no SDR — exercises the SDF/CSV/PNG path for orchestrator E2E.
+    if args.record_iq:
+        try:
+            _write_stub_capture(args)
+        except Exception:
+            log.exception("stub capture failed")
 
     ctrl_reader, _ctrl_writer = await asyncio.open_connection(ctrl.host, ctrl.port)
     status_reader_unused, status_writer = await asyncio.open_connection(status.host, status.port)

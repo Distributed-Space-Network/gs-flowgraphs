@@ -100,3 +100,25 @@ def test_stream_recorder_off_when_disabled() -> None:
 
     args = SimpleNamespace(record_iq=False, record_formats="", output_dir=".", center_freq_hz=1)
     assert StreamRecorder.maybe_start(args, sample_rate_hz=1.0) is None
+
+
+def test_stub_rx_synthetic_capture_writes_all_three(tmp_path: Path) -> None:
+    # The stub honours --record-iq with a synthetic capture (no SDR) so the whole
+    # record→file path is E2E-testable off the bench — uniform with the real engines.
+    from types import SimpleNamespace
+
+    import stub_rx
+
+    out = tmp_path / "cmd_stub"
+    out.mkdir()
+    args = SimpleNamespace(
+        record_iq=True,
+        record_formats="sdf,csv,png",
+        output_dir=str(out),
+        sample_rate=48000,
+        center_freq_hz=401_200_000,
+    )
+    stub_rx._write_stub_capture(args)
+    assert (out / "cmd_stub.sdf").exists()
+    assert (out / "cmd_stub.csv").exists()
+    assert (out / "cmd_stub.png").exists()
