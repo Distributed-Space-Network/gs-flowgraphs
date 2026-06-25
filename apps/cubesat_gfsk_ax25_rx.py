@@ -316,7 +316,9 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             "flowgraph_version": VERSION,
         },
     )
-    await started.wait()
+    # RX: stream + record from spawn (arm — before AOS); don't gate on cmd:start.
+    # ``started`` still tracks the cmd:start/stop lifecycle for the status events.
+    _ = started
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()

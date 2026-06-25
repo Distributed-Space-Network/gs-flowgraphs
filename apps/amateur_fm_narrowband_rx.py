@@ -279,11 +279,14 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
     started = asyncio.Event()
     stop_requested = asyncio.Event()
 
+    # RX: start the flowgraph at spawn (arm — before AOS) so the SDR is warm + recording
+    # before AOS. Do NOT gate streaming on cmd:start (that's for TX keying); cmd:start
+    # still confirms via the 'started' status event and cmd:stop ends the pass.
+    tb.start()
+    started.set()
+
     async def _on_start(_cmd: dict[str, object]) -> None:
-        if started.is_set():
-            return
-        tb.start()
-        started.set()
+        # Already streaming since spawn; just confirm to the orchestrator.
         await send_event(sockets.status_writer, {"event": "started"})
 
     async def _on_stop(cmd: dict[str, object]) -> None:

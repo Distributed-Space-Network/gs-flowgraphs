@@ -100,7 +100,10 @@ async def amain(args) -> int:
         # Pre-demod IQ capture is wired inside build_satellites_rx (PassRecorder taps
         # the SDR source; ctx.stop() finalizes) — uniform with the other RX engines.
         ctx = build_satellites_rx(args, satellite, sample_rate, params)
-        await started.wait()
+        # RX: start streaming + recording at spawn (arm — before AOS) so the front-end
+        # is warm and the whole window is captured. Do NOT gate on cmd:start (that is
+        # for TX keying); cmd:start still fires the 'started' status event and cmd:stop
+        # ends the pass.
         ctx.start()
         last_doppler = 0.0
         try:
