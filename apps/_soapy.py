@@ -25,7 +25,12 @@ trap). Pass ``default_gain_db=None`` to leave the SDR default untouched.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
 from typing import Any, Protocol
+
+_log = logging.getLogger("gs_flowgraphs._soapy")
 
 
 class _SoapyEndpoint(Protocol):
@@ -114,4 +119,112 @@ def make_sink(device_args: str, *, dtype: str = "fc32", nchan: int = 1) -> Any:
     return soapy.sink(device_args, dtype, nchan, "", "", [""] * nchan, [""] * nchan)
 
 
-__all__ = ["configure_soapy_source", "make_sink", "make_source"]
+def _env_float(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        _log.warning("ignoring non-numeric %s=%r", name, raw)
+        return None
+
+
+def _env_bool(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def sdr_env() -> dict[str, Any]:
+    """Station-wide SDR settings from the environment (SatNOGS-style ``GS_SDR_*``),
+    applied by every engine on top of any per-pass params. All optional — unset keys
+    leave today's behaviour unchanged.
+
+    * ``GS_SDR_ANTENNA``    — RX antenna name (e.g. ``LNAW``); else auto / per-pass.
+    * ``GS_SDR_GAIN_DB``    — overall RF gain in dB; else engine default.
+    * ``GS_SDR_AGC``        — ``1/true`` to enable hardware AGC.
+    * ``GS_SDR_LO_OFFSET``  — Hz to shift the LO off the carrier (dodge the DC spike).
+    * ``GS_SDR_PPM``        — oscillator frequency-error correction, ppm.
+    * ``GS_SDR_DC_REMOVAL`` — ``1/true`` to enable automatic DC-offset correction.
+    """
+    return {
+        "antenna": os.environ.get("GS_SDR_ANTENNA", "").strip() or None,
+        "gain_db": _env_float("GS_SDR_GAIN_DB"),
+        "agc": _env_bool("GS_SDR_AGC"),
+        "lo_offset_hz": _env_float("GS_SDR_LO_OFFSET") or 0.0,
+        "ppm": _env_float("GS_SDR_PPM") or 0.0,
+        "dc_removal": _env_bool("GS_SDR_DC_REMOVAL"),
+    }
+
+
+def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    """Per-pass ``params`` with station ``GS_SDR_*`` antenna/gain/agc filled in as
+    defaults (per-pass values win). Feed the result to :func:`configure_soapy_source`."""
+    env = sdr_env()
+    merged: dict[str, Any] = dict(params or {})
+    if env["antenna"] and "sdr_antenna" not in merged:
+        merged["sdr_antenna"] = env["antenna"]
+    if env["gain_db"] is not None and "sdr_gain_db" not in merged:
+        merged["sdr_gain_db"] = env["gain_db"]
+    if "sdr_agc" not in merged:
+        merged["sdr_agc"] = env["agc"]
+    return merged
+
+
+def tune_source(src: Any, center_hz: float, lo_offset_hz: float, *, channel: int = 0) -> None:
+    """Tune a gr-soapy source/sink to ``center_hz`` using an LO offset: the analog LO
+    goes to ``center+offset`` (RF) and the baseband CORDIC to ``-offset`` (BB), so the
+    SDR's DC spike lands at ``+offset`` instead of on the signal. ``lo_offset_hz`` 0 →
+    a plain tune. Falls back to a direct tune if the driver lacks named RF/BB
+    components (then there is simply no offset benefit)."""
+    if lo_offset_hz:
+        try:
+            src.set_frequency(channel, "RF", float(center_hz) + float(lo_offset_hz))
+            src.set_frequency(channel, "BB", -float(lo_offset_hz))
+            return
+        except Exception:  # noqa: BLE001 — driver without RF/BB split → plain tune
+            _log.warning("LO offset unsupported by driver; tuning RF directly")
+    src.set_frequency(channel, float(center_hz))
+
+
+def retune_source(
+    src: Any,
+    center_hz: float,
+    lo_offset_hz: float,
+    doppler_hz: float,
+    *,
+    channel: int = 0,
+) -> None:
+    """Doppler retune that preserves the LO offset by moving only the RF component."""
+    if lo_offset_hz:
+        try:
+            src.set_frequency(
+                channel, "RF", float(center_hz) + float(lo_offset_hz) + float(doppler_hz)
+            )
+            return
+        except Exception:  # noqa: BLE001 — driver without RF/BB split → plain retune
+            pass
+    src.set_frequency(channel, float(center_hz) + float(doppler_hz))
+
+
+def apply_corrections(
+    src: Any, *, ppm: float = 0.0, dc_removal: bool = False, channel: int = 0
+) -> None:
+    """Best-effort ppm + DC-removal on a gr-soapy endpoint (drivers vary; never raises)."""
+    if ppm:
+        with contextlib.suppress(Exception):
+            src.set_frequency_correction(channel, float(ppm))
+    if dc_removal:
+        with contextlib.suppress(Exception):
+            src.set_dc_offset_mode(channel, True)
+
+
+__all__ = [
+    "apply_corrections",
+    "configure_soapy_source",
+    "make_sink",
+    "make_source",
+    "merge_sdr_params",
+    "retune_source",
+    "sdr_env",
+    "tune_source",
+]

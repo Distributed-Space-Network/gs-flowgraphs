@@ -6,14 +6,17 @@ emits one ``frame_received`` status event per valid frame plus the raw frame
 bytes on the data socket (``data_format = "raw_bits"`` -> RAW_BITS artifact).
 
 Two interchangeable engines, selected by ``--engine`` / ``GS_FLOWGRAPH_ENGINE``
-env / params-file ``engine`` key (default ``dsp``):
+env / params-file ``engine`` key (default ``gnuradio``):
 
-* ``dsp``      — pure numpy/scipy demod (``gfsk_ax25`` library). Runs anywhere,
-                 fully unit-tested. IQ from SoapySDR (``--sdr-args driver=...``)
-                 or a ``cf32`` file (``--sdr-args file:/path.cf32``) for bench
-                 use without hardware.
-* ``gnuradio`` — GNU Radio front-end (IQ -> bits) for the bench, handing the
-                 bitstream to the SAME tested ``framing.decode`` protocol layer.
+* ``gnuradio`` — GNU Radio front-end (IQ -> bits) using the gr-soapy source. The
+                 default + production hardware path (SatNOGS-proven: gr-soapy owns
+                 stream activation/MTU/timeouts). Hands the bitstream to the SAME
+                 tested ``framing.decode`` protocol layer.
+* ``dsp``      — pure numpy/scipy demod (``gfsk_ax25`` library). Backup engine:
+                 runs anywhere, fully unit-tested, used for file-IQ bench work and
+                 as a fallback. IQ from SoapySDR (``--sdr-args driver=...``) via a
+                 hand-rolled read loop, or a ``cf32`` file (``--sdr-args
+                 file:/path.cf32``).
 
 Both engines share the scrambler/NRZI/HDLC/AX.25 code, so only the IQ->bits
 front-end differs. The ``gnuradio`` path is validated on the Linux bench (it
@@ -26,12 +29,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
 import sys
 
 import numpy as np
 from _recorder import StreamRecorder
+from _soapy import merge_sdr_params, sdr_env
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
@@ -47,18 +52,23 @@ VERSION = "0.1.0"
 _DEFAULT_SAMPLE_RATE = 96_000  # >= 5x the 18.7 kHz channel; integer-ish sps
 _DECODE_PERIOD_S = 2.0  # how often the dsp engine re-decodes the capture
 _READ_CHUNK = 4096
+_DEFAULT_SDR_GAIN_DB = 40.0  # manual RX gain when none is configured (0 dB = deaf)
 
 
 def _select_engine(args, params: dict[str, object]) -> str:
     explicit = getattr(args, "engine", "") or ""
     env = os.environ.get("GS_FLOWGRAPH_ENGINE", "")
     from_params = str(params.get("engine", "")) if isinstance(params, dict) else ""
-    engine = (explicit or env or from_params or "dsp").lower()
+    # Default to the gr-soapy (gnuradio) front-end: it's the SatNOGS-proven path
+    # (gr-soapy source handles stream activation/MTU/timeouts), whereas the dsp
+    # engine hand-rolls SoapySDR.readStream and is kept as a backup (higher
+    # frequencies, TX, file-IQ, the pytest suite).
+    engine = (explicit or env or from_params or "gnuradio").lower()
     if engine not in ("dsp", "gnuradio"):
         logging.getLogger("cubesat_gfsk_ax25_rx").warning(
-            "unknown engine %r; falling back to dsp", engine
+            "unknown engine %r; falling back to gnuradio", engine
         )
-        engine = "dsp"
+        engine = "gnuradio"
     return engine
 
 
@@ -117,13 +127,13 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25") -> None:
 # ----------------------------------------------------------------------
 
 
-def _open_iq_source(args):
+def _open_iq_source(args, params=None):
     """Return a blocking iterator of complex64 chunks (SoapySDR or cf32 file)."""
     sdr_args = str(args.sdr_args or "")
     if sdr_args.startswith("file:"):
         path = sdr_args[len("file:") :]
         return _file_iq_chunks(path)
-    return _soapy_iq_chunks(args)  # pragma: no cover (needs hardware/SoapySDR)
+    return _soapy_iq_chunks(args, params or {})  # pragma: no cover (needs hardware)
 
 
 def _file_iq_chunks(path: str):
@@ -135,22 +145,128 @@ def _file_iq_chunks(path: str):
             yield np.frombuffer(raw, dtype=np.complex64)
 
 
-def _soapy_iq_chunks(args):  # pragma: no cover (needs hardware/SoapySDR)
+def _sdr_channel(args) -> int:
+    """RX channel index from ``--sdr-port`` when it is a plain integer; else 0.
+    A non-numeric port (e.g. ``RX1``) is treated as an antenna name, not a channel."""
+    port = str(getattr(args, "sdr_port", "") or "").strip()
+    return int(port) if port.isdigit() else 0
+
+
+def _select_rx_antenna(dev, soapy_rx, ch, args, params, log) -> None:  # pragma: no cover
+    """Select + set the RX antenna. Priority: ``params['sdr_antenna']`` → the
+    ``--sdr-port`` label if the driver lists it → the first non-``NONE`` antenna.
+    The available list + the chosen one are logged so a wrong physical port (the
+    classic "0-byte capture / deaf radio") is obvious from the journal."""
+    available = [str(a) for a in dev.listAntennas(soapy_rx, ch)]
+    port = str(getattr(args, "sdr_port", "") or "").strip()
+    chosen = None
+    for cand in (params.get("sdr_antenna"), port):
+        if isinstance(cand, str) and cand in available:
+            chosen = cand
+            break
+    if chosen is None and available:
+        chosen = next((a for a in available if a.upper() != "NONE"), available[0])
+    if chosen is not None:
+        dev.setAntenna(soapy_rx, ch, chosen)
+    log.info("dsp SDR: RX antenna=%s (available=%s, requested port=%r)", chosen, available, port)
+
+
+def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR)
     import SoapySDR  # lazy: only the dsp+hardware path needs it
-    from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
+    from SoapySDR import (
+        SOAPY_SDR_CF32,
+        SOAPY_SDR_OVERFLOW,
+        SOAPY_SDR_RX,
+        SOAPY_SDR_TIMEOUT,
+    )
+
+    log = logging.getLogger("cubesat_gfsk_ax25_rx")
+    ch = _sdr_channel(args)
+    rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
+    freq = float(args.center_freq_hz)
+
+    params = merge_sdr_params(params)  # station GS_SDR_* antenna/gain/agc defaults
+    env = sdr_env()
+    lo = env["lo_offset_hz"]
 
     dev = SoapySDR.Device(args.sdr_args)
-    dev.setSampleRate(SOAPY_SDR_RX, 0, float(args.sample_rate or _DEFAULT_SAMPLE_RATE))
-    dev.setFrequency(SOAPY_SDR_RX, 0, float(args.center_freq_hz))
-    stream = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
+    dev.setSampleRate(SOAPY_SDR_RX, ch, rate)
+    # LO offset: tune the analog LO off-carrier (RF) + the baseband CORDIC back (BB)
+    # so the DC spike sits at +lo, not on the signal. The dsp NCO handles Doppler at
+    # baseband, so the LO is set once here.
+    if lo:
+        try:
+            dev.setFrequency(SOAPY_SDR_RX, ch, "RF", freq + lo)
+            dev.setFrequency(SOAPY_SDR_RX, ch, "BB", -lo)
+        except Exception:  # noqa: BLE001 — driver without RF/BB split → direct tune
+            dev.setFrequency(SOAPY_SDR_RX, ch, freq)
+    else:
+        dev.setFrequency(SOAPY_SDR_RX, ch, freq)
+    _select_rx_antenna(dev, SOAPY_SDR_RX, ch, args, params, log)
+    if env["ppm"]:
+        with contextlib.suppress(Exception):
+            dev.setFrequencyCorrection(SOAPY_SDR_RX, ch, env["ppm"])
+    if env["dc_removal"]:
+        with contextlib.suppress(Exception):
+            dev.setDCOffsetMode(SOAPY_SDR_RX, ch, True)
+
+    # Front-end gain: GS_SDR_AGC enables hardware AGC; otherwise explicit
+    # ``sdr_gain_db`` wins, else AGC off + a sane manual default (a 0 dB front-end is
+    # effectively deaf and was never set before). Mirrors the gnuradio engines.
+    gain_db = params.get("sdr_gain_db")
+    if params.get("sdr_agc"):
+        with contextlib.suppress(Exception):
+            dev.setGainMode(SOAPY_SDR_RX, ch, True)  # hardware AGC
+        gain_str = "AGC"
+    elif isinstance(gain_db, (int, float)) and not isinstance(gain_db, bool):
+        dev.setGain(SOAPY_SDR_RX, ch, float(gain_db))
+        gain_str = f"{float(gain_db):.1f} dB"
+    else:
+        with contextlib.suppress(Exception):
+            dev.setGainMode(SOAPY_SDR_RX, ch, False)  # disable AGC
+        dev.setGain(SOAPY_SDR_RX, ch, float(_DEFAULT_SDR_GAIN_DB))
+        gain_str = f"{_DEFAULT_SDR_GAIN_DB:.1f} dB (default)"
+    log.info(
+        "dsp SDR: %s ch=%d rate=%.0f freq=%.0f lo_offset=%.0f gain=%s ppm=%.2f "
+        "dc_removal=%s — opening RX stream",
+        args.sdr_args, ch, rate, freq, lo, gain_str, env["ppm"], env["dc_removal"],
+    )
+
+    stream = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [ch])
     dev.activateStream(stream)
     buff = np.empty(_READ_CHUNK, dtype=np.complex64)
+    total = reads = timeouts = overflows = errors = 0
     try:
         while True:
-            sr = dev.readStream(stream, [buff], len(buff))
+            # 1 s timeout so a stalled SDR surfaces as logged timeouts, not a silent
+            # spin (the old loop swallowed every ret<=0 and recorded nothing).
+            sr = dev.readStream(stream, [buff], len(buff), timeoutUs=1_000_000)
             if sr.ret > 0:
+                total += sr.ret
+                reads += 1
+                if reads == 1:
+                    log.info("dsp SDR: streaming — first %d samples received", sr.ret)
+                elif reads % 5000 == 0:
+                    log.info("dsp SDR: %.2f Msamples read so far", total / 1e6)
                 yield buff[: sr.ret].copy()
+            elif sr.ret == SOAPY_SDR_TIMEOUT:
+                timeouts += 1
+                if timeouts in (1, 10, 100) or timeouts % 1000 == 0:
+                    log.warning(
+                        "dsp SDR: readStream TIMEOUT x%d — no samples from %s "
+                        "(check antenna/clock/driver)", timeouts, args.sdr_args,
+                    )
+            elif sr.ret == SOAPY_SDR_OVERFLOW:
+                overflows += 1  # 'O' — host not draining fast enough; keep going
+            else:
+                errors += 1
+                if errors in (1, 10) or errors % 1000 == 0:
+                    log.warning("dsp SDR: readStream error ret=%d flags=%d", sr.ret, sr.flags)
     finally:
+        log.info(
+            "dsp SDR: closing stream — total=%.2f Ms reads=%d timeouts=%d overflows=%d errors=%d",
+            total / 1e6, reads, timeouts, overflows, errors,
+        )
         dev.deactivateStream(stream)
         dev.closeStream(stream)
 
@@ -198,7 +314,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
 
     def _reader() -> None:
         try:
-            for chunk in _open_iq_source(args):
+            for chunk in _open_iq_source(args, params):
                 if stop_requested.is_set():
                     break
                 arr = np.asarray(chunk, dtype=np.complex64)

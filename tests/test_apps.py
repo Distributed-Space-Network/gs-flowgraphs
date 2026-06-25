@@ -90,12 +90,12 @@ def test_tx_endurosat_to_rx_endurosat(tmp_path):
 def test_engine_selection_precedence(monkeypatch):
     ns = argparse.Namespace(engine="")
     monkeypatch.delenv("GS_FLOWGRAPH_ENGINE", raising=False)
-    assert rxapp._select_engine(ns, {}) == "dsp"  # default
-    assert rxapp._select_engine(ns, {"engine": "gnuradio"}) == "gnuradio"  # params
-    monkeypatch.setenv("GS_FLOWGRAPH_ENGINE", "gnuradio")
-    assert rxapp._select_engine(ns, {}) == "gnuradio"  # env over default
-    assert rxapp._select_engine(argparse.Namespace(engine="dsp"), {}) == "dsp"  # flag wins
-    assert rxapp._select_engine(argparse.Namespace(engine="bogus"), {}) == "dsp"  # fallback
+    assert rxapp._select_engine(ns, {}) == "gnuradio"  # default (gr-soapy hardware path)
+    assert rxapp._select_engine(ns, {"engine": "dsp"}) == "dsp"  # params override
+    monkeypatch.setenv("GS_FLOWGRAPH_ENGINE", "dsp")
+    assert rxapp._select_engine(ns, {}) == "dsp"  # env over default
+    assert rxapp._select_engine(argparse.Namespace(engine="gnuradio"), {}) == "gnuradio"  # flag
+    assert rxapp._select_engine(argparse.Namespace(engine="bogus"), {}) == "gnuradio"  # fallback
 
 
 def test_dsp_engine_decodes_capture_from_file(tmp_path):

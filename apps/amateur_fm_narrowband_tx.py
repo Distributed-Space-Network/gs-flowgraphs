@@ -45,7 +45,7 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
-from _soapy import make_sink
+from _soapy import apply_corrections, configure_soapy_source, make_sink, merge_sdr_params, sdr_env
 from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
@@ -88,7 +88,6 @@ def build_top_block(
     p: dict[str, object] = params or {}
     tone_hz = float(p.get("tone_hz", _TONE_HZ))  # type: ignore[arg-type]
     fm_deviation_hz = float(p.get("fm_deviation_hz", _FM_DEVIATION_HZ))  # type: ignore[arg-type]
-    sdr_gain_db = float(p.get("sdr_gain_db", 30.0))  # type: ignore[arg-type]
 
     tb = gr.top_block("amateur_fm_narrowband_tx")
 
@@ -125,8 +124,10 @@ def build_top_block(
     # ----------------------------------------------------- soapy sink
     sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, float(args.sample_rate))
-    sink.set_frequency(0, float(args.center_freq_hz))
-    sink.set_gain(0, sdr_gain_db)
+    sink.set_frequency(0, float(args.center_freq_hz))  # TX: no LO offset (modulator at baseband 0)
+    # antenna + PA gain. Precedence: sdr_gain_db param > GS_SDR_GAIN_DB env > 30 dB.
+    configure_soapy_source(sink, merge_sdr_params(p))
+    apply_corrections(sink, ppm=sdr_env()["ppm"], dc_removal=False)
     sink.set_bandwidth(0, float(args.bandwidth_hz) if args.bandwidth_hz else 200_000.0)
 
     tb.connect(tone, fm_mod, interp_filter, sink)

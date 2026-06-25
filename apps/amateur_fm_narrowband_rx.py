@@ -60,7 +60,15 @@ from _spawn_contract import (
     send_event,
 )
 from _recorder import PassRecorder
-from _soapy import make_source
+from _soapy import (
+    apply_corrections,
+    configure_soapy_source,
+    make_source,
+    merge_sdr_params,
+    retune_source,
+    sdr_env,
+    tune_source,
+)
 from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
@@ -114,20 +122,29 @@ class FlowgraphContext:
     pipeline without globals.
     """
 
-    def __init__(self, tb: gr.top_block, src: object, recorder: object = None) -> None:
+    def __init__(
+        self,
+        tb: gr.top_block,
+        src: object,
+        recorder: object = None,
+        lo_offset_hz: float = 0.0,
+    ) -> None:
         self.tb = tb
         self.src = src
         self.recorder = recorder  # pre-demod IQ capture (PassRecorder) or None
+        self.lo_offset_hz = lo_offset_hz  # LO offset the Doppler retune must preserve
 
 
-def _retune_locked(tb: gr.top_block, src: object, new_freq_hz: float) -> None:
+def _retune_locked(
+    tb: gr.top_block, src: object, new_freq_hz: float, lo_offset_hz: float = 0.0
+) -> None:
     """Retune the running source under tb.lock()/unlock(). Called
     from :func:`asyncio.to_thread` so the asyncio loop doesn't block
-    on the GR scheduler.
+    on the GR scheduler. Preserves the LO offset (moves only the RF component).
     """
     try:
         tb.lock()
-        src.set_frequency(0, new_freq_hz)
+        retune_source(src, new_freq_hz, lo_offset_hz, 0.0)
     finally:
         tb.unlock()
 
@@ -154,7 +171,6 @@ def build_top_block(
     Unknown keys are ignored. Missing keys fall back to defaults.
     """
     p: dict[str, object] = params or {}
-    sdr_gain_db = float(p.get("sdr_gain_db", 30.0))  # type: ignore[arg-type]
     fm_deviation_hz = float(p.get("fm_deviation_hz", 5_000.0))  # type: ignore[arg-type]
     deemph_tau_s = float(p.get("deemph_tau_s", 75e-6))  # type: ignore[arg-type]
     audio_cutoff_hz = float(p.get("audio_cutoff_hz", 3_500.0))  # type: ignore[arg-type]
@@ -165,10 +181,15 @@ def build_top_block(
     # SoapySDR source via gr-soapy. ``driver`` keyword string from
     # --sdr-args is parsed by gr-soapy itself; pass ``soapy_args``
     # exactly as the orchestrator built it.
+    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal)
+    lo_offset_hz = env["lo_offset_hz"]
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, float(args.sample_rate))
-    src.set_frequency(0, float(args.center_freq_hz))
-    src.set_gain(0, sdr_gain_db)
+    tune_source(src, float(args.center_freq_hz), lo_offset_hz)  # LO offset → DC spike off-signal
+    # antenna + gain (else the front-end is on a disconnected antenna / 0 dB).
+    # Precedence: per-pass sdr_gain_db param > GS_SDR_GAIN_DB env > 30 dB default.
+    configure_soapy_source(src, merge_sdr_params(p))
+    apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
     src.set_bandwidth(0, float(args.bandwidth_hz) if args.bandwidth_hz else 200_000.0)
 
     # ----------------------------------------------------- channel filter
@@ -215,7 +236,7 @@ def build_top_block(
 
     # Pre-demod IQ capture taps the SAME source, in parallel with the FM chain.
     recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(args.sample_rate))
-    return FlowgraphContext(tb=tb, src=src, recorder=recorder)
+    return FlowgraphContext(tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz)
 
 
 # ----------------------------------------------------------------------
@@ -239,6 +260,7 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
     ctx = build_top_block(args, data_queue, params=params)
     tb = ctx.tb
     src = ctx.src
+    lo_offset_hz = ctx.lo_offset_hz  # preserved across Doppler retunes (_on_set_doppler)
     pump_task = asyncio.create_task(
         pump_data_queue(data_queue, sockets.data_writer),
         name="data-pump",
@@ -292,7 +314,7 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         # flowgraph propagation, re-tune, resume. Source supports
         # live set_frequency without lock/unlock on most SoapySDR
         # devices, but locking is the documented-safe path.
-        await asyncio.to_thread(_retune_locked, tb, src, new_freq)
+        await asyncio.to_thread(_retune_locked, tb, src, new_freq, lo_offset_hz)
 
     # --------------------------------------------------- signal-event task
     async def _emit_signal_events() -> None:

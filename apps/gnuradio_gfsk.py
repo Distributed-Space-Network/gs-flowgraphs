@@ -24,7 +24,16 @@ import queue
 
 import numpy as np
 from _recorder import PassRecorder
-from _soapy import configure_soapy_source, make_sink, make_source
+from _soapy import (
+    apply_corrections,
+    configure_soapy_source,
+    make_sink,
+    make_source,
+    merge_sdr_params,
+    retune_source,
+    sdr_env,
+    tune_source,
+)
 from gnuradio import analog, blocks, digital, gr
 
 from gfsk_ax25 import ax25, endurosat, framing
@@ -53,12 +62,19 @@ class _BitSink(gr.sync_block):
 
 class _RxContext:
     def __init__(
-        self, tb: gr.top_block, src, sink: _BitSink, center_hz: float, recorder=None
+        self,
+        tb: gr.top_block,
+        src,
+        sink: _BitSink,
+        center_hz: float,
+        recorder=None,
+        lo_offset_hz: float = 0.0,
     ) -> None:
         self.tb = tb
         self.src = src
         self._sink = sink
         self._center = center_hz
+        self._lo_offset = lo_offset_hz
         self._recorder = recorder
 
     def start(self) -> None:
@@ -77,7 +93,7 @@ class _RxContext:
         return self._sink.drain()
 
     def set_doppler(self, offset_hz: float) -> None:
-        self.src.set_frequency(0, self._center + offset_hz)
+        retune_source(self.src, self._center, self._lo_offset, offset_hz)
 
 
 def build_rx_top_block(
@@ -86,11 +102,14 @@ def build_rx_top_block(
     sps = sample_rate / profile.symbol_rate_hz
     deviation = profile.mod_index * profile.symbol_rate_hz / 2.0
 
+    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal)
+    lo = env["lo_offset_hz"]
     tb = gr.top_block("cubesat_gfsk_ax25_rx_gr")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, float(sample_rate))
-    src.set_frequency(0, float(args.center_freq_hz))
-    configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
+    tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
+    configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
+    apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
 
     # Quadrature demod: output is instantaneous frequency scaled so +/- deviation
     # maps to ~+/-1 (gain = fs / (2*pi*deviation)).
@@ -115,7 +134,7 @@ def build_rx_top_block(
     tb.connect(src, quad, ted, slicer, sink)
     # Pre-demod IQ capture taps the SAME source, in parallel with the demod chain.
     recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
-    return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder)
+    return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 
 def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile) -> None:
@@ -141,8 +160,8 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
     mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=profile.bt)
     sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, sample_rate)
-    sink.set_frequency(0, float(args.center_freq_hz))
-    configure_soapy_source(sink, params)  # TX antenna + gain (PA drive)
+    sink.set_frequency(0, float(args.center_freq_hz))  # TX: no LO offset (mod at baseband 0)
+    configure_soapy_source(sink, merge_sdr_params(params))  # TX antenna + gain (PA drive)
     tb.connect(src, mod, sink)
     tb.run()
 

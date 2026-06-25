@@ -28,7 +28,15 @@ from __future__ import annotations
 import queue
 
 from _recorder import PassRecorder
-from _soapy import configure_soapy_source, make_source
+from _soapy import (
+    apply_corrections,
+    configure_soapy_source,
+    make_source,
+    merge_sdr_params,
+    retune_source,
+    sdr_env,
+    tune_source,
+)
 from gnuradio import gr
 
 # gr-satellites flowgraph component. Import name/shape may vary by version
@@ -62,12 +70,19 @@ class _FrameSink(gr.basic_block):
 
 class _SatContext:
     def __init__(
-        self, tb: gr.top_block, src, sink: _FrameSink, center_hz: float, recorder=None
+        self,
+        tb: gr.top_block,
+        src,
+        sink: _FrameSink,
+        center_hz: float,
+        recorder=None,
+        lo_offset_hz: float = 0.0,
     ) -> None:
         self.tb = tb
         self.src = src
         self._sink = sink
         self._center = center_hz
+        self._lo_offset = lo_offset_hz
         self._recorder = recorder
 
     def start(self) -> None:
@@ -86,7 +101,7 @@ class _SatContext:
         return self._sink.drain()
 
     def set_doppler(self, offset_hz: float) -> None:
-        self.src.set_frequency(0, self._center + offset_hz)
+        retune_source(self.src, self._center, self._lo_offset, offset_hz)
 
 
 def build_satellites_rx(
@@ -103,11 +118,14 @@ def build_satellites_rx(
     the decoded-frame message port name against the installed gr-satellites
     version. The shape below follows the documented embedding pattern.
     """
+    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal)
+    lo = env["lo_offset_hz"]
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, float(sample_rate))
-    src.set_frequency(0, float(args.center_freq_hz))
-    configure_soapy_source(src, params)  # antenna + gain (else front-end sits at 0 dB)
+    tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
+    configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
+    apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
 
     # NORAD id (e.g. "40071") -> norad=; otherwise treat it as a SatYAML name.
     sat_sel = {"norad": int(satellite)} if str(satellite).isdigit() else {"name": satellite}
@@ -123,7 +141,7 @@ def build_satellites_rx(
     tb.msg_connect(flowgraph, "out", sink, "in")
     # Pre-demod IQ capture taps the SAME source, in parallel with the decoder.
     recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
-    return _SatContext(tb, src, sink, float(args.center_freq_hz), recorder)
+    return _SatContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 
 __all__ = ["build_satellites_rx"]
