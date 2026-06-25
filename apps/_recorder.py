@@ -249,8 +249,56 @@ class PassRecorder:
             self._sdf_path.unlink(missing_ok=True)
 
 
+class StreamRecorder:
+    """Engine-agnostic IQ capture for the **numpy (dsp) path**: append complex64
+    chunks to the SDF as they stream off the SDR, then derive CSV/PNG at finalize.
+    Pure numpy — no GNU Radio (the GR engines use :class:`PassRecorder` instead).
+    ``write`` records the RAW pre-demod chunk (before any Doppler NCO / demod)."""
+
+    def __init__(
+        self, sdf_path: Path, center_hz: float, sample_rate_hz: float, formats: tuple[str, ...]
+    ) -> None:
+        self._sdf_path = sdf_path
+        self._center_hz = center_hz
+        self._sample_rate_hz = sample_rate_hz
+        self._formats = formats
+        self._started = _dt.datetime.now(_dt.UTC)
+        self._fh = sdf_path.open("wb")
+
+    @classmethod
+    def maybe_start(cls, args, *, sample_rate_hz: float):  # type: ignore[no-untyped-def]
+        """A recorder writing ``<output_dir>/<dir-name>.sdf``, or None when capture
+        is off."""
+        if not getattr(args, "record_iq", False):
+            return None
+        formats = parse_formats(getattr(args, "record_formats", ""))
+        if not formats:
+            return None
+        out = Path(args.output_dir or ".")
+        out.mkdir(parents=True, exist_ok=True)
+        sdf_path = out / f"{out.name or 'capture'}.sdf"
+        return cls(sdf_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
+
+    def write(self, chunk: np.ndarray) -> None:
+        self._fh.write(iq_to_sdf_bytes(chunk))
+
+    def finalize(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()
+        finalize_recording(
+            self._sdf_path,
+            center_hz=self._center_hz,
+            sample_rate_hz=self._sample_rate_hz,
+            formats=self._formats,
+            started_utc=self._started,
+        )
+        if "sdf" not in self._formats:
+            self._sdf_path.unlink(missing_ok=True)
+
+
 __all__ = [
     "PassRecorder",
+    "StreamRecorder",
     "finalize_recording",
     "iq_to_sdf_bytes",
     "make_sdf_sink",

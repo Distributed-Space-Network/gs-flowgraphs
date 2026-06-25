@@ -31,6 +31,7 @@ import os
 import sys
 
 import numpy as np
+from _recorder import StreamRecorder
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
@@ -192,16 +193,23 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     loop = asyncio.get_running_loop()
+    # Pre-demod IQ capture: record the RAW chunk (before the Doppler NCO / demod).
+    recorder = StreamRecorder.maybe_start(args, sample_rate_hz=sample_rate)
 
     def _reader() -> None:
         try:
             for chunk in _open_iq_source(args):
                 if stop_requested.is_set():
                     break
-                loop.call_soon_threadsafe(queue.put_nowait, np.asarray(chunk, dtype=np.complex64))
+                arr = np.asarray(chunk, dtype=np.complex64)
+                if recorder is not None:
+                    recorder.write(arr)
+                loop.call_soon_threadsafe(queue.put_nowait, arr)
         except Exception:
             log.exception("IQ source error")
         finally:
+            if recorder is not None:
+                recorder.finalize()  # close SDF + derive CSV/PNG (numpy; in this worker thread)
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     reader_task = loop.run_in_executor(None, _reader)

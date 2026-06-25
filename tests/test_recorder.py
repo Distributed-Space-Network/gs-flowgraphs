@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from _recorder import (
     PassRecorder,
+    StreamRecorder,
     finalize_recording,
     iq_to_sdf_bytes,
     parse_formats,
@@ -71,3 +72,31 @@ def test_passrecorder_finalize_drops_unrequested_sdf(tmp_path: Path) -> None:
     assert not sdf.exists()  # raw SDF removed since it wasn't a requested format
     assert sdf.with_suffix(".csv").exists()
     assert sdf.with_suffix(".png").exists()
+
+
+def test_stream_recorder_dsp_path_writes_all_three(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    out = tmp_path / "cmd_32_32"
+    out.mkdir()
+    args = SimpleNamespace(
+        record_iq=True,
+        record_formats="sdf,csv,png",
+        output_dir=str(out),
+        center_freq_hz=401_762_500,
+    )
+    rec = StreamRecorder.maybe_start(args, sample_rate_hz=48000.0)
+    assert rec is not None
+    for _ in range(4):  # stream several chunks, as the dsp reader does
+        rec.write(_tone(1024))
+    rec.finalize()
+    assert (out / "cmd_32_32.sdf").exists()  # named after the pass dir
+    assert (out / "cmd_32_32.csv").exists()
+    assert (out / "cmd_32_32.png").exists()
+
+
+def test_stream_recorder_off_when_disabled() -> None:
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(record_iq=False, record_formats="", output_dir=".", center_freq_hz=1)
+    assert StreamRecorder.maybe_start(args, sample_rate_hz=1.0) is None

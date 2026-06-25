@@ -59,6 +59,7 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
+from _recorder import PassRecorder
 from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
@@ -112,9 +113,10 @@ class FlowgraphContext:
     pipeline without globals.
     """
 
-    def __init__(self, tb: gr.top_block, src: object) -> None:
+    def __init__(self, tb: gr.top_block, src: object, recorder: object = None) -> None:
         self.tb = tb
         self.src = src
+        self.recorder = recorder  # pre-demod IQ capture (PassRecorder) or None
 
 
 def _retune_locked(tb: gr.top_block, src: object, new_freq_hz: float) -> None:
@@ -218,7 +220,9 @@ def build_top_block(
     # ----------------------------------------------------- connect
     tb.connect(src, chan, demod, audio_lpf, deemph, sink)
 
-    return FlowgraphContext(tb=tb, src=src)
+    # Pre-demod IQ capture taps the SAME source, in parallel with the FM chain.
+    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(args.sample_rate))
+    return FlowgraphContext(tb=tb, src=src, recorder=recorder)
 
 
 # ----------------------------------------------------------------------
@@ -330,8 +334,10 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
             try:
                 tb.stop()
                 tb.wait()
+                if ctx.recorder is not None:
+                    ctx.recorder.finalize()  # SDF flushed by the sink's stop(); derive CSV/PNG
             except Exception:
-                log.exception("tb.stop/wait raised")
+                log.exception("tb.stop/wait/recorder raised")
         # Tear down data pump.
         data_queue.put(None)
         signal_task.cancel()
