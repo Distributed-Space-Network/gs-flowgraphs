@@ -223,15 +223,17 @@ def make_sdf_sink(path: Path, *, headroom: float = _HEADROOM):  # type: ignore[n
     return _SdfSink()
 
 
-_PNG_HEAD_SECONDS = 4.0  # waterfall quick-look from the first N s (full wideband is huge)
+_CSV_HEAD_SECONDS = 30.0  # VSA CSV is a leading window (a full-pass CSV is GB-scale text)
 
 
 class PassRecorder:
-    """Per-pass wideband IQ capture for a GNU Radio engine. ``maybe_start`` taps the SDR
-    source with a **native** cf32 file sink (robust at the 2+ Msps capture rate);
-    ``finalize`` derives a quick-look waterfall PNG from the head of the capture. The
-    ``.cf32`` raw IQ is the artifact — directly replayable through the dsp engine /
-    ``iq_analyze`` — so it is always kept (the SatNOGS "record every pass" model)."""
+    """Per-pass channel IQ capture for a GNU Radio engine. ``maybe_start`` taps the
+    (decimated) channel stream with a **native** cf32 file sink — small, fast, and
+    crash-safe (unbuffered, so the IQ is on disk even if the gr-soapy source hangs at
+    stop). ``finalize`` derives a full-pass waterfall PNG + a leading VSA CSV from that
+    on-disk cf32 (no dependency on ``tb.wait()``). The ``.cf32`` raw IQ is the artifact —
+    directly replayable through the dsp engine / ``iq_analyze`` — and always kept
+    (the SatNOGS "record every pass" model)."""
 
     def __init__(
         self, iq_path: Path, center_hz: float, sample_rate_hz: float, formats: tuple[str, ...]
@@ -258,15 +260,31 @@ class PassRecorder:
         return cls(iq_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
 
     def finalize(self) -> None:
-        # The cf32 raw IQ is written in real time and is the artifact. Derive a
-        # waterfall PNG from the first few seconds (rendering a multi-GB wideband
-        # capture whole is neither feasible nor useful). Best-effort — never raises.
-        if "png" in self._formats and self._iq_path.exists():
-            with contextlib.suppress(Exception):
-                head = max(1, int(self._sample_rate_hz * _PNG_HEAD_SECONDS))
-                iq = np.fromfile(self._iq_path, dtype=np.complex64, count=head)
-                if iq.size:
-                    write_waterfall_png(self._iq_path.with_suffix(".png"), iq)
+        # The cf32 raw IQ is written in real time and is the artifact. Derive the view
+        # formats from it on disk (NOT from a GR sink), so they're produced even when the
+        # gr-soapy source hangs at stop. memmap the capture so the waterfall samples
+        # across the whole pass without loading it all into RAM. Best-effort — never raises.
+        want_png, want_csv = "png" in self._formats, "csv" in self._formats
+        if not (want_png or want_csv) or not self._iq_path.exists():
+            return
+        n_samp = self._iq_path.stat().st_size // 8  # 8 B per complex64; floor a torn write
+        if n_samp < 1:  # need at least one whole sample
+            return
+        with contextlib.suppress(Exception):
+            # shape= truncates a torn final write (SIGTERM mid-write) to whole samples,
+            # so a non-multiple-of-8 file still yields the PNG/CSV instead of raising.
+            iq = np.memmap(self._iq_path, dtype=np.complex64, mode="r", shape=(n_samp,))
+            if want_png:  # full-pass waterfall (spectrogram bounds its row count)
+                write_waterfall_png(self._iq_path.with_suffix(".png"), iq)
+            if want_csv:  # leading window only — the full IQ lives in the .cf32
+                n = max(1, int(self._sample_rate_hz * _CSV_HEAD_SECONDS))
+                write_vsa_csv(
+                    self._iq_path.with_suffix(".csv"),
+                    np.asarray(iq[:n]),
+                    center_hz=self._center_hz,
+                    sample_rate_hz=self._sample_rate_hz,
+                    started_utc=self._started,
+                )
 
 
 class StreamRecorder:

@@ -127,7 +127,9 @@ def build_top_block(
     # antenna + PA gain. Precedence: sdr_gain_db param > GS_SDR_GAIN_DB env > 30 dB.
     configure_soapy_source(sink, merge_sdr_params(p))
     apply_corrections(sink, ppm=sdr_env()["ppm"], dc_removal=False)
-    sink.set_bandwidth(0, float(args.bandwidth_hz) if args.bandwidth_hz else 200_000.0)
+    # Analog TX filter ≈ the SDR sample rate, NOT the narrow channel width — the latter is
+    # below the device filter floor (~0.8 MHz on the XTRX) and would break the path.
+    sink.set_bandwidth(0, float(args.sample_rate))
 
     tb.connect(tone, fm_mod, interp_filter, sink)
     return FlowgraphContext(tb=tb, sink=sink)

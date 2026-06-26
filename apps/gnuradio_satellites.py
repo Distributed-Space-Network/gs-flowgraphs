@@ -26,10 +26,10 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import logging
-import os
 import queue
 import re
 
+from _fallback_select import fallback_modes  # pure mode-selection (testable, no GNU Radio)
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
@@ -49,18 +49,10 @@ from gnuradio import gr
 from satellites.core import gr_satellites_flowgraph
 
 _log = logging.getLogger("gr_satellites_rx")
-
-# Fallback demods run in parallel (all tap one decimator) when gr-satellites has no
-# decoder for a bird — frames come from whichever locks. Covers the frame-producing
-# modulations of 401 MHz LEO cubesats: GFSK/FSK/GMSK, BPSK/QPSK/PSK, AFSK. Override per
-# station with GS_FALLBACK_DEMODS (comma list of "<kind><rate>"); trim it if the SoC is
-# CPU-bound. (FM here would be voice/APT — no frames — so the IQ recording covers it.)
-_DEFAULT_FALLBACK_DEMODS = (
-    "gfsk9600,gfsk4800,gmsk9600,gmsk4800,bpsk1200,bpsk9600,qpsk9600,afsk1200"
-)
-# Channel rate the fallback demods run at (the SDR rate is decimated to this). ~5 sps
-# for 9k6, ~10 for 4k8; ±25 kHz covers a typical narrowband cubesat downlink.
-_FALLBACK_CHANNEL_RATE = 50_000
+# When gr-satellites can't decode a bird, fallback demods run in parallel (all tap one
+# decimator) — frames come from whichever locks. The SET is chosen by
+# ``_fallback_select.fallback_modes`` (backend symbol_rate/modulation when known, else the
+# full bank); GS_FALLBACK_DEMODS overrides. Covers GFSK/FSK/GMSK, BPSK/QPSK/PSK, AFSK.
 
 
 class _FrameSink(gr.basic_block):
@@ -98,6 +90,8 @@ class _SatContext:
         lo_offset_hz: float = 0.0,
         *,
         fallbacks=None,
+        chan=None,
+        sample_rate: float = 0.0,
     ) -> None:
         self.tb = tb
         self.src = src
@@ -106,30 +100,65 @@ class _SatContext:
         self._lo_offset = lo_offset_hz
         self._recorder = recorder
         # When gr-satellites has no decoder for this bird, ``fallbacks`` is a list of
-        # _FallbackDemod tapping the source in parallel; frames come from any of them.
+        # _FallbackDemod tapping ``chan`` in parallel; frames come from any of them.
         self._fallbacks = list(fallbacks or [])
+        self._chan = chan if chan is not None else src  # demod tap point for escalation
+        self._sample_rate = sample_rate
+        self._escalated = False
 
     @property
     def framing(self) -> str:
         return "fallback" if self._fallbacks else "grsatellites"
+
+    def escalate_fallbacks(self) -> None:
+        """No frames decoded → add the full fallback bank to the RUNNING graph (the
+        backend's targeted mode / gr-satellites didn't lock). Idempotent + best-effort:
+        wrapped so a reconfiguration hiccup can't break the recording or the pass; the
+        native cf32 sink is independent of this. BENCH-PENDING: runtime tb.lock()/unlock()
+        reconfiguration — validate on hardware."""
+        if self._escalated:
+            return
+        self._escalated = True
+        try:
+            running = {f.name for f in self._fallbacks}
+            modes = [m for m in fallback_modes(None) if m.strip().lower() not in running]
+            if not modes:
+                return
+            self.tb.lock()
+            try:
+                added = _build_fallbacks(self.tb, self._chan, self._sample_rate, modes=modes)
+            finally:
+                self.tb.unlock()
+            self._fallbacks.extend(added)
+            _log.warning(
+                "no frames yet → escalated to fallback bank (+%d demods: %s)",
+                len(added),
+                ", ".join(f.name for f in added) or "(none)",
+            )
+        except Exception:
+            _log.exception("fallback escalation failed; continuing with current demods")
 
     def start(self) -> None:
         self.tb.start()
 
     def stop(self) -> None:
         self.tb.stop()
-        self.tb.wait()  # let the IQ sink flush before finalize
+        # Finalize BEFORE tb.wait(): the native cf32 sink has already flushed to disk, and
+        # gr-soapy's source can hang tb.wait() (→ SIGTERM), which would otherwise skip the
+        # PNG/CSV derivation. finalize reads the on-disk cf32, so it needs no running graph.
         if self._recorder is not None:
             self._recorder.finalize()
+        self.tb.wait()
 
     def wait(self) -> None:
         self.tb.wait()
 
     def drain_frames(self) -> list[bytes]:
-        if not self._fallbacks:
-            return self._sink.drain()  # gr-satellites decoded PDUs
-        frames: list[bytes] = []
-        for fb in self._fallbacks:  # try every configured fallback demod
+        # gr-satellites PDUs (empty when the sink is unconnected in fallback mode) PLUS
+        # every fallback demod — so escalation works whichever was primary. Snapshot the
+        # list: escalate_fallbacks() may extend it from a worker thread.
+        frames: list[bytes] = list(self._sink.drain())
+        for fb in list(self._fallbacks):
             frames.extend(fb.drain_frames())
         return frames
 
@@ -176,11 +205,15 @@ def _bits_deframe(bit_sink) -> list[bytes]:
 _PSK_ORDER = {"bpsk": 2, "psk": 2, "qpsk": 4}
 
 
-def _build_fallbacks(tb, demod_src, sample_rate: float) -> list[_FallbackDemod]:
-    """Build every configured fallback demod, all tapping ``demod_src`` (already at the
-    channel rate, so they fan out from a single decimator). Covers the frame-producing
-    modulations of 401 MHz LEO cubesats: GFSK / FSK / GMSK, BPSK / QPSK / PSK, AFSK.
-    All share the modulation-agnostic ``_bits_deframe``."""
+def _build_fallbacks(
+    tb, demod_src, sample_rate: float, params=None, modes=None
+) -> list[_FallbackDemod]:
+    """Build the selected fallback demods, all tapping ``demod_src`` (already at the
+    channel rate, so they fan out from a single decimator). The set is ``modes`` if given
+    (an explicit ``"<kind><rate>"`` list, used by runtime escalation), else chosen by
+    ``_fallback_select.fallback_modes`` (backend mode if known, else the full bank). Covers
+    the frame-producing modulations of 401 MHz LEO cubesats: GFSK / FSK / GMSK, BPSK /
+    QPSK / PSK, AFSK. All share the modulation-agnostic ``_bits_deframe``."""
     from gnuradio_gfsk import (  # noqa: PLC0415
         connect_afsk_demod,
         connect_gfsk_demod,
@@ -189,7 +222,8 @@ def _build_fallbacks(tb, demod_src, sample_rate: float) -> list[_FallbackDemod]:
 
     from gfsk_ax25 import endurosat  # noqa: PLC0415
 
-    modes = (os.environ.get("GS_FALLBACK_DEMODS", "") or _DEFAULT_FALLBACK_DEMODS).split(",")
+    if modes is None:
+        modes = fallback_modes(params)
     out: list[_FallbackDemod] = []
     for raw in modes:
         mode = raw.strip().lower()
@@ -246,10 +280,11 @@ def build_satellites_rx(
     """
     env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal/rate)
     lo = env["lo_offset_hz"]
-    # The SDR samples at the capture rate (XTRX can't stream the narrow channel rate).
-    # gr-satellites resamples internally (fed the SDR rate); the fallback demods get a
-    # single shared decimator down to the channel rate.
-    sdr_rate, _ = capture_plan(env["capture_rate_hz"], float(sample_rate))
+    # The SDR samples at the capture rate (XTRX can't stream the narrow channel rate), so
+    # decimate to the CHANNEL rate ONCE and feed everything (recorder, gr-satellites, the
+    # fallback demods) from it. This is what makes the recording the narrow channel
+    # (~MB/min) instead of the multi-GB wideband capture.
+    sdr_rate, decimate = capture_plan(env["capture_rate_hz"], float(sample_rate))
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
@@ -257,9 +292,14 @@ def build_satellites_rx(
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
 
-    # Pre-demod IQ capture FIRST (the priority): it taps the SDR source independently of
-    # the decoder, so a decoder problem never costs us the recording. At the SDR rate.
-    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=sdr_rate)
+    chan = src
+    if decimate:
+        chan = make_decimator(sdr_rate, float(sample_rate))
+        tb.connect(src, chan)
+
+    # Pre-demod IQ capture FIRST (the priority): it taps the channel independently of the
+    # decoder, so a decoder problem never costs us the recording. At the CHANNEL rate.
+    recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
 
     # gr-satellites decoder if the bird is in its catalog; else fall back. ``flowgraph``
     # is instantiated DIRECTLY (no ``.make()``) as a hier block exposing an 'out' PDU.
@@ -270,30 +310,35 @@ def build_satellites_rx(
         if selector is None:
             raise ValueError(f"no usable satellite id {satellite!r}")
         flowgraph = gr_satellites_flowgraph(
-            samp_rate=sdr_rate,  # gr-satellites decimates to the bird's rate internally
+            samp_rate=float(sample_rate),  # the channel rate; gr-satellites resamples to the bird
             iq=True,
             grc_block=True,
             **selector,
         )
-        tb.connect(src, flowgraph)
+        tb.connect(chan, flowgraph)
         tb.msg_connect(flowgraph, "out", sink, "in")
-        _log.info("gr-satellites: decoding %s (%r)", satellite, selector)
+        _log.info("gr-satellites: decoding %s (%r) @ %.0f Hz", satellite, selector, sample_rate)
     except Exception as e:  # noqa: BLE001 — any build failure → fall back, keep the IQ
-        # Not in gr-satellites' catalog (or API drift): switch to the fallback demods.
-        # gr-satellites' samp_rate is wideband (~2 MHz); the GFSK fallback needs a narrow
-        # CHANNEL rate (few sps), so decimate the SDR rate to _FALLBACK_CHANNEL_RATE once
-        # and fan all fallbacks out from it.
+        # Not in gr-satellites' catalog (or API drift): fan the fallback demods out from
+        # the same channel decimator.
         _log.warning("gr-satellites: no decoder for %s (%s) → fallback demods", satellite, e)
-        channel = make_decimator(sdr_rate, float(_FALLBACK_CHANNEL_RATE))
-        tb.connect(src, channel)
-        fallbacks = _build_fallbacks(tb, channel, float(_FALLBACK_CHANNEL_RATE))
+        fallbacks = _build_fallbacks(tb, chan, float(sample_rate), params)
         _log.info(
-            "fallback demods @ %d Hz: %s",
-            _FALLBACK_CHANNEL_RATE,
+            "fallback demods @ %.0f Hz (symbol_rate=%s): %s",
+            sample_rate,
+            (params or {}).get("symbol_rate_hz", "?"),
             ", ".join(f.name for f in fallbacks) or "(none)",
         )
     return _SatContext(
-        tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo, fallbacks=fallbacks
+        tb,
+        src,
+        sink,
+        float(args.center_freq_hz),
+        recorder,
+        lo_offset_hz=lo,
+        fallbacks=fallbacks,
+        chan=chan,
+        sample_rate=float(sample_rate),
     )
 
 

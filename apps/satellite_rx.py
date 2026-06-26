@@ -22,6 +22,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,11 @@ from _spawn_contract import (
 VERSION = "0.1.0"
 _DECODE_PERIOD_S = 2.0
 _DEFAULT_SAMPLE_RATE = 2_000_000
+# No frames after this many seconds → escalate to the full fallback demod bank as a
+# safety net. The TARGETED demod runs from t=0, so this grace costs nothing on the
+# likely-correct mode; it only delays adding the *other* demods (for a wrong/absent
+# backend mode). Short by default (a pass is minutes); tune with GS_ESCALATE_AFTER_S.
+_ESCALATE_AFTER_S = float(os.environ.get("GS_ESCALATE_AFTER_S") or 30.0)
 
 
 def _append_frame_record(output_dir: str | None, frame: bytes, decoder: str) -> None:
@@ -148,6 +154,8 @@ async def amain(args) -> int:
             stop_requested.set()
             return
         last_doppler = 0.0
+        frames_seen = 0
+        started_at = time.monotonic()
         try:
             while not stop_requested.is_set():
                 await asyncio.sleep(_DECODE_PERIOD_S)
@@ -155,9 +163,15 @@ async def amain(args) -> int:
                     last_doppler = doppler["hz"]
                     ctx.set_doppler(last_doppler)
                 for frame in ctx.drain_frames():
+                    frames_seen += 1
                     await _emit_frame(
                         sockets, frame, satellite, decoder=decoder, output_dir=out_dir
                     )
+                # Third fallback trigger: the backend's targeted mode (or gr-satellites)
+                # produced nothing after the grace window → broaden to the full demod bank
+                # on the running graph. Off the loop thread (reconfiguration may block).
+                if frames_seen == 0 and time.monotonic() - started_at >= _ESCALATE_AFTER_S:
+                    await asyncio.to_thread(ctx.escalate_fallbacks)
         finally:
             ctx.stop()
             ctx.wait()

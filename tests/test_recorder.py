@@ -65,15 +65,16 @@ def test_finalize_derives_vsa_csv_and_waterfall_png(tmp_path: Path) -> None:
     assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"  # PNG signature
 
 
-def test_passrecorder_finalize_keeps_cf32_and_derives_png(tmp_path: Path) -> None:
-    # The GR engine records raw cf32 via a native sink; finalize derives a waterfall
-    # PNG from the head and ALWAYS keeps the cf32 (the replayable record-everything
-    # artifact), regardless of which view formats were requested.
+def test_passrecorder_finalize_derives_views_and_keeps_cf32(tmp_path: Path) -> None:
+    # The GR engine records raw cf32 via a native sink; finalize memmaps it and derives a
+    # full-pass waterfall PNG + a leading VSA CSV, and ALWAYS keeps the cf32 (the
+    # replayable record-everything artifact).
     cf32 = tmp_path / "cmd_42.cf32"
     _tone().astype(np.complex64).tofile(cf32)
-    PassRecorder(cf32, 401_200_000.0, 48000.0, ("png",)).finalize()
+    PassRecorder(cf32, 401_200_000.0, 48000.0, ("csv", "png")).finalize()
     assert cf32.exists()                      # raw IQ kept
-    assert cf32.with_suffix(".png").exists()  # waterfall derived from the head
+    assert cf32.with_suffix(".png").exists()  # full-pass waterfall
+    assert cf32.with_suffix(".csv").exists()  # leading VSA CSV window
 
 
 def test_stream_recorder_dsp_path_writes_all_three(tmp_path: Path) -> None:

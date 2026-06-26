@@ -85,9 +85,11 @@ class _RxContext:
 
     def stop(self) -> None:
         self.tb.stop()
-        self.tb.wait()  # flush + close the SDF sink before deriving CSV/PNG
+        # Finalize BEFORE tb.wait(): the native cf32 sink has flushed to disk, and the
+        # gr-soapy source can hang tb.wait() (→ SIGTERM); finalize reads the on-disk cf32.
         if self._recorder is not None:
             self._recorder.finalize()
+        self.tb.wait()
 
     def wait(self) -> None:
         self.tb.wait()
@@ -202,11 +204,16 @@ def build_rx_top_block(
     tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
+    # Decimate to the channel rate ONCE; the demod chain and the recorder both tap it, so
+    # the capture is the narrow channel (~MB/min), not the multi-GB wideband SDR stream.
+    chan = src
+    if decimate:
+        chan = make_decimator(sdr_rate, float(sample_rate))
+        tb.connect(src, chan)
     sink = connect_gfsk_demod(
-        tb, src, float(sample_rate), profile, decimate=decimate, sdr_rate=sdr_rate
+        tb, chan, float(sample_rate), profile, decimate=False, sdr_rate=float(sample_rate)
     )
-    # Pre-demod IQ capture taps the SAME source (at the SDR/capture rate) → wideband IQ.
-    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=sdr_rate)
+    recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
     return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 

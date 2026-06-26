@@ -195,7 +195,11 @@ def build_top_block(
     # Precedence: per-pass sdr_gain_db param > GS_SDR_GAIN_DB env > 30 dB default.
     configure_soapy_source(src, merge_sdr_params(p))
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
-    src.set_bandwidth(0, float(args.bandwidth_hz) if args.bandwidth_hz else 200_000.0)
+    # Analog RX filter ≈ the SDR CAPTURE rate, NOT the channel width. The XTRX's filter
+    # floor is ~0.8 MHz, so setting it to the narrow channel BW (e.g. --bandwidth-hz
+    # 25000) lands below the floor and breaks the analog path → 0 samples → 0-byte
+    # capture. Channel selectivity is done downstream in DSP (the decimator + chan filter).
+    src.set_bandwidth(0, sdr_rate)
 
     # ----------------------------------------------------- channel filter
     # Pass +/- (channel_bw/2) around DC after the source is centred.
@@ -206,43 +210,51 @@ def build_top_block(
         cutoff_freq=_CHANNEL_BW_HZ / 2.0,
         transition_width=_CHANNEL_BW_HZ * 0.1,
     )
-    decim_to_if = max(1, args.sample_rate // _IF_RATE_HZ)
+    # The channel stream enters at args.sample_rate (the post-decimator channel rate, e.g.
+    # 48 kHz). ``decim_to_if`` is 1 when that's already <= the IF rate, so compute the
+    # ACTUAL rate after the channel filter and drive the demod + audio stages from it.
+    # (The old code hard-coded _IF_RATE_HZ=192 kHz, which inverted the gain + audio rate
+    # whenever sample_rate < 192 kHz — i.e. always, at a 48 kHz channel.)
+    decim_to_if = max(1, int(args.sample_rate) // _IF_RATE_HZ)
+    if_rate = float(args.sample_rate) / decim_to_if
     chan = gr_filter.fir_filter_ccf(decim_to_if, chan_taps)
 
     # ----------------------------------------------------- NBFM demod
     # Quad-demod gain depends on the configured peak deviation; default
     # 5 kHz is the amateur narrowband convention. ``params`` may override
     # for missions that use wider/narrower deviation.
-    quad_gain = _IF_RATE_HZ / (2 * math.pi * fm_deviation_hz)
+    quad_gain = if_rate / (2 * math.pi * fm_deviation_hz)
     demod = analog.quadrature_demod_cf(quad_gain)
 
     # ----------------------------------------------------- audio decimator
-    audio_decim = max(1, _IF_RATE_HZ // _AUDIO_RATE_HZ)
+    audio_decim = max(1, int(if_rate) // _AUDIO_RATE_HZ)
     audio_taps = gr_filter.firdes.low_pass(
         gain=1.0,
-        sampling_freq=float(_IF_RATE_HZ),
+        sampling_freq=if_rate,
         cutoff_freq=audio_cutoff_hz,  # voice bandwidth (param-tunable)
         transition_width=500.0,
     )
     audio_lpf = gr_filter.fir_filter_fff(audio_decim, audio_taps)
 
     # ----------------------------------------------------- de-emphasis
-    # Single-pole filter; tau=75 µs is FM broadcast, tau=50 µs is closer
-    # to amateur spec — backend can override via ``deemph_tau_s``.
-    deemph = analog.fm_deemph(_AUDIO_RATE_HZ, tau=deemph_tau_s)
+    # Single-pole filter at the ACTUAL audio output rate; tau=75 µs is FM broadcast,
+    # tau=50 µs is closer to amateur spec — backend can override via ``deemph_tau_s``.
+    deemph = analog.fm_deemph(if_rate / audio_decim, tau=deemph_tau_s)
 
     # ----------------------------------------------------- queue sink
     sink = _QueueSink(audio_queue)
 
     # ----------------------------------------------------- connect
+    # Decimate to the channel rate ONCE; the demod chain and the recorder both tap it, so
+    # the capture is the narrow channel (~MB/min), not the multi-GB wideband SDR stream.
+    chan_src = src
     if decimate:  # SDR at capture rate → resample down to the channel rate first
-        tb.connect(src, make_decimator(sdr_rate, float(args.sample_rate)), chan,
-                   demod, audio_lpf, deemph, sink)
-    else:
-        tb.connect(src, chan, demod, audio_lpf, deemph, sink)
+        chan_src = make_decimator(sdr_rate, float(args.sample_rate))
+        tb.connect(src, chan_src)
+    tb.connect(chan_src, chan, demod, audio_lpf, deemph, sink)
 
-    # Pre-demod IQ capture taps the SAME source (at the SDR/capture rate) → wideband IQ.
-    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=sdr_rate)
+    # Pre-demod IQ capture at the CHANNEL rate (the decimator output), not wideband.
+    recorder = PassRecorder.maybe_start(args, tb, chan_src, sample_rate_hz=float(args.sample_rate))
     return FlowgraphContext(tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz)
 
 
@@ -358,9 +370,12 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         if started.is_set():
             try:
                 tb.stop()
-                tb.wait()
+                # Finalize BEFORE tb.wait(): the native cf32 sink has flushed to disk, and
+                # the gr-soapy source can hang tb.wait() (→ SIGTERM); finalize reads the
+                # on-disk cf32, so the PNG/CSV are produced regardless.
                 if ctx.recorder is not None:
-                    ctx.recorder.finalize()  # SDF flushed by the sink's stop(); derive CSV/PNG
+                    ctx.recorder.finalize()
+                tb.wait()
             except Exception:
                 log.exception("tb.stop/wait/recorder raised")
         # Tear down data pump.
