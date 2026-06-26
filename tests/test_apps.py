@@ -157,3 +157,37 @@ def test_tx_file_to_rx_file_roundtrip(tmp_path):
     assert expected in frames
     ui = ax25.decode_ui(frames[0])
     assert ui is not None and ui.info == payload
+
+
+def test_select_engine_routes_endurosat_to_dsp(monkeypatch):
+    monkeypatch.delenv("GS_FLOWGRAPH_ENGINE", raising=False)
+    ns = argparse.Namespace(engine="")
+    # endurosat framing → the proven IQ-level path (dsp), no explicit engine.
+    assert rxapp._select_engine(ns, {"framing": "endurosat"}) == "dsp"
+    # ax25 (default) → gnuradio.
+    assert rxapp._select_engine(ns, {}) == "gnuradio"
+    # An explicit engine still wins over the endurosat default.
+    assert rxapp._select_engine(argparse.Namespace(engine="gnuradio"),
+                                {"framing": "endurosat"}) == "gnuradio"
+
+
+def test_endurosat_deframe_bits_both_polarities():
+    payload = b"\x20hello-airmac"
+    bits = endurosat_link.frame_bits(payload)
+    assert rxapp._endurosat_deframe_bits(bits) == [payload]
+    # inverted polarity must still decode (the engine sees either sign off the demod)
+    assert rxapp._endurosat_deframe_bits(1 - np.asarray(bits, dtype=np.uint8)) == [payload]
+
+
+def test_append_frame_record_writes_jsonl(tmp_path):
+    payload = b"\x40telemetry"
+    rxapp._append_frame_record(str(tmp_path), payload, "endurosat")
+    rxapp._append_frame_record(str(tmp_path), b"\x20cmd", "endurosat")
+    lines = (tmp_path / "frames.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    rec = json.loads(lines[0])
+    assert rec["framing"] == "endurosat"
+    assert rec["len"] == len(payload)
+    assert rec["payload_hex"] == payload.hex()
+    # the full on-wire frame is reconstructed for endurosat
+    assert rec["frame_hex"] == endurosat_link.frame_bytes(payload).hex()

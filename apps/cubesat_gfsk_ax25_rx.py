@@ -30,9 +30,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import os
 import sys
+import time
 
 import numpy as np
 from _recorder import StreamRecorder
@@ -59,11 +61,18 @@ def _select_engine(args, params: dict[str, object]) -> str:
     explicit = getattr(args, "engine", "") or ""
     env = os.environ.get("GS_FLOWGRAPH_ENGINE", "")
     from_params = str(params.get("engine", "")) if isinstance(params, dict) else ""
-    # Default to the gr-soapy (gnuradio) front-end: it's the SatNOGS-proven path
-    # (gr-soapy source handles stream activation/MTU/timeouts), whereas the dsp
-    # engine hand-rolls SoapySDR.readStream and is kept as a backup (higher
-    # frequencies, TX, file-IQ, the pytest suite).
-    engine = (explicit or env or from_params or "gnuradio").lower()
+    requested = (explicit or env or from_params).lower()
+    if requested:
+        engine = requested
+    elif _select_framing(params) == "endurosat":
+        # The proven, lab-validated EnduroSat chip-packet receiver is the IQ-level
+        # ensemble in endurosat_link (StreamDecoder), which lives in the dsp engine.
+        # Default endurosat passes there rather than the bit-level gnuradio fallback.
+        engine = "dsp"
+    else:
+        # Default to the gr-soapy (gnuradio) front-end: the SatNOGS-proven front-end
+        # (gr-soapy handles stream activation/MTU/timeouts); dsp is the backup.
+        engine = "gnuradio"
     if engine not in ("dsp", "gnuradio"):
         logging.getLogger("cubesat_gfsk_ax25_rx").warning(
             "unknown engine %r; falling back to gnuradio", engine
@@ -96,8 +105,40 @@ def _profile_from_params(params: dict[str, object]) -> endurosat.LinkProfile:
     )
 
 
-async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25") -> None:
-    """Send a frame_received status event + raw frame bytes on the data socket.
+def _append_frame_record(output_dir: str, body: bytes, framing: str, ui=None) -> None:
+    """Append one decoded frame to ``<output_dir>/frames.jsonl`` — the deframed payload
+    plus (for endurosat) the full on-wire frame. Written alongside the IQ files (same
+    pass dir), so gs-client uploads it to object storage when configured, else the
+    IQ-retention reaper cleans it. Never raises."""
+    rec: dict[str, object] = {
+        "ts": round(time.time(), 3),
+        "framing": framing,
+        "len": len(body),
+        "crc_ok": True,
+        "payload_hex": body.hex(),  # deframed link payload (the AirMAC frame for endurosat)
+    }
+    if framing == "endurosat":
+        with contextlib.suppress(Exception):
+            rec["frame_hex"] = endurosat_link.frame_bytes(body).hex()  # full on-wire frame
+    if ui is not None:
+        rec.update({"dest": ui.dest, "src": ui.src, "info_hex": ui.info.hex()})
+    try:
+        with open(os.path.join(output_dir, "frames.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        logging.getLogger("cubesat_gfsk_ax25_rx").warning("frames.jsonl write failed: %s", e)
+
+
+def _endurosat_deframe_bits(bits) -> list[bytes]:  # pragma: no cover (bench)
+    """EnduroSat chip-packet deframe over GR-recovered bits, trying both polarities
+    (the bit-level fallback; the dsp engine's IQ-level StreamDecoder is preferred)."""
+    arr = np.asarray(bits, dtype=np.uint8)
+    return endurosat_link.deframe(arr) or endurosat_link.deframe(1 - arr)
+
+
+async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25", output_dir=None) -> None:
+    """Send a frame_received status event + raw frame bytes on the data socket, and
+    (when ``output_dir`` is given) append a {raw, deframed} record to frames.jsonl.
 
     For ``endurosat`` framing the body is the opaque (encrypted AirMAC) payload,
     so we do not attempt an AX.25 parse — the orchestrator decodes it.
@@ -120,6 +161,8 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25") -> None:
         await sockets.data_writer.drain()
     except (ConnectionResetError, BrokenPipeError):
         logging.getLogger("cubesat_gfsk_ax25_rx").warning("data socket closed; frame not stored")
+    if output_dir:  # persist {raw, deframed} alongside the IQ (S3/temp handled by gs-client)
+        _append_frame_record(output_dir, body, framing, ui)
 
 
 # ----------------------------------------------------------------------
@@ -301,6 +344,7 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
 async def _run_dsp_engine(args, sockets, params, started, stop_requested, profile, doppler) -> None:
     log = logging.getLogger("cubesat_gfsk_ax25_rx")
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
+    out_dir = getattr(args, "output_dir", None)  # frames.jsonl alongside the IQ
     framing = _select_framing(params)
     if framing == "endurosat":
         # The EnduroSat chip link is 9600 sym/s (endurosat_link defaults), not the
@@ -363,7 +407,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
         while not stop_requested.is_set():
             await asyncio.sleep(_DECODE_PERIOD_S)
             for body in decoder.decode_new():
-                await _emit_frame(sockets, body, framing=framing)
+                await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
     try:
@@ -382,7 +426,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
         stop_requested.set()
         decode_task.cancel()
         for body in decoder.flush():
-            await _emit_frame(sockets, body, framing=framing)
+            await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
 
 
@@ -401,6 +445,8 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
 
     from gfsk_ax25 import framing
 
+    framing_kind = _select_framing(params)
+    out_dir = getattr(args, "output_dir", None)  # frames.jsonl alongside the IQ
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
     ctx = build_rx_top_block(args, profile, sample_rate, params)
     await send_event(
@@ -410,10 +456,13 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
             "data_format": "raw_bits",
             "sample_rate": int(sample_rate),
             "engine": "gnuradio",
+            "framing": framing_kind,
             "flowgraph_version": VERSION,
         },
     )
-    await started.wait()
+    # RX: stream + record from spawn (don't gate on cmd:start — that's TX keying);
+    # cmd:start still fires 'started' and cmd:stop ends the pass.
+    _ = started
     ctx.start()
     last_doppler = 0.0
     try:
@@ -423,8 +472,14 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
                 last_doppler = doppler["hz"]
                 ctx.set_doppler(last_doppler)  # retune the SoapySDR source
             bits = ctx.drain_bits()  # np.uint8 hard bits recovered by GR
-            for body in framing.decode(bits, scramble=profile.scramble, nrzi=profile.nrzi):
-                await _emit_frame(sockets, body, framing="ax25")
+            if framing_kind == "endurosat":
+                # Bit-level EnduroSat deframe (fallback; the dsp engine's IQ-level
+                # StreamDecoder is the proven path and the default for endurosat).
+                for body in _endurosat_deframe_bits(bits):
+                    await _emit_frame(sockets, body, framing="endurosat", output_dir=out_dir)
+            else:
+                for body in framing.decode(bits, scramble=profile.scramble, nrzi=profile.nrzi):
+                    await _emit_frame(sockets, body, framing="ax25", output_dir=out_dir)
     finally:
         ctx.stop()
         ctx.wait()
