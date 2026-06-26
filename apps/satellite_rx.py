@@ -126,12 +126,15 @@ async def amain(args) -> int:
             doppler["hz"] = float(off)
 
     async def _engine() -> None:  # pragma: no cover (bench)
-        from gnuradio_satellites import build_satellites_rx
-
         if not satellite:
             log.error("no 'satellite' selected (params 'satellite' / --satellite); nothing to do")
             return
         try:
+            # Import INSIDE the try: a missing dependency (e.g. an un-deployed helper
+            # module) must surface in the journal, not get swallowed by the outer gather()
+            # — which once left a dead pass with no capture and no error.
+            from gnuradio_satellites import build_satellites_rx
+
             # Pre-demod IQ capture is wired inside build_satellites_rx (PassRecorder taps
             # the SDR source; ctx.stop() finalizes) — uniform with the other RX engines.
             ctx = build_satellites_rx(args, satellite, sample_rate, params)
