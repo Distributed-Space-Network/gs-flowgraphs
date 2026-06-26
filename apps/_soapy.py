@@ -167,6 +167,10 @@ def sdr_env() -> dict[str, Any]:
     * ``GS_SDR_LO_OFFSET``  — Hz to shift the LO off the carrier (dodge the DC spike).
     * ``GS_SDR_PPM``        — oscillator frequency-error correction, ppm.
     * ``GS_SDR_DC_REMOVAL`` — ``1/true`` to enable automatic DC-offset correction.
+    * ``GS_SDR_CAPTURE_RATE`` — Hz the SDR actually samples at; the engine decimates
+      down to the channel ``--sample-rate``. Many real SDRs (XTRX/LMS7 floor ~2.1 Msps)
+      can't stream narrow channel rates. Default **2.048 Msps** (SatNOGS's value); set
+      ``0`` to disable (capture directly at the channel rate, e.g. RTL-class SDRs).
     """
     return {
         "antenna": os.environ.get("GS_SDR_ANTENNA", "").strip() or None,
@@ -176,7 +180,44 @@ def sdr_env() -> dict[str, Any]:
         "lo_offset_hz": _env_float("GS_SDR_LO_OFFSET") or 0.0,
         "ppm": _env_float("GS_SDR_PPM") or 0.0,
         "dc_removal": _env_bool("GS_SDR_DC_REMOVAL"),
+        "capture_rate_hz": _capture_rate(),
     }
+
+
+_DEFAULT_CAPTURE_RATE_HZ = 2_048_000.0  # SatNOGS SATNOGS_RX_SAMP_RATE; XTRX RX floor ~2.1 Msps
+
+
+def _capture_rate() -> float:
+    """GS_SDR_CAPTURE_RATE: unset → 2.048 Msps default; explicit 0 → disabled."""
+    v = _env_float("GS_SDR_CAPTURE_RATE")
+    return _DEFAULT_CAPTURE_RATE_HZ if v is None else v
+
+
+def capture_plan(env_capture_rate_hz: float, channel_rate_hz: float) -> tuple[float, bool]:
+    """Return ``(sdr_rate_hz, decimate)``: the rate to set on the SDR and whether the
+    engine must decimate to ``channel_rate_hz``. Decimation is used only when a capture
+    rate is configured (>0) and differs from the channel rate."""
+    if env_capture_rate_hz and abs(env_capture_rate_hz - channel_rate_hz) > 1.0:
+        return float(env_capture_rate_hz), True
+    return float(channel_rate_hz), False
+
+
+def resample_ratio(capture_rate_hz: float, channel_rate_hz: float) -> tuple[int, int]:
+    """(interpolation, decimation) to convert ``capture_rate`` → ``channel_rate``,
+    exact for integer rates (2.048 Msps → 48 ksps = 3/128)."""
+    from fractions import Fraction  # noqa: PLC0415
+
+    frac = Fraction(int(round(channel_rate_hz)), int(round(capture_rate_hz)))
+    return frac.numerator, frac.denominator
+
+
+def make_decimator(capture_rate_hz: float, channel_rate_hz: float) -> Any:
+    """An anti-aliased rational resampler converting an SDR capture rate down to the
+    channel/processing rate — the SatNOGS "capture wide, decimate in software" model."""
+    from gnuradio import filter as gr_filter  # noqa: PLC0415 — bench-only
+
+    interp, decim = resample_ratio(capture_rate_hz, channel_rate_hz)
+    return gr_filter.rational_resampler_ccf(interpolation=interp, decimation=decim)
 
 
 def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
@@ -245,10 +286,13 @@ def apply_corrections(
 
 __all__ = [
     "apply_corrections",
+    "capture_plan",
     "configure_soapy_source",
+    "make_decimator",
     "make_sink",
     "make_source",
     "merge_sdr_params",
+    "resample_ratio",
     "retune_source",
     "sdr_env",
     "tune_source",

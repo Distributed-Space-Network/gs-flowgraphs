@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from _soapy import (
     apply_corrections,
+    capture_plan,
     configure_soapy_source,
     merge_sdr_params,
+    resample_ratio,
     retune_source,
     sdr_env,
     tune_source,
@@ -135,6 +137,7 @@ _SDR_ENV_VARS = (
     "GS_SDR_LO_OFFSET",
     "GS_SDR_PPM",
     "GS_SDR_DC_REMOVAL",
+    "GS_SDR_CAPTURE_RATE",
 )
 
 
@@ -154,6 +157,7 @@ def test_sdr_env_defaults_when_unset(monkeypatch) -> None:
         "lo_offset_hz": 0.0,
         "ppm": 0.0,
         "dc_removal": False,
+        "capture_rate_hz": 2_048_000.0,  # default = SatNOGS rate
     }
 
 
@@ -274,3 +278,47 @@ def test_apply_corrections_noop_when_zero() -> None:
     apply_corrections(src, ppm=0.0, dc_removal=False)
     assert src.ppm is None
     assert src.dc_offset_mode is None
+
+
+# --------------------------------------------------------------------------
+# Capture-rate / decimation (XTRX can't stream the narrow channel rate)
+# --------------------------------------------------------------------------
+
+def test_sdr_env_capture_rate_default(monkeypatch) -> None:
+    _clear_sdr_env(monkeypatch)
+    assert sdr_env()["capture_rate_hz"] == 2_048_000.0
+
+
+def test_sdr_env_capture_rate_override(monkeypatch) -> None:
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_CAPTURE_RATE", "2400000")
+    assert sdr_env()["capture_rate_hz"] == 2_400_000.0
+
+
+def test_sdr_env_capture_rate_zero_disables(monkeypatch) -> None:
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_CAPTURE_RATE", "0")
+    assert sdr_env()["capture_rate_hz"] == 0.0
+
+
+def test_capture_plan_decimates_when_capture_above_channel() -> None:
+    sdr_rate, decimate = capture_plan(2_048_000.0, 48_000.0)
+    assert sdr_rate == 2_048_000.0 and decimate is True
+
+
+def test_capture_plan_disabled_when_zero() -> None:
+    sdr_rate, decimate = capture_plan(0.0, 48_000.0)
+    assert sdr_rate == 48_000.0 and decimate is False
+
+
+def test_capture_plan_no_decimation_when_equal() -> None:
+    sdr_rate, decimate = capture_plan(48_000.0, 48_000.0)
+    assert sdr_rate == 48_000.0 and decimate is False
+
+
+def test_resample_ratio_exact() -> None:
+    # 2.048 Msps -> 48 ksps is exactly 3/128.
+    assert resample_ratio(2_048_000.0, 48_000.0) == (3, 128)
+    # and it actually reconstructs the channel rate
+    interp, decim = resample_ratio(2_048_000.0, 48_000.0)
+    assert 2_048_000.0 * interp / decim == 48_000.0

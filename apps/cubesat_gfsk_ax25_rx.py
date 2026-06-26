@@ -36,7 +36,7 @@ import sys
 
 import numpy as np
 from _recorder import StreamRecorder
-from _soapy import merge_sdr_params, sdr_env
+from _soapy import capture_plan, merge_sdr_params, resample_ratio, sdr_env
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
@@ -171,6 +171,15 @@ def _select_rx_antenna(dev, soapy_rx, ch, args, params, log) -> None:  # pragma:
     log.info("dsp SDR: RX antenna=%s (available=%s, requested port=%r)", chosen, available, port)
 
 
+def _resample_poly(x, up: int, down: int):  # pragma: no cover (needs scipy + hardware)
+    """Polyphase resample a complex64 chunk by ``up/down`` (capture rate → modem rate).
+    scipy handles the anti-alias filter; per-chunk boundary transients are negligible at
+    the large capture/modem ratio and the modem's sync tolerates them."""
+    from scipy.signal import resample_poly  # noqa: PLC0415
+
+    return resample_poly(x, up, down).astype(np.complex64)
+
+
 def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR)
     import SoapySDR  # lazy: only the dsp+hardware path needs it
     from SoapySDR import (
@@ -188,9 +197,13 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
     params = merge_sdr_params(params)  # station GS_SDR_* antenna/gain/agc defaults
     env = sdr_env()
     lo = env["lo_offset_hz"]
+    # Capture at the SDR's supported rate (XTRX floor ~2.1 Msps) and resample each
+    # chunk down to ``rate`` for the modem (the file-IQ path is already at ``rate``).
+    sdr_rate, decimate = capture_plan(env["capture_rate_hz"], rate)
+    up, down = resample_ratio(sdr_rate, rate) if decimate else (1, 1)
 
     dev = SoapySDR.Device(args.sdr_args)
-    dev.setSampleRate(SOAPY_SDR_RX, ch, rate)
+    dev.setSampleRate(SOAPY_SDR_RX, ch, sdr_rate)
     # LO offset: tune the analog LO off-carrier (RF) + the baseband CORDIC back (BB)
     # so the DC spike sits at +lo, not on the signal. The dsp NCO handles Doppler at
     # baseband, so the LO is set once here.
@@ -238,9 +251,9 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
         dev.setGain(SOAPY_SDR_RX, ch, float(_DEFAULT_SDR_GAIN_DB))
         gain_str = f"{_DEFAULT_SDR_GAIN_DB:.1f} dB (default)"
     log.info(
-        "dsp SDR: %s ch=%d rate=%.0f freq=%.0f lo_offset=%.0f gain=%s ppm=%.2f "
+        "dsp SDR: %s ch=%d capture=%.0f→%.0f freq=%.0f lo_offset=%.0f gain=%s ppm=%.2f "
         "dc_removal=%s — opening RX stream",
-        args.sdr_args, ch, rate, freq, lo, gain_str, env["ppm"], env["dc_removal"],
+        args.sdr_args, ch, sdr_rate, rate, freq, lo, gain_str, env["ppm"], env["dc_removal"],
     )
 
     stream = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [ch])
@@ -259,7 +272,10 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
                     log.info("dsp SDR: streaming — first %d samples received", sr.ret)
                 elif reads % 5000 == 0:
                     log.info("dsp SDR: %.2f Msamples read so far", total / 1e6)
-                yield buff[: sr.ret].copy()
+                if decimate:  # resample capture-rate chunk down to the modem rate
+                    yield _resample_poly(buff[: sr.ret], up, down)
+                else:
+                    yield buff[: sr.ret].copy()
             elif sr.ret == SOAPY_SDR_TIMEOUT:
                 timeouts += 1
                 if timeouts in (1, 10, 100) or timeouts % 1000 == 0:

@@ -31,6 +31,7 @@ import queue
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
+    capture_plan,
     configure_soapy_source,
     make_source,
     merge_sdr_params,
@@ -119,18 +120,22 @@ def build_satellites_rx(
     the decoded-frame message port name against the installed gr-satellites
     version. The shape below follows the documented embedding pattern.
     """
-    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal)
+    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal/rate)
     lo = env["lo_offset_hz"]
+    # The SDR samples at the capture rate (XTRX can't stream the narrow channel rate);
+    # gr-satellites resamples internally, so we feed it the actual SDR rate.
+    sdr_rate, _ = capture_plan(env["capture_rate_hz"], float(sample_rate))
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
-    src.set_sample_rate(0, float(sample_rate))
+    src.set_sample_rate(0, sdr_rate)
     tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
 
     # Pre-demod IQ capture FIRST (the priority): it taps the SDR source independently
     # of the decoder, so a gr-satellites build problem never costs us the recording.
-    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
+    # Recorded at the SDR (capture) rate → a proper wideband IQ file.
+    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=sdr_rate)
 
     # gr-satellites decoder (best-effort). NORAD id (all digits) -> norad=; else a
     # SatYAML name. ``gr_satellites_flowgraph`` is instantiated DIRECTLY (there is no
@@ -139,7 +144,7 @@ def build_satellites_rx(
     try:
         sat_sel = {"norad": int(satellite)} if str(satellite).isdigit() else {"name": satellite}
         flowgraph = gr_satellites_flowgraph(
-            samp_rate=float(sample_rate),
+            samp_rate=sdr_rate,  # gr-satellites decimates to the bird's rate internally
             iq=True,
             grc_block=True,
             **sat_sel,

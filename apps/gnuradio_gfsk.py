@@ -26,7 +26,9 @@ import numpy as np
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
+    capture_plan,
     configure_soapy_source,
+    make_decimator,
     make_sink,
     make_source,
     merge_sdr_params,
@@ -102,11 +104,14 @@ def build_rx_top_block(
     sps = sample_rate / profile.symbol_rate_hz
     deviation = profile.mod_index * profile.symbol_rate_hz / 2.0
 
-    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal)
+    env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal/rate)
     lo = env["lo_offset_hz"]
+    # Capture at the SDR's supported rate (XTRX floor ~2.1 Msps) and decimate to the
+    # channel rate; the demod chain below runs at ``sample_rate``.
+    sdr_rate, decimate = capture_plan(env["capture_rate_hz"], float(sample_rate))
     tb = gr.top_block("cubesat_gfsk_ax25_rx_gr")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
-    src.set_sample_rate(0, float(sample_rate))
+    src.set_sample_rate(0, sdr_rate)
     tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
@@ -131,9 +136,12 @@ def build_rx_top_block(
     )
     slicer = digital.binary_slicer_fb()  # float -> 0/1 bytes
     sink = _BitSink()
-    tb.connect(src, quad, ted, slicer, sink)
-    # Pre-demod IQ capture taps the SAME source, in parallel with the demod chain.
-    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
+    if decimate:  # SDR at capture rate → resample down to the channel rate, then demod
+        tb.connect(src, make_decimator(sdr_rate, float(sample_rate)), quad, ted, slicer, sink)
+    else:
+        tb.connect(src, quad, ted, slicer, sink)
+    # Pre-demod IQ capture taps the SAME source (at the SDR/capture rate) → wideband IQ.
+    recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=sdr_rate)
     return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 
