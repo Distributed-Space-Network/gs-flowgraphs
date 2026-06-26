@@ -97,14 +97,22 @@ async def amain(args) -> int:
         if not satellite:
             log.error("no 'satellite' selected (params 'satellite' / --satellite); nothing to do")
             return
-        # Pre-demod IQ capture is wired inside build_satellites_rx (PassRecorder taps
-        # the SDR source; ctx.stop() finalizes) — uniform with the other RX engines.
-        ctx = build_satellites_rx(args, satellite, sample_rate, params)
-        # RX: start streaming + recording at spawn (arm — before AOS) so the front-end
-        # is warm and the whole window is captured. Do NOT gate on cmd:start (that is
-        # for TX keying); cmd:start still fires the 'started' status event and cmd:stop
-        # ends the pass.
-        ctx.start()
+        try:
+            # Pre-demod IQ capture is wired inside build_satellites_rx (PassRecorder taps
+            # the SDR source; ctx.stop() finalizes) — uniform with the other RX engines.
+            ctx = build_satellites_rx(args, satellite, sample_rate, params)
+            # RX: start streaming + recording at spawn (arm — before AOS) so the
+            # front-end is warm and the whole window is captured. Do NOT gate on
+            # cmd:start (that's for TX keying); cmd:start still fires the 'started'
+            # status event and cmd:stop ends the pass.
+            ctx.start()
+            log.info("gr-satellites: flowgraph started (sat=%s); streaming+recording", satellite)
+        except Exception:
+            # Build/start failures used to be swallowed by the outer gather() — log
+            # them so a bad gr-satellites build / SDR error is visible at teardown.
+            log.exception("gr-satellites: engine failed to start (satellite=%s)", satellite)
+            stop_requested.set()
+            return
         last_doppler = 0.0
         try:
             while not stop_requested.is_set():

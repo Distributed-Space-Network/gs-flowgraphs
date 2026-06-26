@@ -25,6 +25,7 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+import logging
 import queue
 
 from _recorder import PassRecorder
@@ -127,20 +128,30 @@ def build_satellites_rx(
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
 
-    # NORAD id (e.g. "40071") -> norad=; otherwise treat it as a SatYAML name.
-    sat_sel = {"norad": int(satellite)} if str(satellite).isdigit() else {"name": satellite}
-    flowgraph = gr_satellites_flowgraph.make(
-        samp_rate=float(sample_rate),
-        iq=True,
-        grc_block=True,  # construct as an embeddable hier block
-        **sat_sel,
-    )
-    sink = _FrameSink()
-    tb.connect(src, flowgraph)
-    # gr-satellites exposes decoded frames on a message output port; forward them.
-    tb.msg_connect(flowgraph, "out", sink, "in")
-    # Pre-demod IQ capture taps the SAME source, in parallel with the decoder.
+    # Pre-demod IQ capture FIRST (the priority): it taps the SDR source independently
+    # of the decoder, so a gr-satellites build problem never costs us the recording.
     recorder = PassRecorder.maybe_start(args, tb, src, sample_rate_hz=float(sample_rate))
+
+    # gr-satellites decoder (best-effort). NORAD id (all digits) -> norad=; else a
+    # SatYAML name. ``gr_satellites_flowgraph`` is instantiated DIRECTLY (there is no
+    # ``.make()`` classmethod) as an embeddable hier block exposing an 'out' PDU port.
+    sink = _FrameSink()
+    try:
+        sat_sel = {"norad": int(satellite)} if str(satellite).isdigit() else {"name": satellite}
+        flowgraph = gr_satellites_flowgraph(
+            samp_rate=float(sample_rate),
+            iq=True,
+            grc_block=True,
+            **sat_sel,
+        )
+        tb.connect(src, flowgraph)
+        tb.msg_connect(flowgraph, "out", sink, "in")
+    except Exception:
+        # A decoder build failure (wrong satellite, gr-satellites API drift, missing
+        # SatYAML) must NOT kill the IQ capture — log it and record IQ only.
+        logging.getLogger("gr_satellites_rx").exception(
+            "gr-satellites decoder build failed (satellite=%s); recording IQ only", satellite
+        )
     return _SatContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 
