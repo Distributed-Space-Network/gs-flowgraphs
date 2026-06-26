@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Generic multi-mission satellite receiver (gr-satellites bridge).
+"""Generic multi-mission satellite receiver (gr-satellites + fallback demods).
 
-A spawn-contract flowgraph that decodes ANY gr-satellites-supported satellite —
-selected by a ``satellite`` (SatYAML name/id) params key — and emits each decoded
-frame over the status/data sockets. The demod + deframe is gr-satellites (GPLv3,
-the canonical multi-mission decoder library); this app is just the spawn-contract
-adapter (Document F). For the EnduroSat mission use the dedicated, tested
-``cubesat_gfsk_ax25_rx.py`` (``--framing endurosat``) instead.
+A spawn-contract flowgraph that records the wideband IQ of EVERY pass (the priority,
+SatNOGS-style) and decodes the bird when it can: gr-satellites (GPLv3, the canonical
+multi-mission decoder) when the ``satellite`` (NORAD id / SatYAML name) is in its
+catalog, otherwise the configured fallback demods (GS_FALLBACK_DEMODS) run in parallel —
+GFSK / FSK / GMSK, BPSK / QPSK / PSK, and AFSK — and frames come from whichever locks.
+So an uncatalogued 401 MHz LEO bird still yields IQ, plus a best-effort frame decode. For
+the EnduroSat mission use the dedicated, tested ``cubesat_gfsk_ax25_rx.py``
+(``--framing endurosat``) instead.
 
 BENCH-PENDING: needs GNU Radio + gr-satellites + gr-soapy; not runnable on the dev
 box (the gr-satellites pieces are imported lazily in the engine task).
@@ -18,8 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import sys
+import time
+from pathlib import Path
 
 from _spawn_contract import (
     build_argparser,
@@ -34,12 +39,35 @@ _DECODE_PERIOD_S = 2.0
 _DEFAULT_SAMPLE_RATE = 2_000_000
 
 
-async def _emit_frame(sockets, frame: bytes, satellite: str) -> None:
+def _append_frame_record(output_dir: str | None, frame: bytes, decoder: str) -> None:
+    """Append a ``{raw, deframed}`` record to ``<output_dir>/frames.jsonl`` (lives in the
+    pass dir → obeys the same IQ retention). For the multi-mission RX the decoded frame
+    IS the deframed unit, so ``raw`` and ``deframed`` are the same on-wire bytes."""
+    if not output_dir:
+        return
+    rec = {
+        "ts": time.time(),
+        "decoder": decoder,
+        "len": len(frame),
+        "raw_hex": frame.hex(),
+        "deframed_hex": frame.hex(),
+    }
+    try:
+        with (Path(output_dir) / "frames.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        logging.getLogger("satellite_rx").warning("could not append frames.jsonl: %s", e)
+
+
+async def _emit_frame(
+    sockets, frame: bytes, satellite: str, *, decoder: str = "gr-satellites", output_dir=None
+) -> None:
+    _append_frame_record(output_dir, frame, decoder)
     await send_event(
         sockets.status_writer,
         {
             "event": "frame_received",
-            "decoder": "gr-satellites",
+            "decoder": decoder,
             "satellite": satellite,
             "frame": {"bytes_b64": base64.b64encode(frame).decode("ascii"), "len": len(frame)},
         },
@@ -106,7 +134,13 @@ async def amain(args) -> int:
             # cmd:start (that's for TX keying); cmd:start still fires the 'started'
             # status event and cmd:stop ends the pass.
             ctx.start()
-            log.info("gr-satellites: flowgraph started (sat=%s); streaming+recording", satellite)
+            decoder = "gr-satellites" if ctx.framing == "grsatellites" else "fallback"
+            out_dir = getattr(args, "output_dir", None)
+            log.info(
+                "satellite_rx: flowgraph started (sat=%s, decoder=%s); streaming+recording",
+                satellite,
+                decoder,
+            )
         except Exception:
             # Build/start failures used to be swallowed by the outer gather() — log
             # them so a bad gr-satellites build / SDR error is visible at teardown.
@@ -121,7 +155,9 @@ async def amain(args) -> int:
                     last_doppler = doppler["hz"]
                     ctx.set_doppler(last_doppler)
                 for frame in ctx.drain_frames():
-                    await _emit_frame(sockets, frame, satellite)
+                    await _emit_frame(
+                        sockets, frame, satellite, decoder=decoder, output_dir=out_dir
+                    )
         finally:
             ctx.stop()
             ctx.wait()

@@ -21,6 +21,7 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import struct
 import zlib
@@ -184,6 +185,21 @@ def finalize_recording(
 # ------------------------------------------------- real-time hookup (bench-only)
 
 
+def make_iq_sink(path: Path):  # type: ignore[no-untyped-def]
+    """A **native** GNU Radio file sink streaming raw ``complex64`` (cf32) to ``path``.
+
+    Used for wideband IQ capture (the SDR runs at the 2+ Msps capture rate). A C++
+    ``blocks.file_sink`` keeps up effortlessly and cannot stall the scheduler the way a
+    Python ``sync_block`` does at that rate (which produced 0-byte captures + a hung
+    ``tb.wait()`` → SIGTERM). Unbuffered, so the IQ hits disk continuously and survives
+    a hard stop. cf32 is directly replayable through the dsp engine / ``iq_analyze``."""
+    from gnuradio import blocks, gr  # noqa: PLC0415 — bench-only
+
+    sink = blocks.file_sink(gr.sizeof_gr_complex, str(path), False)
+    sink.set_unbuffered(True)
+    return sink
+
+
 def make_sdf_sink(path: Path, *, headroom: float = _HEADROOM):  # type: ignore[no-untyped-def]
     """A GNU Radio sink that streams the live complex input to ``path`` as Keysight
     SDF (int16 BE I,Q). Bench-only — imports ``gnuradio`` lazily so this module's
@@ -207,15 +223,20 @@ def make_sdf_sink(path: Path, *, headroom: float = _HEADROOM):  # type: ignore[n
     return _SdfSink()
 
 
+_PNG_HEAD_SECONDS = 4.0  # waterfall quick-look from the first N s (full wideband is huge)
+
+
 class PassRecorder:
-    """Per-pass capture glue for an RX engine. ``maybe_start`` attaches the SDF sink
-    to the SDR source (when ``--record-iq``); ``finalize`` derives the CSV/PNG from
-    the SDF and drops the SDF if it wasn't requested."""
+    """Per-pass wideband IQ capture for a GNU Radio engine. ``maybe_start`` taps the SDR
+    source with a **native** cf32 file sink (robust at the 2+ Msps capture rate);
+    ``finalize`` derives a quick-look waterfall PNG from the head of the capture. The
+    ``.cf32`` raw IQ is the artifact — directly replayable through the dsp engine /
+    ``iq_analyze`` — so it is always kept (the SatNOGS "record every pass" model)."""
 
     def __init__(
-        self, sdf_path: Path, center_hz: float, sample_rate_hz: float, formats: tuple[str, ...]
+        self, iq_path: Path, center_hz: float, sample_rate_hz: float, formats: tuple[str, ...]
     ) -> None:
-        self._sdf_path = sdf_path
+        self._iq_path = iq_path
         self._center_hz = center_hz
         self._sample_rate_hz = sample_rate_hz
         self._formats = formats
@@ -223,9 +244,8 @@ class PassRecorder:
 
     @classmethod
     def maybe_start(cls, args, tb, src, *, sample_rate_hz: float):  # type: ignore[no-untyped-def]
-        """Return a recorder wired into ``tb`` (src → SDF sink), or None when capture
-        is off. The SDF is always written (CSV/PNG derive from it); an unrequested
-        SDF is removed in ``finalize``."""
+        """Return a recorder wired into ``tb`` (src → native cf32 file sink), or None
+        when capture is off."""
         if not getattr(args, "record_iq", False):
             return None
         formats = parse_formats(getattr(args, "record_formats", ""))
@@ -233,20 +253,20 @@ class PassRecorder:
             return None
         out = Path(args.output_dir or ".")
         out.mkdir(parents=True, exist_ok=True)
-        sdf_path = out / f"{out.name or 'capture'}.sdf"
-        tb.connect(src, make_sdf_sink(sdf_path))
-        return cls(sdf_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
+        iq_path = out / f"{out.name or 'capture'}.cf32"
+        tb.connect(src, make_iq_sink(iq_path))
+        return cls(iq_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
 
     def finalize(self) -> None:
-        finalize_recording(
-            self._sdf_path,
-            center_hz=self._center_hz,
-            sample_rate_hz=self._sample_rate_hz,
-            formats=self._formats,
-            started_utc=self._started,
-        )
-        if "sdf" not in self._formats:
-            self._sdf_path.unlink(missing_ok=True)
+        # The cf32 raw IQ is written in real time and is the artifact. Derive a
+        # waterfall PNG from the first few seconds (rendering a multi-GB wideband
+        # capture whole is neither feasible nor useful). Best-effort — never raises.
+        if "png" in self._formats and self._iq_path.exists():
+            with contextlib.suppress(Exception):
+                head = max(1, int(self._sample_rate_hz * _PNG_HEAD_SECONDS))
+                iq = np.fromfile(self._iq_path, dtype=np.complex64, count=head)
+                if iq.size:
+                    write_waterfall_png(self._iq_path.with_suffix(".png"), iq)
 
 
 class StreamRecorder:
