@@ -205,7 +205,6 @@ def build_top_block(
         sampling_freq=float(args.sample_rate),
         cutoff_freq=_CHANNEL_BW_HZ / 2.0,
         transition_width=_CHANNEL_BW_HZ * 0.1,
-        window=gr_filter.firdes.WIN_HAMMING,
     )
     decim_to_if = max(1, args.sample_rate // _IF_RATE_HZ)
     chan = gr_filter.fir_filter_ccf(decim_to_if, chan_taps)
@@ -224,7 +223,6 @@ def build_top_block(
         sampling_freq=float(_IF_RATE_HZ),
         cutoff_freq=audio_cutoff_hz,  # voice bandwidth (param-tunable)
         transition_width=500.0,
-        window=gr_filter.firdes.WIN_HAMMING,
     )
     audio_lpf = gr_filter.fir_filter_fff(audio_decim, audio_taps)
 

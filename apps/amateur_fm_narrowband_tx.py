@@ -117,7 +117,6 @@ def build_top_block(
         sampling_freq=float(args.sample_rate),
         cutoff_freq=_AUDIO_RATE_HZ / 2.0,
         transition_width=_AUDIO_RATE_HZ * 0.1,
-        window=gr_filter.firdes.WIN_HAMMING,
     )
     interp_filter = gr_filter.interp_fir_filter_ccf(interp, interp_taps)
 
