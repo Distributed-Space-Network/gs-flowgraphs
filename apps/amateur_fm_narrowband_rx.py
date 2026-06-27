@@ -254,7 +254,7 @@ def build_top_block(
     tb.connect(chan_src, chan, demod, audio_lpf, deemph, sink)
 
     # Pre-demod IQ capture at the CHANNEL rate (the decimator output), not wideband.
-    recorder = PassRecorder.maybe_start(args, tb, chan_src, sample_rate_hz=float(args.sample_rate))
+    recorder = PassRecorder.maybe_start(args, tb, chan_src)
     return FlowgraphContext(tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz)
 
 
@@ -369,15 +369,12 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         stop_requested.set()
         if started.is_set():
             try:
-                # Finalize BEFORE touching the scheduler: gr-soapy can hang tb.stop() AND
-                # tb.wait() (→ SIGTERM). The native cf32 sink is unbuffered, so finalize
-                # reads the on-disk capture off the still-live graph → PNG/CSV regardless.
-                if ctx.recorder is not None:
-                    ctx.recorder.finalize()
+                # Just stop the graph; views are derived post-pass by gs-client (iq_views
+                # on the on-disk cf32), so a slow/hung teardown can't cost the recording.
                 tb.stop()
                 tb.wait()
             except Exception:
-                log.exception("tb.stop/wait/recorder raised")
+                log.exception("tb.stop/wait raised")
         # Tear down data pump.
         data_queue.put(None)
         signal_task.cancel()

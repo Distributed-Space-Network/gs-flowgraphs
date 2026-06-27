@@ -142,11 +142,9 @@ class _SatContext:
         self.tb.start()
 
     def stop(self) -> None:
-        # Finalize BEFORE touching the scheduler: gr-soapy can hang tb.stop() AND tb.wait()
-        # (→ SIGTERM), which would skip the PNG/CSV. The native cf32 sink is unbuffered, so
-        # the capture is already on disk; finalize reads it off the still-live graph.
-        if self._recorder is not None:
-            self._recorder.finalize()
+        # Just stop the graph. The cf32 is on disk (unbuffered sink); the view artifacts
+        # are derived AFTER the pass by gs-client (iq_views on the .cf32), so a slow/hung
+        # gr-soapy teardown can't cost us the recording or the views.
         self.tb.stop()
         self.tb.wait()
 
@@ -299,7 +297,7 @@ def build_satellites_rx(
 
     # Pre-demod IQ capture FIRST (the priority): it taps the channel independently of the
     # decoder, so a decoder problem never costs us the recording. At the CHANNEL rate.
-    recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
+    recorder = PassRecorder.maybe_start(args, tb, chan)
 
     # gr-satellites decoder if the bird is in its catalog; else fall back. ``flowgraph``
     # is instantiated DIRECTLY (no ``.make()``) as a hier block exposing an 'out' PDU.

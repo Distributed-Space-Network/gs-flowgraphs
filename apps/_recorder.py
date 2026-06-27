@@ -22,14 +22,11 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import datetime as _dt
-import logging
 import struct
 import zlib
 from pathlib import Path
 
 import numpy as np
-
-_log = logging.getLogger("gs_recorder")
 
 _FULL_SCALE = 32767.0
 # Keysight PXB factory preset: scale to 70% (−3 dB) so interpolation can't overshoot.
@@ -225,75 +222,34 @@ def make_sdf_sink(path: Path, *, headroom: float = _HEADROOM):  # type: ignore[n
     return _SdfSink()
 
 
-# VSA CSV is a leading window (a full-pass CSV is GB-scale text). Kept short so finalize
-# stays well under the 30 s stop budget even while the demod graph is still hogging the SoC.
-_CSV_HEAD_SECONDS = 10.0
-
-
 class PassRecorder:
     """Per-pass channel IQ capture for a GNU Radio engine. ``maybe_start`` taps the
     (decimated) channel stream with a **native** cf32 file sink — small, fast, and
     crash-safe (unbuffered, so the IQ is on disk even if the gr-soapy source hangs at
-    stop). ``finalize`` derives a full-pass waterfall PNG + a leading VSA CSV from that
-    on-disk cf32 (no dependency on ``tb.wait()``). The ``.cf32`` raw IQ is the artifact —
-    directly replayable through the dsp engine / ``iq_analyze`` — and always kept
-    (the SatNOGS "record every pass" model)."""
+    stop). That ``.cf32`` is the artifact — directly replayable through the dsp engine /
+    ``iq_analyze`` — and always kept (the SatNOGS "record every pass" model).
 
-    def __init__(
-        self, iq_path: Path, center_hz: float, sample_rate_hz: float, formats: tuple[str, ...]
-    ) -> None:
-        self._iq_path = iq_path
-        self._center_hz = center_hz
-        self._sample_rate_hz = sample_rate_hz
-        self._formats = formats
-        self._started = _dt.datetime.now(_dt.UTC)
+    The view formats (waterfall PNG, VSA CSV) are NOT derived here: gs-client runs
+    ``iq_views`` on the ``.cf32`` AFTER the flowgraph has exited, so the derivation has
+    free CPU and no stop-deadline to race (the in-stop-path approach kept losing to the
+    SoC contention + the gr-soapy teardown hang)."""
+
+    def __init__(self, iq_path: Path) -> None:
+        self.iq_path = iq_path
 
     @classmethod
-    def maybe_start(cls, args, tb, src, *, sample_rate_hz: float):  # type: ignore[no-untyped-def]
+    def maybe_start(cls, args, tb, src):  # type: ignore[no-untyped-def]
         """Return a recorder wired into ``tb`` (src → native cf32 file sink), or None
         when capture is off."""
         if not getattr(args, "record_iq", False):
             return None
-        formats = parse_formats(getattr(args, "record_formats", ""))
-        if not formats:
+        if not parse_formats(getattr(args, "record_formats", "")):
             return None
         out = Path(args.output_dir or ".")
         out.mkdir(parents=True, exist_ok=True)
         iq_path = out / f"{out.name or 'capture'}.cf32"
         tb.connect(src, make_iq_sink(iq_path))
-        return cls(iq_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
-
-    def finalize(self) -> None:
-        # Derive the view formats from the on-disk cf32 (NOT from a GR sink). The CALLER
-        # runs this BEFORE touching tb.stop()/tb.wait(), because gr-soapy can hang either
-        # one (→ SIGTERM); the native sink is unbuffered, so the capture is already on
-        # disk. memmap so the waterfall samples across the whole pass without loading it
-        # all into RAM. Logs success/failure (the old silent suppress hid a no-op).
-        want_png, want_csv = "png" in self._formats, "csv" in self._formats
-        if not (want_png or want_csv) or not self._iq_path.exists():
-            return
-        n_samp = self._iq_path.stat().st_size // 8  # 8 B per complex64; floor a torn write
-        if n_samp < 1:  # need at least one whole sample
-            _log.warning("recording: %s has no samples; no PNG/CSV", self._iq_path.name)
-            return
-        try:
-            # shape= truncates a torn final write (SIGTERM mid-write) to whole samples,
-            # so a non-multiple-of-8 file still yields the PNG/CSV instead of raising.
-            iq = np.memmap(self._iq_path, dtype=np.complex64, mode="r", shape=(n_samp,))
-            if want_png:  # full-pass waterfall (spectrogram bounds its row count)
-                write_waterfall_png(self._iq_path.with_suffix(".png"), iq)
-            if want_csv:  # leading window only — the full IQ lives in the .cf32
-                n = max(1, int(self._sample_rate_hz * _CSV_HEAD_SECONDS))
-                write_vsa_csv(
-                    self._iq_path.with_suffix(".csv"),
-                    np.asarray(iq[:n]),
-                    center_hz=self._center_hz,
-                    sample_rate_hz=self._sample_rate_hz,
-                    started_utc=self._started,
-                )
-            _log.info("recording: derived views from %s (%d samples)", self._iq_path.name, n_samp)
-        except Exception:
-            _log.exception("recording: failed to derive PNG/CSV from %s", self._iq_path.name)
+        return cls(iq_path)
 
 
 class StreamRecorder:

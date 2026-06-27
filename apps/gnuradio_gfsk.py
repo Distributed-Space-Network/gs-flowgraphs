@@ -84,11 +84,8 @@ class _RxContext:
         self.tb.start()
 
     def stop(self) -> None:
-        # Finalize BEFORE touching the scheduler: gr-soapy can hang tb.stop() AND tb.wait()
-        # (→ SIGTERM). The native cf32 sink is unbuffered, so finalize reads the on-disk
-        # capture off the still-live graph.
-        if self._recorder is not None:
-            self._recorder.finalize()
+        # Just stop the graph; views are derived post-pass by gs-client (iq_views on the
+        # on-disk cf32), so a slow/hung gr-soapy teardown can't cost the recording/views.
         self.tb.stop()
         self.tb.wait()
 
@@ -214,7 +211,7 @@ def build_rx_top_block(
     sink = connect_gfsk_demod(
         tb, chan, float(sample_rate), profile, decimate=False, sdr_rate=float(sample_rate)
     )
-    recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
+    recorder = PassRecorder.maybe_start(args, tb, chan)
     return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 
