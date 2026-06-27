@@ -29,6 +29,19 @@ DEFAULT_FALLBACK_DEMODS = "gfsk9600,gfsk4800,gmsk9600,gmsk4800,bpsk1200,bpsk9600
 # Modulation kinds the demod builders understand (see gnuradio_satellites._build_fallbacks).
 DEMOD_KINDS = ("gfsk", "fsk", "gmsk", "bpsk", "qpsk", "psk", "afsk")
 
+# Samples/symbol the channel must give the demods. symbol_sync needs sps>1; ~4 is a
+# comfortable margin for GFSK/PSK timing recovery.
+CHANNEL_OVERSAMPLE = 4.0
+
+
+def channel_rate_for(sample_rate: float, symbol_rate_hz: float, sdr_rate: float) -> float:
+    """The decimation-target channel rate: at least the requested ``sample_rate``, and
+    wide enough for ~CHANNEL_OVERSAMPLE samples/symbol on the bird (so a high-baud bird —
+    e.g. 50 kBd at a 48 kHz default — doesn't give symbol_sync sps<1), capped at the SDR
+    capture rate (can't decimate to more than we sampled)."""
+    want = max(float(sample_rate), CHANNEL_OVERSAMPLE * float(symbol_rate_hz or 0.0))
+    return min(want, float(sdr_rate))
+
 
 def modes_from_params(params: dict | None) -> list[str]:
     """The targeted demod(s) from the backend's per-pass mode, or ``[]`` if the params

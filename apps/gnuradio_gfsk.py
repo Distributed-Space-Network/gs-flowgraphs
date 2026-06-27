@@ -211,7 +211,7 @@ def build_rx_top_block(
     sink = connect_gfsk_demod(
         tb, chan, float(sample_rate), profile, decimate=False, sdr_rate=float(sample_rate)
     )
-    recorder = PassRecorder.maybe_start(args, tb, chan)
+    recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
     return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
 
 

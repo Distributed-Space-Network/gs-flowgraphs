@@ -21,7 +21,9 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
+import json
 import struct
 import zlib
 from pathlib import Path
@@ -238,9 +240,10 @@ class PassRecorder:
         self.iq_path = iq_path
 
     @classmethod
-    def maybe_start(cls, args, tb, src):  # type: ignore[no-untyped-def]
+    def maybe_start(cls, args, tb, src, *, sample_rate_hz: float):  # type: ignore[no-untyped-def]
         """Return a recorder wired into ``tb`` (src → native cf32 file sink), or None
-        when capture is off."""
+        when capture is off. ``sample_rate_hz`` is the ACTUAL rate of ``src`` (the channel
+        rate, which the engine may have widened for a high-baud bird)."""
         if not getattr(args, "record_iq", False):
             return None
         if not parse_formats(getattr(args, "record_formats", "")):
@@ -249,6 +252,16 @@ class PassRecorder:
         out.mkdir(parents=True, exist_ok=True)
         iq_path = out / f"{out.name or 'capture'}.cf32"
         tb.connect(src, make_iq_sink(iq_path))
+        # Self-describing sidecar: a raw cf32 is uninterpretable without its rate+centre.
+        # Post-pass iq_views reads this for the TRUE recording rate (≠ the orchestrator's
+        # --sample-rate when the channel was widened); it also helps offline analysis.
+        meta = {
+            "sample_rate_hz": float(sample_rate_hz),
+            "center_hz": float(getattr(args, "center_freq_hz", 0.0)),
+            "format": "cf32le",
+        }
+        with contextlib.suppress(OSError):
+            iq_path.with_name(iq_path.name + ".json").write_text(json.dumps(meta))
         return cls(iq_path)
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import logging
 import sys
 from pathlib import Path
@@ -46,6 +47,16 @@ def derive_views(
     if not path.exists():
         log.warning("iq_views: %s not found", path)
         return []
+    # Prefer the recording's own metadata sidecar (the TRUE rate/centre the engine used —
+    # it may have widened the channel for a high-baud bird) over the passed-in args.
+    meta = path.with_name(path.name + ".json")
+    if meta.exists():
+        try:
+            d = json.loads(meta.read_text())
+            sample_rate_hz = float(d.get("sample_rate_hz", sample_rate_hz))
+            center_hz = float(d.get("center_hz", center_hz))
+        except (OSError, ValueError, TypeError):
+            log.warning("iq_views: ignoring unreadable sidecar %s", meta.name)
     n_samp = path.stat().st_size // 8  # 8 B/complex64; floor a torn write to whole samples
     if n_samp < 1:
         log.warning("iq_views: %s has no samples", path)

@@ -46,6 +46,17 @@ def test_torn_write_is_truncated_not_fatal(tmp_path: Path) -> None:
     assert cf32.with_suffix(".csv").exists()
 
 
+def test_sidecar_rate_overrides_arg(tmp_path: Path) -> None:
+    # A high-baud bird widens the channel, so the .cf32 rate differs from the
+    # orchestrator's --sample-rate. The .cf32.json sidecar (true rate) must win.
+    cf32 = tmp_path / "s.cf32"
+    _capture(cf32, n=200_000)
+    (tmp_path / "s.cf32.json").write_text('{"sample_rate_hz": 96000.0, "center_hz": 401000000.0}')
+    derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("csv",), csv_seconds=1.0)
+    csv = cf32.with_suffix(".csv").read_text()
+    assert f"XDelta,{1.0 / 96000.0!r}" in csv  # sidecar 96 kHz used, not the 48 kHz arg
+
+
 def test_missing_or_empty_input_is_noop(tmp_path: Path) -> None:
     assert derive_views(tmp_path / "nope.cf32", center_hz=0.0, sample_rate_hz=48_000.0,
                         formats=("png", "csv")) == []

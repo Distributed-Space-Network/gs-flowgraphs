@@ -5,7 +5,12 @@ Pure logic (no GNU Radio), so it runs on any box."""
 from __future__ import annotations
 
 import pytest
-from _fallback_select import DEFAULT_FALLBACK_DEMODS, fallback_modes
+from _fallback_select import (
+    CHANNEL_OVERSAMPLE,
+    DEFAULT_FALLBACK_DEMODS,
+    channel_rate_for,
+    fallback_modes,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +64,17 @@ def test_env_used_only_when_no_backend_mode(monkeypatch) -> None:
     monkeypatch.setenv("GS_FALLBACK_DEMODS", "bpsk9600,qpsk9600")
     assert fallback_modes(None) == ["bpsk9600", "qpsk9600"]
     assert fallback_modes({"framing": "ax25"}) == ["bpsk9600", "qpsk9600"]
+
+
+def test_channel_rate_scales_with_symbol_rate() -> None:
+    sdr = 2_048_000.0
+    # Low-baud bird: channel stays at the requested --sample-rate (no needless widening).
+    assert channel_rate_for(48_000.0, 9_600.0, sdr) == 48_000.0
+    assert channel_rate_for(48_000.0, 0.0, sdr) == 48_000.0  # no symbol rate → default
+    # High-baud bird (the cmd_48 case): 50 kBd needs ~CHANNEL_OVERSAMPLE×, not 48 kHz.
+    assert channel_rate_for(48_000.0, 50_000.0, sdr) == CHANNEL_OVERSAMPLE * 50_000.0
+    # Never exceeds the SDR capture rate.
+    assert channel_rate_for(48_000.0, 1_000_000.0, sdr) == sdr
 
 
 def test_bad_or_zero_rate_falls_back_to_bank() -> None:

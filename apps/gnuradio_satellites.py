@@ -29,7 +29,11 @@ import logging
 import queue
 import re
 
-from _fallback_select import fallback_modes  # pure mode-selection (testable, no GNU Radio)
+from _fallback_select import (  # pure, testable, no GNU Radio
+    CHANNEL_OVERSAMPLE,
+    channel_rate_for,
+    fallback_modes,
+)
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
@@ -230,20 +234,27 @@ def _build_fallbacks(
         m = re.match(r"([a-z]+)(\d*)", mode)
         kind = m.group(1) if m else ""
         rate = float(m.group(2)) if (m and m.group(2)) else 0.0
-        if kind in ("gfsk", "fsk", "gmsk"):  # 2-FSK family (GMSK = h≈0.5)
-            mod_index = 0.5 if kind == "gmsk" else endurosat.LinkProfile().mod_index
-            profile = endurosat.LinkProfile(symbol_rate_hz=rate or 9600.0, mod_index=mod_index)
-            sink = connect_gfsk_demod(
-                tb, demod_src, sample_rate, profile, decimate=False, sdr_rate=sample_rate
-            )
-        elif kind in _PSK_ORDER:  # BPSK / QPSK / PSK (coherent, differential)
-            sink = connect_psk_demod(
-                tb, demod_src, sample_rate, rate or 1200.0, order=_PSK_ORDER[kind]
-            )
-        elif kind == "afsk":  # Bell-202 1200/2200 Hz
-            sink = connect_afsk_demod(tb, demod_src, sample_rate, baud=rate or 1200.0)
-        else:
-            _log.warning("fallback demod %r not implemented; skipping", mode)
+        # Each builder is guarded: a demod that can't be built for this channel (e.g.
+        # symbol_sync needs sps>1, so the rate exceeds ~sample_rate/2) must NOT crash the
+        # engine or cost us the IQ recording — skip it and keep the others.
+        try:
+            if kind in ("gfsk", "fsk", "gmsk"):  # 2-FSK family (GMSK = h≈0.5)
+                mod_index = 0.5 if kind == "gmsk" else endurosat.LinkProfile().mod_index
+                profile = endurosat.LinkProfile(symbol_rate_hz=rate or 9600.0, mod_index=mod_index)
+                sink = connect_gfsk_demod(
+                    tb, demod_src, sample_rate, profile, decimate=False, sdr_rate=sample_rate
+                )
+            elif kind in _PSK_ORDER:  # BPSK / QPSK / PSK (coherent, differential)
+                sink = connect_psk_demod(
+                    tb, demod_src, sample_rate, rate or 1200.0, order=_PSK_ORDER[kind]
+                )
+            elif kind == "afsk":  # Bell-202 1200/2200 Hz
+                sink = connect_afsk_demod(tb, demod_src, sample_rate, baud=rate or 1200.0)
+            else:
+                _log.warning("fallback demod %r not implemented; skipping", mode)
+                continue
+        except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
+            _log.warning("fallback demod %r failed to build (%s); skipping", mode, e)
             continue
         out.append(_FallbackDemod(mode, sink, _bits_deframe))
     return out
@@ -280,9 +291,15 @@ def build_satellites_rx(
     lo = env["lo_offset_hz"]
     # The SDR samples at the capture rate (XTRX can't stream the narrow channel rate), so
     # decimate to the CHANNEL rate ONCE and feed everything (recorder, gr-satellites, the
-    # fallback demods) from it. This is what makes the recording the narrow channel
-    # (~MB/min) instead of the multi-GB wideband capture.
-    sdr_rate, decimate = capture_plan(env["capture_rate_hz"], float(sample_rate))
+    # fallback demods) from it. The channel must be wide enough for the bird's symbol rate
+    # (≥ a few samples/symbol) — a 50 kBd bird needs more than the 48 kHz default, else
+    # symbol_sync gets sps<1 — so size it from the backend's symbol_rate_hz, capped at the
+    # capture rate. Low-baud birds stay at the requested --sample-rate (~MB/min recording).
+    sym = float((params or {}).get("symbol_rate_hz") or 0.0)
+    want_channel = max(float(sample_rate), CHANNEL_OVERSAMPLE * sym)
+    sdr_rate, _ = capture_plan(env["capture_rate_hz"], want_channel)
+    channel_rate = channel_rate_for(float(sample_rate), sym, sdr_rate)
+    decimate = channel_rate < sdr_rate
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
@@ -292,12 +309,12 @@ def build_satellites_rx(
 
     chan = src
     if decimate:
-        chan = make_decimator(sdr_rate, float(sample_rate))
+        chan = make_decimator(sdr_rate, channel_rate)
         tb.connect(src, chan)
 
     # Pre-demod IQ capture FIRST (the priority): it taps the channel independently of the
     # decoder, so a decoder problem never costs us the recording. At the CHANNEL rate.
-    recorder = PassRecorder.maybe_start(args, tb, chan)
+    recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=channel_rate)
 
     # gr-satellites decoder if the bird is in its catalog; else fall back. ``flowgraph``
     # is instantiated DIRECTLY (no ``.make()``) as a hier block exposing an 'out' PDU.
@@ -308,22 +325,22 @@ def build_satellites_rx(
         if selector is None:
             raise ValueError(f"no usable satellite id {satellite!r}")
         flowgraph = gr_satellites_flowgraph(
-            samp_rate=float(sample_rate),  # the channel rate; gr-satellites resamples to the bird
+            samp_rate=channel_rate,  # the channel rate; gr-satellites resamples to the bird
             iq=True,
             grc_block=True,
             **selector,
         )
         tb.connect(chan, flowgraph)
         tb.msg_connect(flowgraph, "out", sink, "in")
-        _log.info("gr-satellites: decoding %s (%r) @ %.0f Hz", satellite, selector, sample_rate)
+        _log.info("gr-satellites: decoding %s (%r) @ %.0f Hz", satellite, selector, channel_rate)
     except Exception as e:  # noqa: BLE001 — any build failure → fall back, keep the IQ
         # Not in gr-satellites' catalog (or API drift): fan the fallback demods out from
         # the same channel decimator.
         _log.warning("gr-satellites: no decoder for %s (%s) → fallback demods", satellite, e)
-        fallbacks = _build_fallbacks(tb, chan, float(sample_rate), params)
+        fallbacks = _build_fallbacks(tb, chan, channel_rate, params)
         _log.info(
             "fallback demods @ %.0f Hz (symbol_rate=%s): %s",
-            sample_rate,
+            channel_rate,
             (params or {}).get("symbol_rate_hz", "?"),
             ", ".join(f.name for f in fallbacks) or "(none)",
         )
@@ -336,7 +353,7 @@ def build_satellites_rx(
         lo_offset_hz=lo,
         fallbacks=fallbacks,
         chan=chan,
-        sample_rate=float(sample_rate),
+        sample_rate=channel_rate,  # the rate ``chan`` runs at — escalation builds demods on it
     )
 
 

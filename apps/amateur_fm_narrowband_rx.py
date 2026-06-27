@@ -254,7 +254,7 @@ def build_top_block(
     tb.connect(chan_src, chan, demod, audio_lpf, deemph, sink)
 
     # Pre-demod IQ capture at the CHANNEL rate (the decimator output), not wideband.
-    recorder = PassRecorder.maybe_start(args, tb, chan_src)
+    recorder = PassRecorder.maybe_start(args, tb, chan_src, sample_rate_hz=float(args.sample_rate))
     return FlowgraphContext(tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz)
 
 
