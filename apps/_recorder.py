@@ -224,6 +224,19 @@ def make_sdf_sink(path: Path, *, headroom: float = _HEADROOM):  # type: ignore[n
     return _SdfSink()
 
 
+def write_cf32_sidecar(iq_path: Path, *, sample_rate_hz: float, center_hz: float) -> None:
+    """Write the self-describing ``<file>.cf32.json`` metadata sidecar. A raw cf32 is
+    uninterpretable without its rate/centre; post-pass iq_views reads this (the rate may
+    differ from the orchestrator's --sample-rate when the channel was widened)."""
+    meta = {
+        "sample_rate_hz": float(sample_rate_hz),
+        "center_hz": float(center_hz),
+        "format": "cf32le",
+    }
+    with contextlib.suppress(OSError):
+        iq_path.with_name(iq_path.name + ".json").write_text(json.dumps(meta))
+
+
 class PassRecorder:
     """Per-pass channel IQ capture for a GNU Radio engine. ``maybe_start`` taps the
     (decimated) channel stream with a **native** cf32 file sink — small, fast, and
@@ -252,64 +265,44 @@ class PassRecorder:
         out.mkdir(parents=True, exist_ok=True)
         iq_path = out / f"{out.name or 'capture'}.cf32"
         tb.connect(src, make_iq_sink(iq_path))
-        # Self-describing sidecar: a raw cf32 is uninterpretable without its rate+centre.
-        # Post-pass iq_views reads this for the TRUE recording rate (≠ the orchestrator's
-        # --sample-rate when the channel was widened); it also helps offline analysis.
-        meta = {
-            "sample_rate_hz": float(sample_rate_hz),
-            "center_hz": float(getattr(args, "center_freq_hz", 0.0)),
-            "format": "cf32le",
-        }
-        with contextlib.suppress(OSError):
-            iq_path.with_name(iq_path.name + ".json").write_text(json.dumps(meta))
+        write_cf32_sidecar(
+            iq_path,
+            sample_rate_hz=sample_rate_hz,
+            center_hz=float(getattr(args, "center_freq_hz", 0.0)),
+        )
         return cls(iq_path)
 
 
 class StreamRecorder:
-    """Engine-agnostic IQ capture for the **numpy (dsp) path**: append complex64
-    chunks to the SDF as they stream off the SDR, then derive CSV/PNG at finalize.
-    Pure numpy — no GNU Radio (the GR engines use :class:`PassRecorder` instead).
-    ``write`` records the RAW pre-demod chunk (before any Doppler NCO / demod)."""
+    """Engine-agnostic **cf32** IQ capture for the numpy (dsp) path: append complex64
+    chunks (RAW, pre-demod) as they stream off the SDR. Same raw format as the GR engines
+    (:class:`PassRecorder`); the view artifacts (SDF / CSV / PNG) are derived AFTER the
+    pass by iq_views (run by gs-client), so nothing is generated in-pass but the cf32."""
 
-    def __init__(
-        self, sdf_path: Path, center_hz: float, sample_rate_hz: float, formats: tuple[str, ...]
-    ) -> None:
-        self._sdf_path = sdf_path
-        self._center_hz = center_hz
-        self._sample_rate_hz = sample_rate_hz
-        self._formats = formats
-        self._started = _dt.datetime.now(_dt.UTC)
-        self._fh = sdf_path.open("wb")
+    def __init__(self, iq_path: Path, center_hz: float, sample_rate_hz: float) -> None:
+        self._iq_path = iq_path
+        self._fh = iq_path.open("wb")
+        write_cf32_sidecar(iq_path, sample_rate_hz=sample_rate_hz, center_hz=center_hz)
 
     @classmethod
     def maybe_start(cls, args, *, sample_rate_hz: float):  # type: ignore[no-untyped-def]
-        """A recorder writing ``<output_dir>/<dir-name>.sdf``, or None when capture
+        """A recorder writing ``<output_dir>/<dir-name>.cf32``, or None when capture
         is off."""
         if not getattr(args, "record_iq", False):
             return None
-        formats = parse_formats(getattr(args, "record_formats", ""))
-        if not formats:
+        if not parse_formats(getattr(args, "record_formats", "")):
             return None
         out = Path(args.output_dir or ".")
         out.mkdir(parents=True, exist_ok=True)
-        sdf_path = out / f"{out.name or 'capture'}.sdf"
-        return cls(sdf_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
+        iq_path = out / f"{out.name or 'capture'}.cf32"
+        return cls(iq_path, float(args.center_freq_hz), float(sample_rate_hz))
 
     def write(self, chunk: np.ndarray) -> None:
-        self._fh.write(iq_to_sdf_bytes(chunk))
+        self._fh.write(np.asarray(chunk, dtype=np.complex64).tobytes())
 
-    def finalize(self) -> None:
+    def close(self) -> None:
         if not self._fh.closed:
             self._fh.close()
-        finalize_recording(
-            self._sdf_path,
-            center_hz=self._center_hz,
-            sample_rate_hz=self._sample_rate_hz,
-            formats=self._formats,
-            started_utc=self._started,
-        )
-        if "sdf" not in self._formats:
-            self._sdf_path.unlink(missing_ok=True)
 
 
 __all__ = [

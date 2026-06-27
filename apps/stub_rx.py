@@ -115,9 +115,10 @@ async def _read_commands(reader: asyncio.StreamReader) -> object:
 
 
 def _write_stub_capture(args: argparse.Namespace) -> None:
-    """Synthetic pre-demod IQ capture so ``--record-iq`` exercises the full
-    SDF/CSV/PNG path end-to-end without hardware (the stub has no real SDR). Lazy
-    imports keep numpy off the default stub path; the seed makes it deterministic."""
+    """Synthetic pre-demod cf32 capture so ``--record-iq`` exercises the record path
+    end-to-end without hardware (the stub has no real SDR). The view artifacts
+    (SDF/CSV/PNG) are derived post-pass by iq_views, like the real engines. Lazy imports
+    keep numpy off the default stub path; the seed makes it deterministic."""
     from _recorder import StreamRecorder  # noqa: PLC0415 — lazy: only when capturing
     import numpy as np  # noqa: PLC0415
 
@@ -133,7 +134,7 @@ def _write_stub_capture(args: argparse.Namespace) -> None:
         + 0.3 * np.exp(2j * np.pi * 1200.0 * t)
     ).astype(np.complex64)
     rec.write(iq)
-    rec.finalize()
+    rec.close()
 
 
 async def amain(args: argparse.Namespace) -> int:

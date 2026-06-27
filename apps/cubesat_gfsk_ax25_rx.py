@@ -398,7 +398,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             log.exception("IQ source error")
         finally:
             if recorder is not None:
-                recorder.finalize()  # close SDF + derive CSV/PNG (numpy; in this worker thread)
+                recorder.close()  # close the cf32; views derived post-pass by iq_views
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     reader_task = loop.run_in_executor(None, _reader)

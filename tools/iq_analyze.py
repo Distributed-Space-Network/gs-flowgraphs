@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """IQ capture analysis for EnduroSat UHF reverse-engineering.
 
-Loads a Keysight 89600 VSA "Main Time" CSV export, detects bursts, demodulates
-2-GFSK via the tested ``gfsk_ax25`` library, and locates the chip-packet sync
-(0xAA preamble + 0x7E sync word). Used to reverse the AirMAC framing from lab
-captures (see memory: endurosat-airmac-protocol).
+Loads a capture, detects bursts, demodulates 2-GFSK via the tested ``gfsk_ax25``
+library, and locates the chip-packet sync (0xAA preamble + 0x7E sync word). Used to
+reverse the AirMAC framing from lab captures (see memory: endurosat-airmac-protocol).
 
-The VSA CSV has a key,value header, then a line ``Y`` and rows of ``I,Q`` floats.
-Despite the file's ``IQ,FALSE`` flag the Main-Time data is complex (two columns).
-Sample rate comes from ``XDelta`` (= 1 / (1.28 x span)); for a 100 kHz span that
-is 128 kHz, ~13.3 samples/symbol at 9600 sym/s — non-integer, which the
-demodulator's Gardner timing recovery handles.
+Two input formats, by extension:
+  * ``.cf32`` — raw complex64 the GR engines record (the WHOLE pass), with rate/centre
+    read from the ``<file>.cf32.json`` sidecar (or ``--sample-rate``). Preferred: it's
+    the full capture, not a window.
+  * ``.csv``  — Keysight 89600 VSA "Main Time" export: key,value header, a ``Y`` line,
+    then ``I,Q`` float rows. Sample rate from ``XDelta``. Note the VSA CSV is typically
+    only an analysis WINDOW (e.g. 10 s) of a longer recording — use the cf32 for the
+    full pass.
 
-Usage:  python tools/iq_analyze.py <capture.csv> [--symbol-rate 9600]
+Usage:  python tools/iq_analyze.py <capture.cf32|.csv> [--symbol-rate 9600] [--sample-rate HZ]
 
 License: GPLv3 (see ../COPYING).
 """
@@ -20,6 +22,8 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -69,6 +73,33 @@ def load_vsa_csv(path: str | Path) -> Capture:
     fs = 1.0 / xdelta if xdelta else 0.0
     center = float(meta.get("InputCenter", "0") or 0.0)
     return Capture(iq=iq, fs=fs, center_hz=center, meta=meta)
+
+
+def load_cf32(path: str | Path, sample_rate_hz: float = 0.0) -> Capture:
+    """Load a raw complex64 (cf32) capture — the WHOLE pass the GR engines record. Rate
+    and centre come from the ``<file>.cf32.json`` sidecar (PassRecorder writes it), or
+    from ``sample_rate_hz`` when there's no sidecar."""
+    path = Path(path)
+    iq = np.fromfile(path, dtype=np.complex64)
+    fs, center, meta = sample_rate_hz, 0.0, {}
+    sidecar = path.with_name(path.name + ".json")
+    if sidecar.exists():
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            d = json.loads(sidecar.read_text())
+            fs = float(d.get("sample_rate_hz", fs))
+            center = float(d.get("center_hz", center))
+            meta = {k: str(v) for k, v in d.items()}
+    return Capture(iq=iq, fs=fs, center_hz=center, meta=meta)
+
+
+def load_capture(path: str | Path, sample_rate_hz: float = 0.0) -> Capture:
+    """Load a ``.cf32`` (raw, whole-pass) or ``.csv`` (VSA window) capture by extension."""
+    p = Path(path)
+    cap = load_cf32(p, sample_rate_hz) if p.suffix.lower() == ".cf32" else load_vsa_csv(p)
+    if not cap.fs:
+        msg = f"{p.name}: unknown sample rate (no cf32 sidecar / XDelta) — pass --sample-rate"
+        raise ValueError(msg)
+    return cap
 
 
 def _read_iq_rows(path: Path, skiprows: int) -> np.ndarray:
@@ -126,8 +157,10 @@ def frame_bytes(bits: np.ndarray, *, order: str = "big") -> bytes:
     return np.packbits(b[:n], bitorder=order).tobytes() if n else b""
 
 
-def analyze_file(path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE) -> None:
-    cap = load_vsa_csv(path)
+def analyze_file(
+    path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0
+) -> None:
+    cap = load_capture(path, sample_rate_hz)
     dur = len(cap.iq) / cap.fs if cap.fs else 0.0
     print(
         f"{Path(path).name}: {len(cap.iq):,} samples | fs={cap.fs:.0f} Hz | "
@@ -151,10 +184,13 @@ def analyze_file(path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE) -> 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="iq_analyze", description="EnduroSat UHF IQ analysis")
-    p.add_argument("csv", help="Keysight VSA Main-Time CSV export")
+    p.add_argument("capture", help="capture file: .cf32 (raw, whole pass) or VSA .csv")
     p.add_argument("--symbol-rate", type=float, default=DEFAULT_SYMBOL_RATE)
+    p.add_argument(
+        "--sample-rate", type=float, default=0.0, help="cf32 sample rate if no sidecar (Hz)"
+    )
     args = p.parse_args(argv)
-    analyze_file(args.csv, symbol_rate=args.symbol_rate)
+    analyze_file(args.capture, symbol_rate=args.symbol_rate, sample_rate_hz=args.sample_rate)
     return 0
 
 

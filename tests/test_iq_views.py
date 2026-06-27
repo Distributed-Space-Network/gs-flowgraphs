@@ -33,6 +33,18 @@ def test_derive_views_respects_requested_formats(tmp_path: Path) -> None:
     derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("png",))
     assert cf32.with_suffix(".png").exists()
     assert not cf32.with_suffix(".csv").exists()
+    assert not cf32.with_suffix(".sdf").exists()
+
+
+def test_derive_views_sdf_is_whole_pass_int16(tmp_path: Path) -> None:
+    # SDF is the whole-pass Keysight int16 transcode of the cf32 (4 B/sample).
+    cf32 = tmp_path / "s.cf32"
+    n = 144_000
+    _capture(cf32, n=n)
+    derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("sdf",))
+    sdf = cf32.with_suffix(".sdf")
+    assert sdf.exists()
+    assert sdf.stat().st_size == n * 4  # int16 I + int16 Q per sample (whole pass)
 
 
 def test_torn_write_is_truncated_not_fatal(tmp_path: Path) -> None:

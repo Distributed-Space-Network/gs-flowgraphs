@@ -21,9 +21,10 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from _recorder import write_vsa_csv, write_waterfall_png
+from _recorder import iq_to_sdf_bytes, write_vsa_csv, write_waterfall_png
 
 log = logging.getLogger("iq_views")
+_SDF_CHUNK = 1 << 20  # samples per chunk when transcoding cf32 → SDF (bounded memory)
 
 
 def derive_views(
@@ -36,13 +37,15 @@ def derive_views(
 ) -> list[Path]:
     """Write the requested views next to ``cf32``. Returns the paths written.
 
-    The waterfall PNG spans the whole pass (the spectrogram bounds its own row count, and
-    we memmap so only the FFT windows are read). The VSA CSV is a leading ``csv_seconds``
-    window (a full-pass CSV is GB-scale text; the complete IQ lives in the .cf32)."""
+    PNG = whole-pass waterfall (the spectrogram bounds its row count; we memmap so only the
+    FFT windows are read). SDF = whole-pass Keysight int16 transcode of the cf32 (chunked).
+    CSV = a leading ``csv_seconds`` VSA window (a full-pass CSV is GB-scale text; the
+    complete IQ lives in the .cf32 / .sdf)."""
     path = Path(cf32)
     want_png = "png" in formats
     want_csv = "csv" in formats
-    if not (want_png or want_csv):
+    want_sdf = "sdf" in formats
+    if not (want_png or want_csv or want_sdf):
         return []
     if not path.exists():
         log.warning("iq_views: %s not found", path)
@@ -80,6 +83,12 @@ def derive_views(
             started_utc=started,
         )
         written.append(csv)
+    if want_sdf:  # whole-pass Keysight int16 transcode, chunked so memory stays bounded
+        sdf = path.with_suffix(".sdf")
+        with sdf.open("wb") as fh:
+            for off in range(0, n_samp, _SDF_CHUNK):
+                fh.write(iq_to_sdf_bytes(np.asarray(iq[off : off + _SDF_CHUNK])))
+        written.append(sdf)
     log.info(
         "iq_views: derived %s from %s (%d samples)",
         ", ".join(p.suffix.lstrip(".") for p in written),
@@ -91,12 +100,12 @@ def derive_views(
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="iq_views", description="Derive PNG/CSV views from a recorded .cf32 capture."
+        prog="iq_views", description="Derive SDF/PNG/CSV views from a recorded .cf32 capture."
     )
     p.add_argument("--input", required=True, help="path to the .cf32 capture")
     p.add_argument("--center-hz", type=float, default=0.0, help="capture centre frequency, Hz")
     p.add_argument("--sample-rate", type=float, required=True, help="capture sample rate, Hz")
-    p.add_argument("--formats", default="png,csv", help="comma list, subset of png,csv")
+    p.add_argument("--formats", default="sdf,png,csv", help="comma list, subset of sdf,png,csv")
     p.add_argument(
         "--csv-seconds", type=float, default=30.0, help="leading window (s) for the VSA CSV"
     )

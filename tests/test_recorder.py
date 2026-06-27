@@ -63,7 +63,7 @@ def test_finalize_derives_vsa_csv_and_waterfall_png(tmp_path: Path) -> None:
     assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"  # PNG signature
 
 
-def test_stream_recorder_dsp_path_writes_all_three(tmp_path: Path) -> None:
+def test_stream_recorder_dsp_path_writes_cf32(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
     out = tmp_path / "cmd_32_32"
@@ -78,10 +78,13 @@ def test_stream_recorder_dsp_path_writes_all_three(tmp_path: Path) -> None:
     assert rec is not None
     for _ in range(4):  # stream several chunks, as the dsp reader does
         rec.write(_tone(1024))
-    rec.finalize()
-    assert (out / "cmd_32_32.sdf").exists()  # named after the pass dir
-    assert (out / "cmd_32_32.csv").exists()
-    assert (out / "cmd_32_32.png").exists()
+    rec.close()
+    cf32 = out / "cmd_32_32.cf32"
+    assert cf32.exists()
+    assert cf32.stat().st_size == 4 * 1024 * 8  # 4 chunks × 1024 complex64 (8 B each)
+    assert (out / "cmd_32_32.cf32.json").exists()  # self-describing sidecar
+    # views (sdf/csv/png) are derived POST-pass by iq_views, not in-pass
+    assert not (out / "cmd_32_32.sdf").exists()
 
 
 def test_stream_recorder_off_when_disabled() -> None:
@@ -91,9 +94,10 @@ def test_stream_recorder_off_when_disabled() -> None:
     assert StreamRecorder.maybe_start(args, sample_rate_hz=1.0) is None
 
 
-def test_stub_rx_synthetic_capture_writes_all_three(tmp_path: Path) -> None:
-    # The stub honours --record-iq with a synthetic capture (no SDR) so the whole
+def test_stub_rx_synthetic_capture_writes_cf32(tmp_path: Path) -> None:
+    # The stub honours --record-iq with a synthetic cf32 capture (no SDR) so the
     # record→file path is E2E-testable off the bench — uniform with the real engines.
+    # Views (sdf/csv/png) are derived post-pass by iq_views, not here.
     from types import SimpleNamespace
 
     import stub_rx
@@ -108,6 +112,6 @@ def test_stub_rx_synthetic_capture_writes_all_three(tmp_path: Path) -> None:
         center_freq_hz=401_200_000,
     )
     stub_rx._write_stub_capture(args)
-    assert (out / "cmd_stub.sdf").exists()
-    assert (out / "cmd_stub.csv").exists()
-    assert (out / "cmd_stub.png").exists()
+    assert (out / "cmd_stub.cf32").exists()
+    assert (out / "cmd_stub.cf32.json").exists()
+    assert not (out / "cmd_stub.sdf").exists()

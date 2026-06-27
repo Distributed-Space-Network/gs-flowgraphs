@@ -18,7 +18,7 @@ dependencies = ["numpy>=1.24", "scipy>=1.10"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
-pythonpath = ["apps"]
+pythonpath = ["apps", "tools"]
 testpaths = ["tests"]
 addopts = "-ra"
 
