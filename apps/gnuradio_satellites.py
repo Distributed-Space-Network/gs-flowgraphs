@@ -142,12 +142,12 @@ class _SatContext:
         self.tb.start()
 
     def stop(self) -> None:
-        self.tb.stop()
-        # Finalize BEFORE tb.wait(): the native cf32 sink has already flushed to disk, and
-        # gr-soapy's source can hang tb.wait() (→ SIGTERM), which would otherwise skip the
-        # PNG/CSV derivation. finalize reads the on-disk cf32, so it needs no running graph.
+        # Finalize BEFORE touching the scheduler: gr-soapy can hang tb.stop() AND tb.wait()
+        # (→ SIGTERM), which would skip the PNG/CSV. The native cf32 sink is unbuffered, so
+        # the capture is already on disk; finalize reads it off the still-live graph.
         if self._recorder is not None:
             self._recorder.finalize()
+        self.tb.stop()
         self.tb.wait()
 
     def wait(self) -> None:

@@ -84,11 +84,12 @@ class _RxContext:
         self.tb.start()
 
     def stop(self) -> None:
-        self.tb.stop()
-        # Finalize BEFORE tb.wait(): the native cf32 sink has flushed to disk, and the
-        # gr-soapy source can hang tb.wait() (→ SIGTERM); finalize reads the on-disk cf32.
+        # Finalize BEFORE touching the scheduler: gr-soapy can hang tb.stop() AND tb.wait()
+        # (→ SIGTERM). The native cf32 sink is unbuffered, so finalize reads the on-disk
+        # capture off the still-live graph.
         if self._recorder is not None:
             self._recorder.finalize()
+        self.tb.stop()
         self.tb.wait()
 
     def wait(self) -> None:

@@ -21,13 +21,15 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
-import contextlib
 import datetime as _dt
+import logging
 import struct
 import zlib
 from pathlib import Path
 
 import numpy as np
+
+_log = logging.getLogger("gs_recorder")
 
 _FULL_SCALE = 32767.0
 # Keysight PXB factory preset: scale to 70% (−3 dB) so interpolation can't overshoot.
@@ -223,7 +225,9 @@ def make_sdf_sink(path: Path, *, headroom: float = _HEADROOM):  # type: ignore[n
     return _SdfSink()
 
 
-_CSV_HEAD_SECONDS = 30.0  # VSA CSV is a leading window (a full-pass CSV is GB-scale text)
+# VSA CSV is a leading window (a full-pass CSV is GB-scale text). Kept short so finalize
+# stays well under the 30 s stop budget even while the demod graph is still hogging the SoC.
+_CSV_HEAD_SECONDS = 10.0
 
 
 class PassRecorder:
@@ -260,17 +264,19 @@ class PassRecorder:
         return cls(iq_path, float(args.center_freq_hz), float(sample_rate_hz), formats)
 
     def finalize(self) -> None:
-        # The cf32 raw IQ is written in real time and is the artifact. Derive the view
-        # formats from it on disk (NOT from a GR sink), so they're produced even when the
-        # gr-soapy source hangs at stop. memmap the capture so the waterfall samples
-        # across the whole pass without loading it all into RAM. Best-effort — never raises.
+        # Derive the view formats from the on-disk cf32 (NOT from a GR sink). The CALLER
+        # runs this BEFORE touching tb.stop()/tb.wait(), because gr-soapy can hang either
+        # one (→ SIGTERM); the native sink is unbuffered, so the capture is already on
+        # disk. memmap so the waterfall samples across the whole pass without loading it
+        # all into RAM. Logs success/failure (the old silent suppress hid a no-op).
         want_png, want_csv = "png" in self._formats, "csv" in self._formats
         if not (want_png or want_csv) or not self._iq_path.exists():
             return
         n_samp = self._iq_path.stat().st_size // 8  # 8 B per complex64; floor a torn write
         if n_samp < 1:  # need at least one whole sample
+            _log.warning("recording: %s has no samples; no PNG/CSV", self._iq_path.name)
             return
-        with contextlib.suppress(Exception):
+        try:
             # shape= truncates a torn final write (SIGTERM mid-write) to whole samples,
             # so a non-multiple-of-8 file still yields the PNG/CSV instead of raising.
             iq = np.memmap(self._iq_path, dtype=np.complex64, mode="r", shape=(n_samp,))
@@ -285,6 +291,9 @@ class PassRecorder:
                     sample_rate_hz=self._sample_rate_hz,
                     started_utc=self._started,
                 )
+            _log.info("recording: derived views from %s (%d samples)", self._iq_path.name, n_samp)
+        except Exception:
+            _log.exception("recording: failed to derive PNG/CSV from %s", self._iq_path.name)
 
 
 class StreamRecorder:

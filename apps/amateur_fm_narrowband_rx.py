@@ -369,12 +369,12 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         stop_requested.set()
         if started.is_set():
             try:
-                tb.stop()
-                # Finalize BEFORE tb.wait(): the native cf32 sink has flushed to disk, and
-                # the gr-soapy source can hang tb.wait() (→ SIGTERM); finalize reads the
-                # on-disk cf32, so the PNG/CSV are produced regardless.
+                # Finalize BEFORE touching the scheduler: gr-soapy can hang tb.stop() AND
+                # tb.wait() (→ SIGTERM). The native cf32 sink is unbuffered, so finalize
+                # reads the on-disk capture off the still-live graph → PNG/CSV regardless.
                 if ctx.recorder is not None:
                     ctx.recorder.finalize()
+                tb.stop()
                 tb.wait()
             except Exception:
                 log.exception("tb.stop/wait/recorder raised")
