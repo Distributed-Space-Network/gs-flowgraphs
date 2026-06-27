@@ -202,6 +202,29 @@ def capture_plan(env_capture_rate_hz: float, channel_rate_hz: float) -> tuple[fl
     return float(channel_rate_hz), False
 
 
+# Minimum auto LO offset (Hz). The DC/LO spike must clear the channel; we always capture
+# wide, so we can dodge in hardware and the decimator filters the spike out.
+_AUTO_LO_OFFSET_MIN_HZ = 100_000.0
+
+
+def auto_lo_offset(
+    sdr_rate_hz: float, channel_rate_hz: float, configured_offset_hz: float
+) -> float:
+    """LO offset that keeps the SDR's DC/LO spike OUT of the decimated channel, chosen
+    AUTOMATICALLY — we know the bird's frequency, so no per-pass config is needed.
+
+    Honors a non-zero ``GS_SDR_LO_OFFSET`` override; otherwise offsets by one channel-width
+    below the bird (min 100 kHz), which ``tune_source`` puts the spike at while keeping the
+    signal at DC. Returns 0 only when the channel is so wide there's no room left in the
+    captured band to dodge — DC removal handles the spike then."""
+    if configured_offset_hz:
+        return float(configured_offset_hz)
+    off = max(float(channel_rate_hz), _AUTO_LO_OFFSET_MIN_HZ)
+    if off > float(sdr_rate_hz) / 2.0 - float(channel_rate_hz) / 2.0:  # no room to dodge
+        return 0.0
+    return off
+
+
 def resample_ratio(capture_rate_hz: float, channel_rate_hz: float) -> tuple[int, int]:
     """(interpolation, decimation) to convert ``capture_rate`` → ``channel_rate``,
     exact for integer rates (2.048 Msps → 48 ksps = 3/128)."""

@@ -26,6 +26,7 @@ import numpy as np
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
+    auto_lo_offset,
     capture_plan,
     configure_soapy_source,
     make_decimator,
@@ -192,10 +193,11 @@ def build_rx_top_block(
     args, profile: endurosat.LinkProfile, sample_rate: float, params: dict | None = None
 ) -> _RxContext:
     env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal/rate)
-    lo = env["lo_offset_hz"]
     # Capture at the SDR's supported rate (XTRX floor ~2.1 Msps) and decimate to the
     # channel rate; the demod chain runs at ``sample_rate``.
     sdr_rate, decimate = capture_plan(env["capture_rate_hz"], float(sample_rate))
+    # AUTO LO offset → DC spike dodged off the bird (no per-pass config); see _soapy.
+    lo = auto_lo_offset(sdr_rate, float(sample_rate), env["lo_offset_hz"])
     tb = gr.top_block("cubesat_gfsk_ax25_rx_gr")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)

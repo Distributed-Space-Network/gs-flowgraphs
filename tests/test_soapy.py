@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from _soapy import (
     apply_corrections,
+    auto_lo_offset,
     capture_plan,
     configure_soapy_source,
     merge_sdr_params,
@@ -17,6 +18,18 @@ from _soapy import (
     sdr_env,
     tune_source,
 )
+
+
+def test_auto_lo_offset_dodges_dc_spike_by_default() -> None:
+    sdr = 2_048_000.0
+    # No configured offset → auto-dodge: spike one channel-width below the bird (min 100 k),
+    # comfortably outside the channel and inside the captured band.
+    assert auto_lo_offset(sdr, 48_000.0, 0.0) == 100_000.0  # min floor for a narrow channel
+    assert auto_lo_offset(sdr, 200_000.0, 0.0) == 200_000.0  # one channel-width for a wide one
+    # An explicit GS_SDR_LO_OFFSET wins.
+    assert auto_lo_offset(sdr, 48_000.0, 250_000.0) == 250_000.0
+    # No room to dodge in the captured band (very wide channel) → 0 (DC removal handles it).
+    assert auto_lo_offset(sdr, 1_000_000.0, 0.0) == 0.0
 
 
 class FakeSoapy:

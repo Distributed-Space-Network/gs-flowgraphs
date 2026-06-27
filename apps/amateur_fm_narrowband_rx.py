@@ -62,6 +62,7 @@ from _spawn_contract import (
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
+    auto_lo_offset,
     capture_plan,
     configure_soapy_source,
     make_decimator,
@@ -184,10 +185,11 @@ def build_top_block(
     # --sdr-args is parsed by gr-soapy itself; pass ``soapy_args``
     # exactly as the orchestrator built it.
     env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal/rate)
-    lo_offset_hz = env["lo_offset_hz"]
     # Capture at the SDR's supported rate (XTRX floor ~2.1 Msps), decimate to the
     # channel rate ahead of the channel filter; the FM chain runs at args.sample_rate.
     sdr_rate, decimate = capture_plan(env["capture_rate_hz"], float(args.sample_rate))
+    # AUTO LO offset → DC spike dodged off the bird (no per-pass config); see _soapy.
+    lo_offset_hz = auto_lo_offset(sdr_rate, float(args.sample_rate), env["lo_offset_hz"])
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
     tune_source(src, float(args.center_freq_hz), lo_offset_hz)  # LO offset → DC spike off-signal

@@ -37,6 +37,7 @@ from _fallback_select import (  # pure, testable, no GNU Radio
 from _recorder import PassRecorder
 from _soapy import (
     apply_corrections,
+    auto_lo_offset,
     capture_plan,
     configure_soapy_source,
     make_decimator,
@@ -288,7 +289,6 @@ def build_satellites_rx(
     decoded-frame message port name against the installed gr-satellites version.
     """
     env = sdr_env()  # station-wide GS_SDR_* (antenna/gain/lo-offset/ppm/dc-removal/rate)
-    lo = env["lo_offset_hz"]
     # The SDR samples at the capture rate (XTRX can't stream the narrow channel rate), so
     # decimate to the CHANNEL rate ONCE and feed everything (recorder, gr-satellites, the
     # fallback demods) from it. The channel must be wide enough for the bird's symbol rate
@@ -300,6 +300,10 @@ def build_satellites_rx(
     sdr_rate, _ = capture_plan(env["capture_rate_hz"], want_channel)
     channel_rate = channel_rate_for(float(sample_rate), sym, sdr_rate)
     decimate = channel_rate < sdr_rate
+    # AUTO LO offset: dodge the DC/LO spike off the bird (no per-pass config — we know the
+    # frequency). tune_source keeps the signal at DC and the spike at +offset, which the
+    # decimator filters out. Honors an explicit GS_SDR_LO_OFFSET.
+    lo = auto_lo_offset(sdr_rate, channel_rate, env["lo_offset_hz"])
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
