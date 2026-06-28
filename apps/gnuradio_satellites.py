@@ -115,7 +115,6 @@ class _SatContext:
         self._valve_ours = valve_ours
         self._valve_grsat = valve_grsat
         self._winner: str | None = None
-        self._seen: set[bytes] = set()
 
     @property
     def framing(self) -> str:
@@ -134,26 +133,32 @@ class _SatContext:
     def wait(self) -> None:
         self.tb.wait()
 
-    def drain_frames(self) -> list[bytes]:
-        # gr-satellites PDUs and our demod, kept separate so we can tell who decoded FIRST.
-        gr_frames = list(self._sink.drain())
-        our_frames: list[bytes] = []
+    def drain_frames(self) -> list[tuple[str, bytes]]:
+        # Each frame tagged with the engine that produced it (kept separate so we know who
+        # decoded). ``our_frames`` carry the demod name (e.g. "gfsk2400"); gr-satellites PDUs
+        # are "gr-satellites".
+        our_frames: list[tuple[str, bytes]] = []
         for fb in list(self._fallbacks):
-            our_frames.extend(fb.drain_frames())
-        # First CRC-valid frame wins; gate off the loser's valve so its chain starves. Only
-        # when both ran (both valves present). Idempotent.
-        if self._winner is None and (self._valve_ours or self._valve_grsat):
-            if gr_frames:
-                self._winner = "grsatellites"
-                self._gate_off(self._valve_ours, "our engine")
-            elif our_frames:
+            our_frames.extend((fb.name, f) for f in fb.drain_frames())
+        gr_frames: list[tuple[str, bytes]] = [("gr-satellites", f) for f in self._sink.drain()]
+        # Race: the first to produce a CRC-valid frame wins; gate off the loser. Only while
+        # both ran (both valves set). On a tie within one drain, OUR engine wins (it's the
+        # backend-specified primary). Idempotent.
+        if self._winner is None and self._valve_ours is not None and self._valve_grsat is not None:
+            if our_frames:
                 self._winner = "ours"
                 self._gate_off(self._valve_grsat, "gr-satellites")
-        fresh: list[bytes] = []
-        for f in (*gr_frames, *our_frames):
-            if f not in self._seen:
-                self._seen.add(f)
-                fresh.append(f)
+            elif gr_frames:
+                self._winner = "grsatellites"
+                self._gate_off(self._valve_ours, "our engine")
+        # Dedup WITHIN this drain only (a frame both engines decoded in the same window) — NOT
+        # across drains, so genuine repeat beacons (identical payloads over time) are kept.
+        fresh: list[tuple[str, bytes]] = []
+        seen: set[bytes] = set()
+        for source, f in (*our_frames, *gr_frames):
+            if f not in seen:
+                seen.add(f)
+                fresh.append((source, f))
         return fresh
 
     def _gate_off(self, valve, name: str) -> None:
@@ -171,20 +176,26 @@ class _FallbackDemod:
     """One fallback demod tapping the SDR source: a demodulator chain + a deframer.
     ``drain_frames`` returns the bytes of any frames recovered since the last call."""
 
+    _LOCK_AFTER = 2  # matches of the SAME framing before locking (one CRC hit can be spurious)
+
     def __init__(self, name: str, sink, deframe, framing: str | None = None) -> None:
         self.name = name
         self._sink = sink
         self._deframe = deframe
         self._framing = (framing or "").strip().lower() or None  # backend hint (locks the protocol)
         self._locked: str | None = None  # framing discovered this pass when no hint was given
+        self._hits: dict[str, int] = {}  # per-framing match count, to lock only on a confident one
 
     def drain_frames(self) -> list[bytes]:
-        # Backend gave the framing → use only that. Otherwise try all, and once one matches,
-        # LOCK to it for the rest of the pass (stop frame-matching).
+        # Backend gave the framing → use only that. Otherwise try all; once ONE framing has
+        # matched _LOCK_AFTER times (a single CRC hit can be a ~1/65536 fluke), lock to it for
+        # the rest of the pass so a spurious early match can't strand the real framing.
         use = self._framing or self._locked
         frames, matched = self._deframe(self._sink, use)
         if matched and self._framing is None and self._locked is None:
-            self._locked = matched
+            self._hits[matched] = self._hits.get(matched, 0) + 1
+            if self._hits[matched] >= self._LOCK_AFTER:
+                self._locked = matched
         return frames
 
 
@@ -255,8 +266,8 @@ def _build_fallbacks(
         # symbol_sync needs sps>1, so the rate exceeds ~sample_rate/2) must NOT crash the
         # engine or cost us the IQ recording — skip it and keep the others.
         try:
-            if kind in ("gfsk", "fsk", "gmsk"):  # 2-FSK family (GMSK = h≈0.5)
-                mod_index = 0.5 if kind == "gmsk" else endurosat.LinkProfile().mod_index
+            if kind in ("gfsk", "fsk", "gmsk", "msk"):  # 2-FSK family; (G)MSK ≈ h=0.5 CPFSK
+                mod_index = 0.5 if kind in ("gmsk", "msk") else endurosat.LinkProfile().mod_index
                 profile = endurosat.LinkProfile(symbol_rate_hz=rate or 9600.0, mod_index=mod_index)
                 sink = connect_gfsk_demod(
                     tb, demod_src, sample_rate, profile, decimate=False, sdr_rate=sample_rate
@@ -283,10 +294,13 @@ def _backend_mode(params: dict | None) -> str | None:
     "gfsk2400"). None when either is absent — caller then runs gr-satellites only."""
     p = params or {}
     kind = str(p.get("modulation") or "").strip().lower()
-    rate = p.get("symbol_rate_hz")
-    if not kind or not rate:
+    try:
+        rate = int(float(p.get("symbol_rate_hz") or 0))
+    except (TypeError, ValueError):  # a non-numeric symbol rate must not crash the engine
         return None
-    return f"{kind}{int(float(rate))}"
+    if not kind or rate <= 0:
+        return None
+    return f"{kind}{rate}"
 
 
 def _build_grsatellites(selector, channel_rate: float, satellite):

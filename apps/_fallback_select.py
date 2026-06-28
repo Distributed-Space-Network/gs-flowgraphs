@@ -27,7 +27,7 @@ import re
 DEFAULT_FALLBACK_DEMODS = "gfsk9600,gfsk4800,gmsk9600,gmsk4800,bpsk1200,bpsk9600,qpsk9600,afsk1200"
 
 # Modulation kinds the demod builders understand (see gnuradio_satellites._build_fallbacks).
-DEMOD_KINDS = ("gfsk", "fsk", "gmsk", "bpsk", "qpsk", "psk", "afsk")
+DEMOD_KINDS = ("gfsk", "fsk", "gmsk", "msk", "bpsk", "qpsk", "psk", "afsk")
 
 # Samples/symbol the channel must give the demods. symbol_sync needs sps>1; ~4 is a
 # comfortable margin for GFSK/PSK timing recovery.

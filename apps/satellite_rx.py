@@ -72,11 +72,10 @@ async def _emit_frame(
             "frame": {"bytes_b64": base64.b64encode(frame).decode("ascii"), "len": len(frame)},
         },
     )
-    try:
-        sockets.data_writer.write(frame)
-        await sockets.data_writer.drain()
-    except (ConnectionResetError, BrokenPipeError):
-        logging.getLogger("satellite_rx").warning("data socket closed; frame not stored")
+    # NOTE: we deliberately do NOT tee frames to the data socket. The decoded-frames product
+    # is frames.jsonl (appended above; gs-client uploads it post-pass). Streaming frames to the
+    # data socket would also tee them to raw_bits.bin, which then races frames.jsonl to the same
+    # presigned upload URL. frames.jsonl is the single source of truth for decoded frames.
 
 
 async def amain(args) -> int:
@@ -157,12 +156,12 @@ async def amain(args) -> int:
                 if doppler["hz"] != last_doppler:
                     last_doppler = doppler["hz"]
                     ctx.set_doppler(last_doppler)
-                # Decode is LIVE: gr-satellites, or our one demod with the bird's known
-                # backend mode. Frames go to the data/status sockets + frames.jsonl, which
-                # gs-client uploads post-pass. No brute-force bank, no post-pass decode.
-                for frame in ctx.drain_frames():
+                # Decode is LIVE: gr-satellites and/or our one demod (the bird's backend mode),
+                # each frame tagged with the engine that produced it. Frames -> status events +
+                # frames.jsonl, which gs-client uploads post-pass. No bank, no post-pass decode.
+                for source, frame in ctx.drain_frames():
                     await _emit_frame(
-                        sockets, frame, satellite, decoder=decoder, output_dir=out_dir
+                        sockets, frame, satellite, decoder=source, output_dir=out_dir
                     )
         finally:
             ctx.stop()
