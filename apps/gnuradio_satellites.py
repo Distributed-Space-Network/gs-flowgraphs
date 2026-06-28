@@ -25,6 +25,7 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import queue
 import re
@@ -95,6 +96,8 @@ class _SatContext:
         lo_offset_hz: float = 0.0,
         *,
         fallbacks=None,
+        valve_ours=None,
+        valve_grsat=None,
     ) -> None:
         self.tb = tb
         self.src = src
@@ -102,14 +105,17 @@ class _SatContext:
         self._center = center_hz
         self._lo_offset = lo_offset_hz
         self._recorder = recorder
-        # When gr-satellites has no decoder for this bird, ``fallbacks`` is a list of
-        # _FallbackDemod tapping the channel in parallel; frames come from any of them. The
-        # real-time graph runs only the backend's TARGETED demod(s) — it must keep up with
-        # the SDR or drop samples. The exhaustive bank runs POST-PASS on the recorded .cf32
-        # (``decode_file``), which has no real-time deadline. (Earlier we escalated to the
-        # full bank on the live graph; on a constrained SoC that overran the RX DMA →
-        # BUF_OVF + starved Doppler retuning. Post-pass decode replaces it.)
+        # Frames come from gr-satellites (``sink``) and/or our own demod (``fallbacks``, one
+        # demod for the bird's known mode). With demod params present AND the bird catalogued
+        # we run BOTH (each behind a valve), and the FIRST to produce a CRC-valid frame wins:
+        # we gate off the loser's valve so its chain starves (the SDR stream is shared — one
+        # open, fanned out — so there is no hardware conflict, only CPU, and two chains is
+        # cheap). Frames are deduped across both.
         self._fallbacks = list(fallbacks or [])
+        self._valve_ours = valve_ours
+        self._valve_grsat = valve_grsat
+        self._winner: str | None = None
+        self._seen: set[bytes] = set()
 
     @property
     def framing(self) -> str:
@@ -129,12 +135,33 @@ class _SatContext:
         self.tb.wait()
 
     def drain_frames(self) -> list[bytes]:
-        # gr-satellites PDUs (empty when the sink is unconnected in fallback mode) PLUS
-        # every targeted fallback demod — frames come from whichever locks.
-        frames: list[bytes] = list(self._sink.drain())
+        # gr-satellites PDUs and our demod, kept separate so we can tell who decoded FIRST.
+        gr_frames = list(self._sink.drain())
+        our_frames: list[bytes] = []
         for fb in list(self._fallbacks):
-            frames.extend(fb.drain_frames())
-        return frames
+            our_frames.extend(fb.drain_frames())
+        # First CRC-valid frame wins; gate off the loser's valve so its chain starves. Only
+        # when both ran (both valves present). Idempotent.
+        if self._winner is None and (self._valve_ours or self._valve_grsat):
+            if gr_frames:
+                self._winner = "grsatellites"
+                self._gate_off(self._valve_ours, "our engine")
+            elif our_frames:
+                self._winner = "ours"
+                self._gate_off(self._valve_grsat, "gr-satellites")
+        fresh: list[bytes] = []
+        for f in (*gr_frames, *our_frames):
+            if f not in self._seen:
+                self._seen.add(f)
+                fresh.append(f)
+        return fresh
+
+    def _gate_off(self, valve, name: str) -> None:
+        if valve is None:
+            return
+        with contextlib.suppress(Exception):  # bench-pending: blocks.copy disabled drains input
+            valve.set_enabled(False)
+        _log.info("%s won; gated off %s for the rest of the pass", self._winner, name)
 
     def set_doppler(self, offset_hz: float) -> None:
         retune_source(self.src, self._center, self._lo_offset, offset_hz)
@@ -144,34 +171,53 @@ class _FallbackDemod:
     """One fallback demod tapping the SDR source: a demodulator chain + a deframer.
     ``drain_frames`` returns the bytes of any frames recovered since the last call."""
 
-    def __init__(self, name: str, sink, deframe) -> None:
+    def __init__(self, name: str, sink, deframe, framing: str | None = None) -> None:
         self.name = name
         self._sink = sink
         self._deframe = deframe
+        self._framing = (framing or "").strip().lower() or None  # backend hint (locks the protocol)
+        self._locked: str | None = None  # framing discovered this pass when no hint was given
 
     def drain_frames(self) -> list[bytes]:
-        return self._deframe(self._sink)
+        # Backend gave the framing → use only that. Otherwise try all, and once one matches,
+        # LOCK to it for the rest of the pass (stop frame-matching).
+        use = self._framing or self._locked
+        frames, matched = self._deframe(self._sink, use)
+        if matched and self._framing is None and self._locked is None:
+            self._locked = matched
+        return frames
 
 
-def _bits_deframe(bit_sink) -> list[bytes]:
-    """Modulation-agnostic deframer: turn a demod's hard bits into frames. Tries AX.25
-    both descrambled (G3RUH) and plain, then the EnduroSat chip packet (both bit
-    polarities). The HDLC flag + FCS/CRC gate false positives, so trying everything is
-    safe — only CRC-valid frames come back. Used by every fallback demod."""
+_FRAMINGS = ("ax25", "endurosat")  # link layers our engine knows; gr-satellites does its own
+
+
+def _bits_deframe(bit_sink, framing_name: str | None = None) -> tuple[list[bytes], str | None]:
+    """Deframe a demod's hard bits → ``(frames, matched_framing)``. ``framing_name`` runs ONLY
+    that link layer (the backend told us). When None, try every known framing — we don't know
+    the link layer — and report which one matched so the caller can lock onto it. Every framing
+    is CRC/FCS-gated, so trying several is safe (a wrong one has a ~1/65536-per-flag spurious
+    chance, which is why locking once matched is worth it)."""
     import numpy as np  # noqa: PLC0415
 
     from gfsk_ax25 import endurosat_link, framing  # noqa: PLC0415
 
-    bits = bit_sink.drain()
+    bits = bit_sink.drain()  # consume once; try framings against the same buffer
     if not len(bits):
-        return []
-    frames: list[bytes] = []
-    for scramble in (True, False):  # G3RUH-scrambled AX.25, then plain AX.25
-        frames.extend(framing.decode(bits, scramble=scramble, nrzi=True))
-    if frames:
-        return frames
-    arr = np.asarray(bits, dtype=np.uint8)
-    return endurosat_link.deframe(arr) or endurosat_link.deframe(1 - arr)
+        return [], None
+    order = [framing_name.strip().lower()] if framing_name else list(_FRAMINGS)
+    for name in order:
+        if name == "endurosat":
+            arr = np.asarray(bits, dtype=np.uint8)
+            frames = endurosat_link.deframe(arr) or endurosat_link.deframe(1 - arr)
+        elif name == "ax25":  # both G3RUH-descrambled and plain — same framing, just descrambling
+            frames = []
+            for scramble in (True, False):
+                frames.extend(framing.decode(bits, scramble=scramble, nrzi=True))
+        else:
+            continue
+        if frames:
+            return frames, name
+    return [], None
 
 
 # Modulation kind -> demod builder. ``_build_fallbacks`` parses "<kind><rate>"
@@ -180,14 +226,13 @@ _PSK_ORDER = {"bpsk": 2, "psk": 2, "qpsk": 4}
 
 
 def _build_fallbacks(
-    tb, demod_src, sample_rate: float, params=None, modes=None
+    tb, demod_src, sample_rate: float, params=None, modes=None, framing=None
 ) -> list[_FallbackDemod]:
-    """Build the selected fallback demods, all tapping ``demod_src`` (already at the
-    channel rate, so they fan out from a single decimator). The set is ``modes`` if given
-    (an explicit ``"<kind><rate>"`` list, used by runtime escalation), else chosen by
-    ``_fallback_select.fallback_modes`` (backend mode if known, else the full bank). Covers
-    the frame-producing modulations of 401 MHz LEO cubesats: GFSK / FSK / GMSK, BPSK /
-    QPSK / PSK, AFSK. All share the modulation-agnostic ``_bits_deframe``."""
+    """Build the demod(s) tapping ``demod_src`` (already at the channel rate). Normally this
+    is the ONE demod the backend specified — ``modes=["<kind><rate>"]`` from the transmitter
+    record (modulation + symbol_rate) — deframed with the backend ``framing``. Falls back to
+    ``fallback_modes(params)`` only when no explicit mode is given. Covers the frame-producing
+    modulations of 401 MHz LEO cubesats: GFSK / FSK / GMSK, BPSK / QPSK / PSK, AFSK."""
     from gnuradio_gfsk import (  # noqa: PLC0415
         connect_afsk_demod,
         connect_gfsk_demod,
@@ -228,8 +273,37 @@ def _build_fallbacks(
         except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
             _log.warning("fallback demod %r failed to build (%s); skipping", mode, e)
             continue
-        out.append(_FallbackDemod(mode, sink, _bits_deframe))
+        out.append(_FallbackDemod(mode, sink, _bits_deframe, framing))
     return out
+
+
+def _backend_mode(params: dict | None) -> str | None:
+    """The single "<kind><rate>" the backend specified, from the transmitter record's
+    modulation + symbol_rate_hz (e.g. {"modulation":"gfsk","symbol_rate_hz":2400} ->
+    "gfsk2400"). None when either is absent — caller then runs gr-satellites only."""
+    p = params or {}
+    kind = str(p.get("modulation") or "").strip().lower()
+    rate = p.get("symbol_rate_hz")
+    if not kind or not rate:
+        return None
+    return f"{kind}{int(float(rate))}"
+
+
+def _build_grsatellites(selector, channel_rate: float, satellite):
+    """Instantiate the gr-satellites flowgraph for ``satellite`` (by NORAD) or return None if
+    it has no decoder (not catalogued / API drift) — non-fatal; our engine + the recording
+    carry on. The caller wires it (so it can insert a valve first for the parallel race)."""
+    if selector is None:
+        return None
+    try:
+        fg = gr_satellites_flowgraph(
+            samp_rate=channel_rate, iq=True, grc_block=True, **selector  # gr-satellites resamples
+        )
+        _log.info("gr-satellites: decoder for %s (%r) @ %.0f Hz", satellite, selector, channel_rate)
+        return fg
+    except Exception as e:  # noqa: BLE001 — not catalogued / API drift
+        _log.info("gr-satellites: no decoder for %s (%s)", satellite, e)
+        return None
 
 
 def _gr_satellites_selector(satellite) -> dict | None:
@@ -291,34 +365,40 @@ def build_satellites_rx(
     # decoder, so a decoder problem never costs us the recording. At the CHANNEL rate.
     recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=channel_rate)
 
-    # gr-satellites decoder if the bird is in its catalog; else fall back. ``flowgraph``
-    # is instantiated DIRECTLY (no ``.make()``) as a hier block exposing an 'out' PDU.
+    # Engine selection (per backend params). Both tap the SAME channel stream (one SDR open,
+    # fanned out — no hardware conflict; the dynamic SDR control, Doppler, is ephemeris-driven
+    # on the shared source, identical for both). CPU is the only shared cost, and two chains is
+    # cheap (the 12-demod bank is what overran the RX DMA, not two):
+    #   * demod params present AND bird catalogued → BOTH, each behind a valve; the first to
+    #     produce a CRC-valid frame wins and the loser's valve is gated off (see drain_frames).
+    #   * demod params present, not catalogued → OUR engine only.
+    #   * only a NORAD / a demod param missing → gr-satellites only.
+    from gnuradio import blocks  # noqa: PLC0415 — bench-only
+
     sink = _FrameSink()
     fallbacks: list[_FallbackDemod] = []
+    valve_ours = valve_grsat = None
     selector = _gr_satellites_selector(satellite)
-    try:
-        if selector is None:
-            raise ValueError(f"no usable satellite id {satellite!r}")
-        flowgraph = gr_satellites_flowgraph(
-            samp_rate=channel_rate,  # the channel rate; gr-satellites resamples to the bird
-            iq=True,
-            grc_block=True,
-            **selector,
-        )
-        tb.connect(chan, flowgraph)
-        tb.msg_connect(flowgraph, "out", sink, "in")
-        _log.info("gr-satellites: decoding %s (%r) @ %.0f Hz", satellite, selector, channel_rate)
-    except Exception as e:  # noqa: BLE001 — any build failure → fall back, keep the IQ
-        # Not in gr-satellites' catalog (or API drift): fan the fallback demods out from
-        # the same channel decimator.
-        _log.warning("gr-satellites: no decoder for %s (%s) → fallback demods", satellite, e)
-        fallbacks = _build_fallbacks(tb, chan, channel_rate, params)
-        _log.info(
-            "fallback demods @ %.0f Hz (symbol_rate=%s): %s",
-            channel_rate,
-            (params or {}).get("symbol_rate_hz", "?"),
-            ", ".join(f.name for f in fallbacks) or "(none)",
-        )
+    framing = (params or {}).get("framing")
+    mode = _backend_mode(params)  # "<kind><rate>" when modulation+symbol_rate both present
+    fg = _build_grsatellites(selector, channel_rate, satellite)  # None if not catalogued
+    if mode and fg is not None:  # race both
+        valve_ours = blocks.copy(gr.sizeof_gr_complex)
+        valve_grsat = blocks.copy(gr.sizeof_gr_complex)
+        tb.connect(chan, valve_ours)
+        tb.connect(chan, valve_grsat, fg)
+        tb.msg_connect(fg, "out", sink, "in")
+        fallbacks = _build_fallbacks(tb, valve_ours, channel_rate, modes=[mode], framing=framing)
+        _log.info("racing: our engine %s + gr-satellites %r (first frame wins)", mode, selector)
+    elif mode:  # our engine only (not catalogued)
+        fallbacks = _build_fallbacks(tb, chan, channel_rate, modes=[mode], framing=framing)
+        _log.info("our engine: %s @ %.0f Hz (framing=%s)", mode, channel_rate, framing or "auto")
+    elif fg is not None:  # gr-satellites only (no demod params)
+        tb.connect(chan, fg)
+        tb.msg_connect(fg, "out", sink, "in")
+        _log.info("gr-satellites only for %s (no demod params)", satellite)
+    else:
+        _log.warning("no decode: no demod params and no gr-satellites decoder for %r", satellite)
     return _SatContext(
         tb,
         src,
@@ -327,57 +407,9 @@ def build_satellites_rx(
         recorder,
         lo_offset_hz=lo,
         fallbacks=fallbacks,
+        valve_ours=valve_ours,
+        valve_grsat=valve_grsat,
     )
 
 
-def decode_file(
-    cf32_path,
-    *,
-    sample_rate_hz: float,
-    satellite: str = "",
-    params: dict | None = None,
-    modes: list[str] | None = None,
-) -> list[tuple[str, bytes]]:
-    """POST-PASS decode of a recorded ``.cf32``: gr-satellites (if the bird is in its
-    catalog) plus the demod bank, run over the whole capture off a file source.
-
-    This is where decode belongs — NOT the real-time graph. A file source runs to EOF as
-    fast as the CPU allows, with no SDR to keep up with, so there is no BUF_OVF / dropped
-    samples / starved Doppler. gs-client runs it after teardown (the SDR is freed), like
-    ``iq_views`` for the views.
-
-    The demods are the backend's TARGETED set by default (``fallback_modes(params)`` — the
-    optimal path: we use the symbol rate/modulation we were given, not a brute-force sweep,
-    so a targeted decode at 48 ksps finishes well inside the gap before the next pass). Pass
-    ``modes`` to force a specific set (e.g. a wider sweep when there is idle time). Returns
-    ``[(demod_name, frame_bytes)]`` for every CRC-valid frame. BENCH-PENDING: needs GNU
-    Radio + gr-satellites (bench only)."""
-    from gnuradio import blocks  # noqa: PLC0415 — bench-only
-
-    tb = gr.top_block("iq_decode")
-    src = blocks.file_source(gr.sizeof_gr_complex, str(cf32_path), repeat=False)
-    sink = _FrameSink()
-    selector = _gr_satellites_selector(satellite)
-    if selector is not None:
-        try:
-            flowgraph = gr_satellites_flowgraph(
-                samp_rate=float(sample_rate_hz), iq=True, grc_block=True, **selector
-            )
-            tb.connect(src, flowgraph)
-            tb.msg_connect(flowgraph, "out", sink, "in")
-        except Exception as e:  # noqa: BLE001 — not in catalog / API drift → bank only
-            _log.warning("post-pass: gr-satellites has no decoder for %s (%s)", satellite, e)
-    pick = modes if modes is not None else list(dict.fromkeys(fallback_modes(params)))
-    fallbacks = _build_fallbacks(tb, src, float(sample_rate_hz), modes=pick)
-    _log.info(
-        "post-pass decode: %d demods over %s @ %.0f Hz",
-        len(fallbacks), cf32_path, float(sample_rate_hz),
-    )
-    tb.run()  # blocks until the file is exhausted — offline, no SDR, no real-time deadline
-    results: list[tuple[str, bytes]] = [("grsatellites", f) for f in sink.drain()]
-    for fb in fallbacks:
-        results.extend((fb.name, fr) for fr in fb.drain_frames())
-    return results
-
-
-__all__ = ["build_satellites_rx", "decode_file"]
+__all__ = ["build_satellites_rx"]

@@ -157,9 +157,9 @@ async def amain(args) -> int:
                 if doppler["hz"] != last_doppler:
                     last_doppler = doppler["hz"]
                     ctx.set_doppler(last_doppler)
-                # Real-time decode is the backend's TARGETED mode only — it must keep up with
-                # the SDR. The exhaustive fallback bank runs POST-PASS on the recorded .cf32
-                # (gs-client → iq_decode), so we never overload the live graph chasing it.
+                # Decode is LIVE: gr-satellites, or our one demod with the bird's known
+                # backend mode. Frames go to the data/status sockets + frames.jsonl, which
+                # gs-client uploads post-pass. No brute-force bank, no post-pass decode.
                 for frame in ctx.drain_frames():
                     await _emit_frame(
                         sockets, frame, satellite, decoder=decoder, output_dir=out_dir
