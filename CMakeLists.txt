@@ -49,7 +49,8 @@ install(
     apps/cubesat_gfsk_ax25_rx.py
     apps/cubesat_gfsk_ax25_tx.py
     apps/satellite_rx.py             # multi-mission gr-satellites receiver (bench)
-    apps/iq_views.py                 # post-pass PNG/CSV from a .cf32 (run by gs-client)
+    apps/iq_views.py                 # post-pass PNG/CSV/SDF from a .cf32 (run by gs-client)
+    apps/iq_decode.py                # post-pass exhaustive decode of a .cf32 (run by gs-client)
   DESTINATION ${GS_APPS_INSTALL_DIR}
 )
 install(

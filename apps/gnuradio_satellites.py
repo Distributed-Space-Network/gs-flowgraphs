@@ -95,8 +95,6 @@ class _SatContext:
         lo_offset_hz: float = 0.0,
         *,
         fallbacks=None,
-        chan=None,
-        sample_rate: float = 0.0,
     ) -> None:
         self.tb = tb
         self.src = src
@@ -105,43 +103,17 @@ class _SatContext:
         self._lo_offset = lo_offset_hz
         self._recorder = recorder
         # When gr-satellites has no decoder for this bird, ``fallbacks`` is a list of
-        # _FallbackDemod tapping ``chan`` in parallel; frames come from any of them.
+        # _FallbackDemod tapping the channel in parallel; frames come from any of them. The
+        # real-time graph runs only the backend's TARGETED demod(s) — it must keep up with
+        # the SDR or drop samples. The exhaustive bank runs POST-PASS on the recorded .cf32
+        # (``decode_file``), which has no real-time deadline. (Earlier we escalated to the
+        # full bank on the live graph; on a constrained SoC that overran the RX DMA →
+        # BUF_OVF + starved Doppler retuning. Post-pass decode replaces it.)
         self._fallbacks = list(fallbacks or [])
-        self._chan = chan if chan is not None else src  # demod tap point for escalation
-        self._sample_rate = sample_rate
-        self._escalated = False
 
     @property
     def framing(self) -> str:
         return "fallback" if self._fallbacks else "grsatellites"
-
-    def escalate_fallbacks(self) -> None:
-        """No frames decoded → add the full fallback bank to the RUNNING graph (the
-        backend's targeted mode / gr-satellites didn't lock). Idempotent + best-effort:
-        wrapped so a reconfiguration hiccup can't break the recording or the pass; the
-        native cf32 sink is independent of this. BENCH-PENDING: runtime tb.lock()/unlock()
-        reconfiguration — validate on hardware."""
-        if self._escalated:
-            return
-        self._escalated = True
-        try:
-            running = {f.name for f in self._fallbacks}
-            modes = [m for m in fallback_modes(None) if m.strip().lower() not in running]
-            if not modes:
-                return
-            self.tb.lock()
-            try:
-                added = _build_fallbacks(self.tb, self._chan, self._sample_rate, modes=modes)
-            finally:
-                self.tb.unlock()
-            self._fallbacks.extend(added)
-            _log.warning(
-                "no frames yet → escalated to fallback bank (+%d demods: %s)",
-                len(added),
-                ", ".join(f.name for f in added) or "(none)",
-            )
-        except Exception:
-            _log.exception("fallback escalation failed; continuing with current demods")
 
     def start(self) -> None:
         self.tb.start()
@@ -158,8 +130,7 @@ class _SatContext:
 
     def drain_frames(self) -> list[bytes]:
         # gr-satellites PDUs (empty when the sink is unconnected in fallback mode) PLUS
-        # every fallback demod — so escalation works whichever was primary. Snapshot the
-        # list: escalate_fallbacks() may extend it from a worker thread.
+        # every targeted fallback demod — frames come from whichever locks.
         frames: list[bytes] = list(self._sink.drain())
         for fb in list(self._fallbacks):
             frames.extend(fb.drain_frames())
@@ -356,9 +327,57 @@ def build_satellites_rx(
         recorder,
         lo_offset_hz=lo,
         fallbacks=fallbacks,
-        chan=chan,
-        sample_rate=channel_rate,  # the rate ``chan`` runs at — escalation builds demods on it
     )
 
 
-__all__ = ["build_satellites_rx"]
+def decode_file(
+    cf32_path,
+    *,
+    sample_rate_hz: float,
+    satellite: str = "",
+    params: dict | None = None,
+    modes: list[str] | None = None,
+) -> list[tuple[str, bytes]]:
+    """POST-PASS decode of a recorded ``.cf32``: gr-satellites (if the bird is in its
+    catalog) plus the demod bank, run over the whole capture off a file source.
+
+    This is where decode belongs — NOT the real-time graph. A file source runs to EOF as
+    fast as the CPU allows, with no SDR to keep up with, so there is no BUF_OVF / dropped
+    samples / starved Doppler. gs-client runs it after teardown (the SDR is freed), like
+    ``iq_views`` for the views.
+
+    The demods are the backend's TARGETED set by default (``fallback_modes(params)`` — the
+    optimal path: we use the symbol rate/modulation we were given, not a brute-force sweep,
+    so a targeted decode at 48 ksps finishes well inside the gap before the next pass). Pass
+    ``modes`` to force a specific set (e.g. a wider sweep when there is idle time). Returns
+    ``[(demod_name, frame_bytes)]`` for every CRC-valid frame. BENCH-PENDING: needs GNU
+    Radio + gr-satellites (bench only)."""
+    from gnuradio import blocks  # noqa: PLC0415 — bench-only
+
+    tb = gr.top_block("iq_decode")
+    src = blocks.file_source(gr.sizeof_gr_complex, str(cf32_path), repeat=False)
+    sink = _FrameSink()
+    selector = _gr_satellites_selector(satellite)
+    if selector is not None:
+        try:
+            flowgraph = gr_satellites_flowgraph(
+                samp_rate=float(sample_rate_hz), iq=True, grc_block=True, **selector
+            )
+            tb.connect(src, flowgraph)
+            tb.msg_connect(flowgraph, "out", sink, "in")
+        except Exception as e:  # noqa: BLE001 — not in catalog / API drift → bank only
+            _log.warning("post-pass: gr-satellites has no decoder for %s (%s)", satellite, e)
+    pick = modes if modes is not None else list(dict.fromkeys(fallback_modes(params)))
+    fallbacks = _build_fallbacks(tb, src, float(sample_rate_hz), modes=pick)
+    _log.info(
+        "post-pass decode: %d demods over %s @ %.0f Hz",
+        len(fallbacks), cf32_path, float(sample_rate_hz),
+    )
+    tb.run()  # blocks until the file is exhausted — offline, no SDR, no real-time deadline
+    results: list[tuple[str, bytes]] = [("grsatellites", f) for f in sink.drain()]
+    for fb in fallbacks:
+        results.extend((fb.name, fr) for fr in fb.drain_frames())
+    return results
+
+
+__all__ = ["build_satellites_rx", "decode_file"]
