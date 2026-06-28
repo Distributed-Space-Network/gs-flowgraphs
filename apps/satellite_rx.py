@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import sys
@@ -189,6 +190,17 @@ def main(argv: list[str] | None = None) -> int:
         print(VERSION)
         return 0
     logging.basicConfig(level=logging.INFO)
+    # Persist OUR (Python) logs — engine selection, decoded frames, errors — to a per-pass
+    # file. stderr is a ring buffer the verbose xtrx/LMS7 C++ driver spam floods, so the
+    # decode-relevant lines scroll out before teardown; this file keeps them (and the C++
+    # spam never reaches it, so it stays clean + greppable).
+    out_dir = getattr(args, "output_dir", "") or ""
+    if out_dir:
+        with contextlib.suppress(OSError):
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(Path(out_dir) / "flowgraph.log", encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
+            logging.getLogger().addHandler(fh)
     try:
         return asyncio.run(amain(args))
     except KeyboardInterrupt:
