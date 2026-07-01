@@ -30,6 +30,7 @@ import logging
 import queue
 import re
 
+import framings  # framing registry (deframe dispatch); numpy-only, import-safe
 from _fallback_select import (  # pure, testable, no GNU Radio
     CHANNEL_OVERSAMPLE,
     channel_rate_for,
@@ -178,10 +179,9 @@ class _FallbackDemod:
 
     _LOCK_AFTER = 2  # matches of the SAME framing before locking (one CRC hit can be spurious)
 
-    def __init__(self, name: str, sink, deframe, framing: str | None = None) -> None:
+    def __init__(self, name: str, sink, framing: str | None = None) -> None:
         self.name = name
         self._sink = sink
-        self._deframe = deframe
         self._framing = (framing or "").strip().lower() or None  # backend hint (locks the protocol)
         self._locked: str | None = None  # framing discovered this pass when no hint was given
         self._hits: dict[str, int] = {}  # per-framing match count, to lock only on a confident one
@@ -191,7 +191,7 @@ class _FallbackDemod:
         # matched _LOCK_AFTER times (a single CRC hit can be a ~1/65536 fluke), lock to it for
         # the rest of the pass so a spurious early match can't strand the real framing.
         use = self._framing or self._locked
-        frames, matched = self._deframe(self._sink, use)
+        frames, matched = framings.deframe(self._sink.drain(), use)
         if matched and self._framing is None and self._locked is None:
             self._hits[matched] = self._hits.get(matched, 0) + 1
             if self._hits[matched] >= self._LOCK_AFTER:
@@ -199,41 +199,10 @@ class _FallbackDemod:
         return frames
 
 
-_FRAMINGS = ("ax25", "endurosat")  # link layers our engine knows; gr-satellites does its own
-
-
-def _bits_deframe(bit_sink, framing_name: str | None = None) -> tuple[list[bytes], str | None]:
-    """Deframe a demod's hard bits → ``(frames, matched_framing)``. ``framing_name`` runs ONLY
-    that link layer (the backend told us). When None, try every known framing — we don't know
-    the link layer — and report which one matched so the caller can lock onto it. Every framing
-    is CRC/FCS-gated, so trying several is safe (a wrong one has a ~1/65536-per-flag spurious
-    chance, which is why locking once matched is worth it)."""
-    import numpy as np  # noqa: PLC0415
-
-    from gfsk_ax25 import endurosat_link, framing  # noqa: PLC0415
-
-    bits = bit_sink.drain()  # consume once; try framings against the same buffer
-    if not len(bits):
-        return [], None
-    order = [framing_name.strip().lower()] if framing_name else list(_FRAMINGS)
-    for name in order:
-        if name == "endurosat":
-            arr = np.asarray(bits, dtype=np.uint8)
-            frames = endurosat_link.deframe(arr) or endurosat_link.deframe(1 - arr)
-        elif name == "ax25":  # both G3RUH-descrambled and plain — same framing, just descrambling
-            frames = []
-            for scramble in (True, False):
-                frames.extend(framing.decode(bits, scramble=scramble, nrzi=True))
-        else:
-            continue
-        if frames:
-            return frames, name
-    return [], None
-
-
-# Modulation kind -> demod builder. ``_build_fallbacks`` parses "<kind><rate>"
-# (e.g. gfsk9600, gmsk4800, bpsk1200, qpsk9600, afsk1200) and dispatches here.
-_PSK_ORDER = {"bpsk": 2, "psk": 2, "qpsk": 4}
+# Deframing (``framings.deframe``) and the modulation→demod dispatch (``modem.build_demod``)
+# live in the framing/modem registries now (docs/08 — universal modem + framing).
+# ``_build_fallbacks`` just composes them: parse "<kind><rate>" → build demod → wrap with the
+# deframer. New modulations/framings register in modem.py/framings.py, not here.
 
 
 def _build_fallbacks(
@@ -242,15 +211,9 @@ def _build_fallbacks(
     """Build the demod(s) tapping ``demod_src`` (already at the channel rate). Normally this
     is the ONE demod the backend specified — ``modes=["<kind><rate>"]`` from the transmitter
     record (modulation + symbol_rate) — deframed with the backend ``framing``. Falls back to
-    ``fallback_modes(params)`` only when no explicit mode is given. Covers the frame-producing
-    modulations of 401 MHz LEO cubesats: GFSK / FSK / GMSK, BPSK / QPSK / PSK, AFSK."""
-    from gnuradio_gfsk import (  # noqa: PLC0415
-        connect_afsk_demod,
-        connect_gfsk_demod,
-        connect_psk_demod,
-    )
-
-    from gfsk_ax25 import endurosat  # noqa: PLC0415
+    ``fallback_modes(params)`` only when no explicit mode is given. Modulation coverage comes
+    from the modem registry (``modem.build_demod``)."""
+    import modem  # noqa: PLC0415 — lazy: pulls in gnuradio_gfsk (GNU Radio) only at decode time
 
     if modes is None:
         modes = fallback_modes(params)
@@ -262,29 +225,18 @@ def _build_fallbacks(
         m = re.match(r"([a-z]+)(\d*)", mode)
         kind = m.group(1) if m else ""
         rate = float(m.group(2)) if (m and m.group(2)) else 0.0
-        # Each builder is guarded: a demod that can't be built for this channel (e.g.
-        # symbol_sync needs sps>1, so the rate exceeds ~sample_rate/2) must NOT crash the
-        # engine or cost us the IQ recording — skip it and keep the others.
+        # Guarded: a demod that can't be built for this channel (e.g. symbol_sync needs sps>1,
+        # so the rate exceeds ~sample_rate/2) must NOT crash the engine or cost us the IQ
+        # recording — skip it and keep the others.
         try:
-            if kind in ("gfsk", "fsk", "gmsk", "msk"):  # 2-FSK family; (G)MSK ≈ h=0.5 CPFSK
-                mod_index = 0.5 if kind in ("gmsk", "msk") else endurosat.LinkProfile().mod_index
-                profile = endurosat.LinkProfile(symbol_rate_hz=rate or 9600.0, mod_index=mod_index)
-                sink = connect_gfsk_demod(
-                    tb, demod_src, sample_rate, profile, decimate=False, sdr_rate=sample_rate
-                )
-            elif kind in _PSK_ORDER:  # BPSK / QPSK / PSK (coherent, differential)
-                sink = connect_psk_demod(
-                    tb, demod_src, sample_rate, rate or 1200.0, order=_PSK_ORDER[kind]
-                )
-            elif kind == "afsk":  # Bell-202 1200/2200 Hz
-                sink = connect_afsk_demod(tb, demod_src, sample_rate, baud=rate or 1200.0)
-            else:
-                _log.warning("fallback demod %r not implemented; skipping", mode)
-                continue
+            sink = modem.build_demod(kind, tb, demod_src, sample_rate, rate)
         except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
             _log.warning("fallback demod %r failed to build (%s); skipping", mode, e)
             continue
-        out.append(_FallbackDemod(mode, sink, _bits_deframe, framing))
+        if sink is None:
+            _log.warning("fallback demod %r not implemented; skipping", mode)
+            continue
+        out.append(_FallbackDemod(mode, sink, framing))
     return out
 
 

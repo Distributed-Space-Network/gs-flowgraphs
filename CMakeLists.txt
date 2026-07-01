@@ -58,6 +58,9 @@ install(
     apps/_soapy.py                   # SoapySDR gain/antenna config, shared by the GR engines
     apps/_recorder.py                # pre-demod IQ capture (cf32/CSV/PNG), imported by the RX engines
     apps/_fallback_select.py         # fallback demod selection (imported by gnuradio_satellites)
+    apps/modem.py                    # modem registry: modulation -> demod chain (docs/08)
+    apps/framings.py                 # framing registry: framing -> deframe (docs/08)
+    apps/fec.py                      # FEC registry skeleton (docs/08)
     apps/gnuradio_gfsk.py            # bench engine helper (imported only by --engine gnuradio)
     apps/gnuradio_satellites.py      # gr-satellites bridge (imported by satellite_rx at decode time)
   DESTINATION ${GS_APPS_INSTALL_DIR}
