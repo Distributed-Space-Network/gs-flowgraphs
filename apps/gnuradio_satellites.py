@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import queue
 import re
+import tempfile
 
 import framings  # framing registry (deframe dispatch); numpy-only, import-safe
 from _fallback_select import (  # pure, testable, no GNU Radio
@@ -284,6 +286,31 @@ def _gr_satellites_selector(satellite) -> dict | None:
     return {"name": s}
 
 
+def _synthetic_satyaml_path(satellite, params: dict | None, frequency_hz: float) -> str | None:
+    """Write a synthetic gr-satellites SatYAML from the backend's ``(modulation, baud, framing)``
+    for a bird gr-satellites doesn't catalog, and return its path (to pass as
+    ``gr_satellites_flowgraph(file=...)``) — or None when gr-satellites can't demodulate the
+    modulation (QAM/APSK/OFDM/QPSK → our own modem) or a field is missing. This reuses
+    gr-satellites' full demod + ~50-deframer library for NON-catalogued birds (docs/08 Ph1).
+    The caller removes the temp file after the flowgraph has parsed it."""
+    import grsat_synth  # noqa: PLC0415 — lazy, numpy/PyYAML only (no GNU Radio)
+
+    p = params or {}
+    s = str(satellite or "").strip()
+    norad = int(s) if s.isdigit() else 0
+    fd, path = tempfile.mkstemp(prefix="grsat_synth_", suffix=".yml")
+    os.close(fd)
+    out = grsat_synth.write_synthetic_satyaml(
+        path, norad, p.get("modulation"), p.get("symbol_rate_hz"),
+        p.get("framing"), frequency_hz, name=(s or None),
+    )
+    if out is None:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        return None
+    return out
+
+
 def build_satellites_rx(
     args, satellite: str, sample_rate: float, params: dict | None = None
 ) -> _SatContext:
@@ -335,10 +362,13 @@ def build_satellites_rx(
     # fanned out — no hardware conflict; the dynamic SDR control, Doppler, is ephemeris-driven
     # on the shared source, identical for both). CPU is the only shared cost, and two chains is
     # cheap (the 12-demod bank is what overran the RX DMA, not two):
-    #   * demod params present AND bird catalogued → BOTH, each behind a valve; the first to
-    #     produce a CRC-valid frame wins and the loser's valve is gated off (see drain_frames).
-    #   * demod params present, not catalogued → OUR engine only.
+    #   * demod params present AND a gr-satellites decoder exists → BOTH, each behind a valve;
+    #     the first to produce a CRC-valid frame wins and the loser's valve is gated off.
+    #   * demod params present, no gr-satellites decoder → OUR engine only.
     #   * only a NORAD / a demod param missing → gr-satellites only.
+    # The gr-satellites decoder is the catalogued SatYAML when the bird is known; otherwise, if
+    # the backend gave (modulation, framing, baud), a SYNTHETIC SatYAML so we still get its full
+    # ~50-deframer library for a non-catalogued bird (docs/08 Ph1).
     from gnuradio import blocks  # noqa: PLC0415 — bench-only
 
     sink = _FrameSink()
@@ -348,6 +378,16 @@ def build_satellites_rx(
     framing = (params or {}).get("framing")
     mode = _backend_mode(params)  # "<kind><rate>" when modulation+symbol_rate both present
     fg = _build_grsatellites(selector, channel_rate, satellite)  # None if not catalogued
+    if fg is None and mode:  # not catalogued → synthesize a SatYAML from the backend rfLink
+        synth = _synthetic_satyaml_path(satellite, params, float(args.center_freq_hz))
+        if synth is not None:
+            try:
+                fg = _build_grsatellites({"file": synth}, channel_rate, satellite)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(synth)  # gr-satellites parsed it in __init__; safe to remove
+            if fg is not None:
+                _log.info("gr-satellites via synthetic SatYAML for %s (not catalogued)", satellite)
     if mode and fg is not None:  # race both
         valve_ours = blocks.copy(gr.sizeof_gr_complex)
         valve_grsat = blocks.copy(gr.sizeof_gr_complex)
@@ -356,7 +396,7 @@ def build_satellites_rx(
         tb.msg_connect(fg, "out", sink, "in")
         fallbacks = _build_fallbacks(tb, valve_ours, channel_rate, modes=[mode], framing=framing)
         _log.info("racing: our engine %s + gr-satellites %r (first frame wins)", mode, selector)
-    elif mode:  # our engine only (not catalogued)
+    elif mode:  # our engine only (no gr-satellites decoder — not catalogued, un-synthesizable)
         fallbacks = _build_fallbacks(tb, chan, channel_rate, modes=[mode], framing=framing)
         _log.info("our engine: %s @ %.0f Hz (framing=%s)", mode, channel_rate, framing or "auto")
     elif fg is not None:  # gr-satellites only (no demod params)
