@@ -21,7 +21,7 @@ import numpy as np
 # Link layers our own engine deframes in-process (numpy). ``argos`` and ``ccsds_tm`` run ONLY when
 # explicitly requested (Argos' sync is a placeholder pending bench confirmation; CCSDS TM needs
 # per-bird channel-coding params) — kept out of autodetect to avoid spurious/mis-parametrized runs.
-_LOCAL = ("ax25", "endurosat", "argos", "ccsds_tm")
+_LOCAL = ("ax25", "endurosat", "argos", "ccsds_tm", "kiss", "slip")
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
 
 # The gr-satellites framing vocabulary (SatYAML ``framing:`` strings) reused via synthetic
@@ -60,7 +60,7 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
     A gr-satellites framing name (e.g. ``"USP"``) is not deframed here — it returns
     ``([], None)`` because that link layer is decoded upstream in the gr-satellites flowgraph
     (the synthetic-SatYAML path); the two run in parallel and the first valid frame wins."""
-    from gfsk_ax25 import argos, ccsds, endurosat_link  # noqa: PLC0415
+    from gfsk_ax25 import argos, ccsds, endurosat_link, kiss  # noqa: PLC0415
     from gfsk_ax25 import framing as ax25_framing  # noqa: PLC0415
 
     arr = np.asarray(bits, dtype=np.uint8)
@@ -78,6 +78,10 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
             frames = argos.deframe(arr)
         elif name in ("ccsds_tm", "ccsds"):  # explicit only — ASM+RS(255,223)+randomize+FECF chain
             frames = ccsds.deframe_tm(arr)
+        elif name == "kiss":   # byte-oriented TNC framing — pack bits to bytes first
+            frames = kiss.kiss_decode(bytes(np.packbits(arr)))
+        elif name == "slip":
+            frames = kiss.slip_decode(bytes(np.packbits(arr)))
         else:
             continue  # gr-satellites framing (or unknown) → decoded upstream, not here
         if frames:

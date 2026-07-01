@@ -1,0 +1,77 @@
+"""KISS and SLIP TNC framing (docs/08 Tier 3 — uplink/relay framings not in gr-satellites).
+
+Byte-oriented delimiter framing used by TNCs and packet radio: frames are bracketed by an END
+byte (0xC0) with an escape mechanism so the delimiter can appear in the payload. KISS (used to
+shuttle frames to/from a TNC) additionally carries a leading command/port byte; SLIP is the same
+delimiting without it. Both are exact + reversible, so they are unit-tested by round trip
+(including payloads that contain the reserved bytes). numpy/stdlib-only.
+"""
+from __future__ import annotations
+
+FEND = 0xC0   # frame delimiter (SLIP END)
+FESC = 0xDB   # escape (SLIP ESC)
+TFEND = 0xDC  # transposed frame-end
+TFESC = 0xDD  # transposed escape
+
+
+def _escape(frame: bytes) -> bytes:
+    out = bytearray()
+    for b in frame:
+        if b == FEND:
+            out += bytes([FESC, TFEND])
+        elif b == FESC:
+            out += bytes([FESC, TFESC])
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def _unescape(payload: bytes) -> bytes:
+    out = bytearray()
+    i = 0
+    while i < len(payload):
+        b = payload[i]
+        if b == FESC and i + 1 < len(payload):
+            nxt = payload[i + 1]
+            out.append(FEND if nxt == TFEND else FESC if nxt == TFESC else nxt)
+            i += 2
+        else:
+            out.append(b)
+            i += 1
+    return bytes(out)
+
+
+def kiss_encode(frame: bytes, *, command: int = 0, port: int = 0) -> bytes:
+    """Wrap ``frame`` in a KISS frame: FEND, command/port byte, escaped payload, FEND."""
+    type_byte = ((port & 0x0F) << 4) | (command & 0x0F)
+    return bytes([FEND, type_byte]) + _escape(bytes(frame)) + bytes([FEND])
+
+
+def kiss_decode(stream: bytes) -> list[bytes]:
+    """Extract KISS frame payloads from ``stream`` (command/port byte stripped). Empty frames and
+    trailing partials are ignored."""
+    out: list[bytes] = []
+    for chunk in bytes(stream).split(bytes([FEND])):
+        if not chunk:
+            continue
+        payload = _unescape(chunk[1:])  # drop the command/port byte
+        if payload:
+            out.append(payload)
+    return out
+
+
+def slip_encode(frame: bytes) -> bytes:
+    """Wrap ``frame`` in a SLIP frame: END, escaped payload, END (no command byte)."""
+    return bytes([FEND]) + _escape(bytes(frame)) + bytes([FEND])
+
+
+def slip_decode(stream: bytes) -> list[bytes]:
+    """Extract SLIP frame payloads from ``stream``."""
+    out: list[bytes] = []
+    for chunk in bytes(stream).split(bytes([FEND])):
+        if not chunk:
+            continue
+        payload = _unescape(chunk)
+        if payload:
+            out.append(payload)
+    return out

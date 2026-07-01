@@ -39,6 +39,11 @@ _QAM_ORDER = {"qam": 16, "qam16": 16, "qam32": 32, "qam64": 64, "qam128": 128, "
 _APSK_ORDER = {"apsk": 16, "apsk16": 16, "apsk32": 32}
 _OFDM = ("ofdm",)
 _DVBS2 = ("dvbs2", "dvb-s2", "dvbs2x", "dvb-s2x")
+# Tier 3 — long tail. OOK/ASK + CW/Morse are numpy codecs (offline, on a captured .cf32); the
+# analog families (NBFM/WFM/AM) are GNU Radio. All classify tier=3.
+_OOK = {"ook": 2, "ask": 2, "2ask": 2, "4ask": 4, "mask": 4}
+_CW = ("cw", "morse")
+_ANALOG = {"nbfm": "nbfm", "fm": "nbfm", "wfm": "wfm", "am": "am"}
 
 
 @dataclass(frozen=True)
@@ -89,21 +94,30 @@ def modulation_spec(kind: str) -> ModSpec | None:
         return ModSpec(k, "ofdm", order=0, tier=2)
     if k in _DVBS2:
         return ModSpec(k, "dvbs2", order=0, tier=2)
+    if k in _OOK:
+        return ModSpec(k, "ook", order=_OOK[k], tier=3)
+    if k in _CW:
+        return ModSpec(k, "cw", order=2, tier=3)
+    if k in _ANALOG:
+        return ModSpec(k, _ANALOG[k], order=0, tier=3)
     return None
 
 
 _TIER2_KEYS = set(_QAM_ORDER) | set(_APSK_ORDER) | set(_OFDM) | set(_DVBS2)
+_TIER3_KEYS = set(_OOK) | set(_CW) | set(_ANALOG)
 
 
 def demod_families() -> set[str]:
-    """Every modulation key the modem recognizes for RX (Tier 1 + Tier 2). Tier-2 keys build via
-    GNU Radio / gr-dvbs2rx on the bench. Used by callers to decide whether to attempt a build."""
-    return set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"} | _TIER2_KEYS
+    """Every modulation key the modem recognizes for RX (Tiers 1–3). Tier-2 builds via GNU Radio /
+    gr-dvbs2rx; Tier-3 OOK/CW are numpy codecs and the analog families are GNU Radio (bench)."""
+    return (set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"}
+            | _TIER2_KEYS | _TIER3_KEYS)
 
 
 def mod_families() -> set[str]:
-    """Every modulation key we can TX-modulate (Tier 1 + Tier 2)."""
-    return set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"} | _TIER2_KEYS
+    """Every modulation key we can TX-modulate (Tiers 1–3)."""
+    return (set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"}
+            | _TIER2_KEYS | _TIER3_KEYS)
 
 
 # ── Chain construction (GNU Radio, lazy) ─────────────────────────────────────────────────────
@@ -122,6 +136,8 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
         return None  # unrecognized — return BEFORE importing GNU Radio (import-safe)
     if spec.tier == 2:
         return _build_tier2_demod(spec, tb, src, sample_rate, symbol_rate)
+    if spec.tier == 3:
+        return _build_tier3_demod(spec, tb, src, sample_rate)
 
     from gnuradio_gfsk import (  # noqa: PLC0415 — GNU Radio only; keeps this module import-safe
         connect_afsk_demod,
@@ -177,6 +193,26 @@ def _build_tier2_demod(spec, tb, src, sample_rate: float, symbol_rate: float):
     return None
 
 
+def _build_tier3_demod(spec, tb, src, sample_rate: float):
+    """Tier 3. The analog families (NBFM/WFM/AM) build a GNU Radio analog demod (bench, guarded).
+    OOK/ASK and CW/Morse are offline numpy codecs (:mod:`gfsk_ax25.ook` / :mod:`gfsk_ax25.morse`)
+    run on the captured .cf32 post-pass, not in-flowgraph bit-sink chains → return None with a
+    pointer."""
+    import logging  # noqa: PLC0415
+
+    if spec.family in ("nbfm", "wfm", "am"):
+        try:
+            import gnuradio_hirate  # noqa: PLC0415
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("modem").info("modem: %s demod needs GNU Radio (%s)", spec.kind, e)
+            return None
+        return gnuradio_hirate.connect_analog_demod(tb, src, sample_rate, spec.family)
+    logging.getLogger("modem").info(
+        "modem: %s is an offline numpy codec (gfsk_ax25.%s); run post-pass on the .cf32",
+        spec.kind, "ook" if spec.family == "ook" else "morse")
+    return None
+
+
 def build_mod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
     """Build the GNU Radio **modulator** chain for ``kind`` (TX): bytes/bits in → complex IQ out,
     or ``None`` if unsupported / build-pending. Lazily imports ``gnuradio.digital``; bench-only.
@@ -196,6 +232,10 @@ def build_mod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
             logging.getLogger("modem").info("modem: %s TX needs GNU Radio (%s)", kind, e)
             return None
         return gnuradio_hirate.build_tier2_mod(spec, tb, src, sample_rate, symbol_rate)
+    if spec.tier == 3:  # OOK/CW TX are numpy codecs; analog TX uses the FM apps → not a GR block
+        logging.getLogger("modem").info(
+            "modem: %s TX is a numpy codec / analog app, not a GR modulator block", kind)
+        return None
     try:
         from gnuradio import digital  # noqa: PLC0415 — bench-only
     except Exception:  # noqa: BLE001 — no GNU Radio here; caller treats as build-pending

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from gnuradio import blocks, digital
+from gnuradio import analog, blocks, digital
 from gnuradio import filter as gr_filter
 from gnuradio_gfsk import _BitSink, _RmsAgc  # reuse the shared bit sink + RMS AGC
 
@@ -95,6 +95,25 @@ def connect_dvbs2_demod(tb, src, sample_rate, symbol_rate):
     _log.info("hirate: gr-dvbs2rx present; construct dvbs2_rx on the bench (params per bird): %r",
               dvbs2rx)
     return None  # the dvbs2rx receive chain is assembled per-stream on the bench (MODCOD/rolloff)
+
+
+def connect_analog_demod(tb, src, sample_rate, kind):
+    """Tier-3 analog voice/data demod → real float output. NBFM via ``analog.nbfm_rx`` (or a
+    quadrature demod), WFM via ``analog.wfm_rcv``, AM via ``analog.am_demod_cf``. Returns the
+    terminal block (an audio-rate float stream); the caller records/decodes it on the bench."""
+    if kind == "am":
+        demod = analog.am_demod_cf(channel_rate=int(sample_rate), audio_decim=1,
+                                   audio_pass=5000, audio_stop=5500)
+        tb.connect(src, demod)
+        return demod
+    if kind == "wfm":
+        demod = analog.wfm_rcv(quad_rate=int(sample_rate), audio_decimation=1)
+        tb.connect(src, demod)
+        return demod
+    quad = analog.quadrature_demod_cf(sample_rate / (2.0 * 3.141592653589793 * 5000.0))
+    tb.connect(src, quad)  # NBFM: quadrature discriminator (audio filtering added on the bench)
+    _log.info("hirate: NBFM quadrature demod built; audio LPF/de-emphasis bench-tuned")
+    return quad
 
 
 def build_tier2_mod(spec, tb, src, sample_rate, symbol_rate):

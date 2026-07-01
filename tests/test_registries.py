@@ -28,9 +28,10 @@ def test_modem_advertises_the_tier1_and_tier2_families():
 
 
 def test_framing_registry_lists_local_and_grsatellites_layers():
-    assert framings.local_framings() == ("ax25", "endurosat", "argos", "ccsds_tm")
+    assert framings.local_framings() == (
+        "ax25", "endurosat", "argos", "ccsds_tm", "kiss", "slip")
     known = framings.known_framings()
-    assert "ax25" in known and "argos" in known and "ccsds_tm" in known
+    assert "ax25" in known and "argos" in known and "ccsds_tm" in known and "kiss" in known
     # the gr-satellites vocabulary is advertised (reused via synthetic SatYAML, decoded upstream).
     for f in ("USP", "AX100 ASM+Golay", "CCSDS Concatenated", "Mobitex"):
         assert f in known

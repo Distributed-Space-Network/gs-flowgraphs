@@ -50,6 +50,16 @@ def test_tier2_classifies_into_distinct_families(kind, family, order):
     assert spec.supported is False  # not a Tier-1 in-process chain
 
 
+@pytest.mark.parametrize(
+    ("kind", "family"),
+    [("ook", "ook"), ("ask", "ook"), ("cw", "cw"), ("morse", "cw"),
+     ("nbfm", "nbfm"), ("fm", "nbfm"), ("wfm", "wfm"), ("am", "am")],
+)
+def test_tier3_families(kind, family):
+    spec = modem.modulation_spec(kind)
+    assert spec is not None and spec.tier == 3 and spec.family == family
+
+
 def test_normalization_is_case_space_underscore_insensitive():
     assert modem.modulation_spec("G F_S K").family == "fsk"
     assert modem.modulation_spec("  BPSK ").family == "psk"
