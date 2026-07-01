@@ -55,7 +55,12 @@ def _runs(timeline: np.ndarray):
 def decode(timeline, *, unit: float | None = None) -> str:
     """On/off timeline → text. If ``unit`` is not given it is estimated as the shortest on-run
     (one dot). On-runs classify dot/dash at 2 units; off-runs classify intra/char/word at 2 and 5
-    units — the standard 1/3/7 spacing with margins."""
+    units — the standard 1/3/7 spacing with margins.
+
+    Ambiguity: a message whose only element is a single dash (e.g. ``"T"``) can't be told from a
+    single dot (``"E"``) without a time reference — the auto estimate treats the lone element as a
+    dot. Pass ``unit=`` (from the known WPM) to disambiguate; any message containing a dot estimates
+    correctly."""
     arr = np.asarray(timeline, dtype=np.uint8)
     runs = _runs(arr)
     if not runs:
