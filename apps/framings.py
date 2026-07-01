@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import numpy as np
 
-# Link layers our own engine deframes in-process (numpy). ``argos`` runs ONLY when explicitly
-# requested (its documented sync is a placeholder pending bench confirmation — see argos.py — so
-# it is deliberately kept out of autodetect to avoid spurious matches).
-_LOCAL = ("ax25", "endurosat", "argos")
+# Link layers our own engine deframes in-process (numpy). ``argos`` and ``ccsds_tm`` run ONLY when
+# explicitly requested (Argos' sync is a placeholder pending bench confirmation; CCSDS TM needs
+# per-bird channel-coding params) — kept out of autodetect to avoid spurious/mis-parametrized runs.
+_LOCAL = ("ax25", "endurosat", "argos", "ccsds_tm")
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
 
 # The gr-satellites framing vocabulary (SatYAML ``framing:`` strings) reused via synthetic
@@ -60,7 +60,7 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
     A gr-satellites framing name (e.g. ``"USP"``) is not deframed here — it returns
     ``([], None)`` because that link layer is decoded upstream in the gr-satellites flowgraph
     (the synthetic-SatYAML path); the two run in parallel and the first valid frame wins."""
-    from gfsk_ax25 import argos, endurosat_link  # noqa: PLC0415
+    from gfsk_ax25 import argos, ccsds, endurosat_link  # noqa: PLC0415
     from gfsk_ax25 import framing as ax25_framing  # noqa: PLC0415
 
     arr = np.asarray(bits, dtype=np.uint8)
@@ -76,6 +76,8 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
                 frames.extend(ax25_framing.decode(arr, scramble=scramble, nrzi=True))
         elif name == "argos":  # explicit only — BCH-gated PTT/PMT-A3 (placeholder sync)
             frames = argos.deframe(arr)
+        elif name in ("ccsds_tm", "ccsds"):  # explicit only — ASM+RS(255,223)+randomize+FECF chain
+            frames = ccsds.deframe_tm(arr)
         else:
             continue  # gr-satellites framing (or unknown) → decoded upstream, not here
         if frames:

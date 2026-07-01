@@ -28,9 +28,9 @@ def test_modem_advertises_the_tier1_and_tier2_families():
 
 
 def test_framing_registry_lists_local_and_grsatellites_layers():
-    assert framings.local_framings() == ("ax25", "endurosat", "argos")
+    assert framings.local_framings() == ("ax25", "endurosat", "argos", "ccsds_tm")
     known = framings.known_framings()
-    assert "ax25" in known and "argos" in known
+    assert "ax25" in known and "argos" in known and "ccsds_tm" in known
     # the gr-satellites vocabulary is advertised (reused via synthetic SatYAML, decoded upstream).
     for f in ("USP", "AX100 ASM+Golay", "CCSDS Concatenated", "Mobitex"):
         assert f in known
@@ -40,7 +40,9 @@ def test_fec_registry_advertises_codes_and_implements_the_numpy_ones():
     codes = fec.known_codes()
     for c in ("ccsds_randomizer", "crc16", "crc32", "asm", "reed_solomon", "golay"):
         assert c in codes
-    assert fec.implemented_codes() == ("ccsds_randomizer", "crc16", "crc32", "asm")
+    impl = fec.implemented_codes()
+    assert impl == ("ccsds_randomizer", "crc16", "crc32", "asm", "reed_solomon")
+    assert "golay" not in impl and "ldpc" not in impl  # bench / gr-satellites
 
 
 def test_deframe_empty_and_noise_return_no_match():

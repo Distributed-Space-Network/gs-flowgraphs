@@ -18,6 +18,9 @@ from __future__ import annotations
 import numpy as np
 
 from gfsk_ax25.crc import crc16_ccitt_false, crc32_ieee
+from gfsk_ax25.reedsolomon import RS_NSYM_255_223, RSCodec
+
+_rs255 = RSCodec(RS_NSYM_255_223)  # conventional RS(255,223) t=16 (see reedsolomon.py caveat)
 
 # ── CCSDS pseudo-randomizer (CCSDS 131.0-B) ──────────────────────────────────────────────────
 # h(x) = x^8 + x^7 + x^5 + x^3 + 1, all-ones seed. Empirically locked to the published PN
@@ -71,6 +74,17 @@ def crc32(data: bytes) -> int:
     return crc32_ieee(data)
 
 
+# ── Reed-Solomon RS(255,223) (conventional; see reedsolomon.py for the CCSDS dual-basis caveat) ─
+def reed_solomon_encode(data: bytes) -> bytes:
+    """RS(255,223): ``data`` (≤223 bytes) → data + 32 parity bytes. Corrects up to 16 symbols."""
+    return _rs255.encode(data)
+
+
+def reed_solomon_decode(codeword: bytes):
+    """RS(255,223): 255-byte codeword → 223 message bytes, or ``None`` if > 16 symbol errors."""
+    return _rs255.decode(codeword)
+
+
 # ── CCSDS Attached Sync Marker (ASM) ─────────────────────────────────────────────────────────
 ASM_CCSDS = 0x1ACFFC1D          # standard 32-bit CCSDS TM/AOS frame sync marker
 ASM_CCSDS_BYTES = ASM_CCSDS.to_bytes(4, "big")
@@ -96,11 +110,11 @@ def find_asm(bits, marker: int = ASM_CCSDS, width: int = 32) -> int:
 
 # ── Catalog ──────────────────────────────────────────────────────────────────────────────────
 # numpy-implemented here (verifiable in CI).
-_NUMPY_CODES = ("ccsds_randomizer", "crc16", "crc32", "asm")
+_NUMPY_CODES = ("ccsds_randomizer", "crc16", "crc32", "asm", "reed_solomon")
 # GNU Radio fec.* — construction confirmed on the bench.
 _GNURADIO_CODES = ("ccsds_conv_k7", "viterbi", "ldpc", "turbo", "polar")
-# via gr-satellites deframers (reused whole, not called standalone).
-_GRSAT_CODES = ("reed_solomon", "golay")
+# via gr-satellites deframers (reused whole) — incl. the CCSDS dual-basis RS + Golay.
+_GRSAT_CODES = ("ccsds_reed_solomon", "golay")
 
 
 def known_codes() -> tuple[str, ...]:

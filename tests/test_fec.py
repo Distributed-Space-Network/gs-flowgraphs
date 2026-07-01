@@ -43,7 +43,18 @@ def test_asm_absent_returns_minus_one():
     assert fec.find_asm(noise) == -1
 
 
+def test_reed_solomon_roundtrip_via_registry():
+    data = bytes(range(223))
+    cw = fec.reed_solomon_encode(data)
+    assert len(cw) == 255
+    corrupt = bytearray(cw)
+    corrupt[10] ^= 0xFF
+    corrupt[200] ^= 0x0F
+    assert fec.reed_solomon_decode(bytes(corrupt)) == data
+
+
 def test_catalog_split():
     assert set(fec.implemented_codes()) <= set(fec.known_codes())
-    assert "reed_solomon" in fec.known_codes()  # declared (gr-satellites), not numpy here
-    assert "reed_solomon" not in fec.implemented_codes()
+    assert "reed_solomon" in fec.implemented_codes()          # numpy RS(255,223)
+    assert "golay" in fec.known_codes()                       # declared (gr-satellites)
+    assert "golay" not in fec.implemented_codes()

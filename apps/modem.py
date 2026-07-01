@@ -33,11 +33,12 @@ _PSK_ORDER = {
 }
 _DIFFERENTIAL = frozenset({"dbpsk", "dqpsk"})   # differential encoding (DxPSK)
 _OFFSET = frozenset({"oqpsk"})                   # offset QPSK (I/Q half-symbol stagger)
-# Tier 2 — higher-order / multicarrier; no Tier-1 chain (our own modem / gr-dvbs2rx later).
-_TIER2 = (
-    "qam", "qam16", "qam32", "qam64", "qam128", "qam256",
-    "apsk", "apsk16", "apsk32", "ofdm", "dvbs2", "dvb-s2", "dvbs2x", "dvb-s2x",
-)
+# Tier 2 — higher-order / multicarrier. Classified into distinct families with a constellation
+# order; the demod/mod chains are GNU Radio (+ gr-dvbs2rx for DVB-S2), constructed on the bench.
+_QAM_ORDER = {"qam": 16, "qam16": 16, "qam32": 32, "qam64": 64, "qam128": 128, "qam256": 256}
+_APSK_ORDER = {"apsk": 16, "apsk16": 16, "apsk32": 32}
+_OFDM = ("ofdm",)
+_DVBS2 = ("dvbs2", "dvb-s2", "dvbs2x", "dvb-s2x")
 
 
 @dataclass(frozen=True)
@@ -80,20 +81,29 @@ def modulation_spec(kind: str) -> ModSpec | None:
         )
     if k == "afsk":
         return ModSpec(k, "afsk", order=2)
-    if k in _TIER2 or k.startswith(("qam", "apsk", "ofdm", "dvbs2", "dvb-s2")):
-        return ModSpec(k, "tier2", tier=2)
+    if k in _QAM_ORDER:
+        return ModSpec(k, "qam", order=_QAM_ORDER[k], tier=2)
+    if k in _APSK_ORDER:
+        return ModSpec(k, "apsk", order=_APSK_ORDER[k], tier=2)
+    if k in _OFDM:
+        return ModSpec(k, "ofdm", order=0, tier=2)
+    if k in _DVBS2:
+        return ModSpec(k, "dvbs2", order=0, tier=2)
     return None
 
 
+_TIER2_KEYS = set(_QAM_ORDER) | set(_APSK_ORDER) | set(_OFDM) | set(_DVBS2)
+
+
 def demod_families() -> set[str]:
-    """The modulation keys the modem currently recognizes for RX (Tier 1 + Tier 2 keys; Tier 2
-    keys classify but route elsewhere). Used by callers to decide whether to attempt a build."""
-    return set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"} | set(_TIER2)
+    """Every modulation key the modem recognizes for RX (Tier 1 + Tier 2). Tier-2 keys build via
+    GNU Radio / gr-dvbs2rx on the bench. Used by callers to decide whether to attempt a build."""
+    return set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"} | _TIER2_KEYS
 
 
 def mod_families() -> set[str]:
-    """The modulation keys we can TX-modulate (Tier 1 families; Tier 2 modulators come later)."""
-    return set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"}
+    """Every modulation key we can TX-modulate (Tier 1 + Tier 2)."""
+    return set(_FSK_2LEVEL) | set(_MFSK) | set(_PSK_ORDER) | {"afsk"} | _TIER2_KEYS
 
 
 # ── Chain construction (GNU Radio, lazy) ─────────────────────────────────────────────────────
@@ -102,13 +112,16 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
     and return its bit sink (``drain()`` → hard bits), or ``None`` if unsupported / build-pending.
 
     FSK → tuned quadrature-demod chain; PSK (2/4/8) → FLL+Costas chain (order from the spec);
-    AFSK → FM-demod + tone xlate → FSK chain. M-FSK and offset/8-PSK are classified but their
+    AFSK → FM-demod + tone xlate → FSK chain. Tier 2 (QAM/APSK/OFDM/DVB-S2) routes to the
+    ``gnuradio_hirate`` bench constructors. M-FSK and offset/8-PSK are classified but their
     dedicated slicer/loop is bench build-pending (return ``None`` with a log, never crash)."""
     import logging  # noqa: PLC0415
 
     spec = modulation_spec(kind)
-    if spec is None or spec.tier != 1:
-        return None  # unsupported / Tier 2 — return BEFORE importing GNU Radio (import-safe)
+    if spec is None:
+        return None  # unrecognized — return BEFORE importing GNU Radio (import-safe)
+    if spec.tier == 2:
+        return _build_tier2_demod(spec, tb, src, sample_rate, symbol_rate)
 
     from gnuradio_gfsk import (  # noqa: PLC0415 — GNU Radio only; keeps this module import-safe
         connect_afsk_demod,
@@ -141,6 +154,29 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
     return None
 
 
+def _build_tier2_demod(spec, tb, src, sample_rate: float, symbol_rate: float):
+    """Route a Tier-2 spec to the ``gnuradio_hirate`` bench constructor, guarded so a box without
+    GNU Radio / gr-dvbs2rx gets ``None`` (import-safe) rather than an ImportError."""
+    import logging  # noqa: PLC0415
+
+    try:
+        import gnuradio_hirate  # noqa: PLC0415 — GNU Radio (+ gr-dvbs2rx) bench module
+    except Exception as e:  # noqa: BLE001 — no GNU Radio here; caller treats as build-pending
+        logging.getLogger("modem").info("modem: %s demod needs GNU Radio (%s)", spec.kind, e)
+        return None
+    if spec.family == "qam":
+        return gnuradio_hirate.connect_qam_demod(
+            tb, src, sample_rate, symbol_rate, order=spec.order)
+    if spec.family == "apsk":
+        return gnuradio_hirate.connect_apsk_demod(
+            tb, src, sample_rate, symbol_rate, order=spec.order)
+    if spec.family == "ofdm":
+        return gnuradio_hirate.connect_ofdm_demod(tb, src, sample_rate)
+    if spec.family == "dvbs2":
+        return gnuradio_hirate.connect_dvbs2_demod(tb, src, sample_rate, symbol_rate)
+    return None
+
+
 def build_mod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
     """Build the GNU Radio **modulator** chain for ``kind`` (TX): bytes/bits in → complex IQ out,
     or ``None`` if unsupported / build-pending. Lazily imports ``gnuradio.digital``; bench-only.
@@ -151,8 +187,15 @@ def build_mod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
     import logging  # noqa: PLC0415
 
     spec = modulation_spec(kind)
-    if spec is None or spec.tier != 1:
+    if spec is None:
         return None
+    if spec.tier == 2:  # QAM/APSK/OFDM/DVB-S2 modulators live in the hirate bench module
+        try:
+            import gnuradio_hirate  # noqa: PLC0415
+        except Exception as e:  # noqa: BLE001 — no GNU Radio here
+            logging.getLogger("modem").info("modem: %s TX needs GNU Radio (%s)", kind, e)
+            return None
+        return gnuradio_hirate.build_tier2_mod(spec, tb, src, sample_rate, symbol_rate)
     try:
         from gnuradio import digital  # noqa: PLC0415 — bench-only
     except Exception:  # noqa: BLE001 — no GNU Radio here; caller treats as build-pending

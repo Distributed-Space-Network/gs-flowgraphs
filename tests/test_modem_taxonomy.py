@@ -36,13 +36,18 @@ def test_differential_and_offset_flags():
     assert modem.modulation_spec("qpsk").offset is False
 
 
-@pytest.mark.parametrize("kind", ["qam16", "qam256", "apsk32", "ofdm", "dvbs2", "dvb-s2x"])
-def test_tier2_classifies_but_is_not_tier1(kind):
+@pytest.mark.parametrize(
+    ("kind", "family", "order"),
+    [("qam16", "qam", 16), ("qam256", "qam", 256), ("apsk32", "apsk", 32),
+     ("ofdm", "ofdm", 0), ("dvbs2", "dvbs2", 0), ("dvb-s2x", "dvbs2", 0)],
+)
+def test_tier2_classifies_into_distinct_families(kind, family, order):
     spec = modem.modulation_spec(kind)
     assert spec is not None
     assert spec.tier == 2
-    assert spec.family == "tier2"
-    assert spec.supported is False
+    assert spec.family == family
+    assert spec.order == order
+    assert spec.supported is False  # not a Tier-1 in-process chain
 
 
 def test_normalization_is_case_space_underscore_insensitive():
