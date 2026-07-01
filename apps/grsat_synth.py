@@ -26,6 +26,15 @@ _MOD_INDEX = {"gmsk": 0.5, "msk": 0.5}
 _DEFAULT_MOD_INDEX = 0.5  # most cubesat GFSK / 2-FSK ~ h = 0.5
 
 
+def can_synthesize(modulation, baud, framing) -> bool:
+    """True when :func:`synthetic_satyaml` would succeed — i.e. gr-satellites can demodulate the
+    modulation (FSK/BPSK/AFSK family) and both ``framing`` and ``baud`` are present. Lets the
+    composer decide whether the gr-satellites (synthetic-SatYAML) path is available without
+    writing a file."""
+    kind = str(modulation or "").strip().lower()
+    return bool(_GRSAT_MOD.get(kind) and framing and baud)
+
+
 def synthetic_satyaml(norad, modulation, baud, framing, frequency_hz, *, name=None):
     """Return gr-satellites SatYAML **text** for a non-catalogued bird, or ``None`` when
     gr-satellites has no demodulator for ``modulation`` (QAM/APSK/OFDM/QPSK → our own modem) or

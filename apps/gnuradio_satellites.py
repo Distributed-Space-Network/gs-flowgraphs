@@ -378,6 +378,15 @@ def build_satellites_rx(
     framing = (params or {}).get("framing")
     mode = _backend_mode(params)  # "<kind><rate>" when modulation+symbol_rate both present
     fg = _build_grsatellites(selector, channel_rate, satellite)  # None if not catalogued
+    # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
+    # the backend rfLink implies. The construction below still drives the graph; the plan is the
+    # single explanation of the choice (and the seam a future satellite_rx composition builds on).
+    try:
+        import compose  # noqa: PLC0415 — pure, import-safe
+        _log.info("decode plan: %s",
+                  compose.plan_decode(params, catalogued=fg is not None).describe())
+    except Exception as e:  # noqa: BLE001 — planning must never block decoding
+        _log.debug("decode-plan compose failed (non-fatal): %s", e)
     if fg is None and mode:  # not catalogued → synthesize a SatYAML from the backend rfLink
         synth = _synthetic_satyaml_path(satellite, params, float(args.center_freq_hz))
         if synth is not None:
