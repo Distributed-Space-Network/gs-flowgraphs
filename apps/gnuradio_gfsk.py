@@ -64,6 +64,27 @@ class _BitSink(gr.sync_block):
         return np.concatenate(out) if out else np.empty(0, dtype=np.uint8)
 
 
+class _RmsAgc(gr.hier_block2):
+    """Divide a signal by its running RMS (normalize to ``reference``). Faithful port of
+    gr-satellites' ``rms_agc`` (GPLv3) — an RMS-normalizing AGC, not a peak/feedback one, so
+    it does not ring on a fading pass. ``cplx`` selects complex (PSK) vs float (FSK) I/O."""
+
+    def __init__(self, alpha: float, reference: float = 1.0, *, cplx: bool) -> None:
+        size = gr.sizeof_gr_complex if cplx else gr.sizeof_float
+        gr.hier_block2.__init__(
+            self, "rms_agc", gr.io_signature(1, 1, size), gr.io_signature(1, 1, size))
+        rms = blocks.rms_cf(alpha) if cplx else blocks.rms_ff(alpha)
+        scale = blocks.multiply_const_ff(1.0 / reference)
+        floor = blocks.add_const_ff(1e-19)  # avoid divide-by-zero on silence
+        div = blocks.divide_cc(1) if cplx else blocks.divide_ff(1)
+        if cplx:
+            self.connect(self, rms, scale, floor, blocks.float_to_complex(1), (div, 1))
+        else:
+            self.connect(self, rms, scale, floor, (div, 1))
+        self.connect(self, (div, 0))
+        self.connect(div, self)
+
+
 class _RxContext:
     def __init__(
         self,
@@ -101,27 +122,60 @@ class _RxContext:
 
 
 def connect_gfsk_demod(
-    tb, src, sample_rate: float, profile: endurosat.LinkProfile, *, decimate: bool, sdr_rate: float
+    tb, src, sample_rate: float, profile: endurosat.LinkProfile, *,
+    decimate: bool, sdr_rate: float, dc_block: bool = True,
 ) -> _BitSink:
-    """Connect a 2-GFSK demod chain (quad-demod → Gardner symbol sync → binary slicer →
-    bit sink) onto ``src``, decimating ``sdr_rate``→``sample_rate`` first when needed.
-    Returns the bit sink (``drain()`` → hard bits). Shared by the cubesat GFSK engine
-    and the gr-satellites engine's generic fallback for birds gr-satellites can't decode."""
-    sps = sample_rate / profile.symbol_rate_hz
-    deviation = profile.mod_index * profile.symbol_rate_hz / 2.0
-    # Quadrature demod: instantaneous frequency scaled so +/- deviation → ~+/-1.
-    quad = analog.quadrature_demod_cf(sample_rate / (2.0 * math.pi * deviation))
-    # Gardner symbol timing recovery at the channel symbol rate.
-    ted = digital.symbol_sync_ff(
-        digital.TED_GARDNER, sps, 0.045, 1.0, 1.0, 0.05, 1,
-        digital.constellation_bpsk().base(), digital.IR_MMSE_8TAP, 128, [],
-    )
-    slicer = digital.binary_slicer_fb()  # float -> 0/1 bytes
+    """Connect a 2-GFSK/FSK/GMSK demod chain onto ``src`` and return the bit sink
+    (``drain()`` → hard bits). Mirrors gr-satellites' ``fsk_demodulator`` (GPLv3) so our
+    own-engine fallback matches a real receiver for birds gr-satellites can't decode:
+
+        [Carson LPF] → quad demod → square-pulse matched filter (+decim) → DC blocker
+        → AGC → Gardner symbol sync → binary slicer.
+
+    The DC blocker is the key addition: a carrier/Doppler frequency offset rides the
+    discriminator output as a DC bias, which a bare slicer mis-slices — removing it makes
+    the demod immune to the ~kHz catalog/oscillator/Doppler offsets the old chain failed on.
+    Shared by the cubesat GFSK engine and the gr-satellites engine's generic fallback."""
+    baud = float(profile.symbol_rate_hz)
+    deviation = profile.mod_index * baud / 2.0
+    sps = sample_rate / baud
+    # Keep symbol processing near ~10 sps: decimate the demodulated stream when the channel
+    # gives many samples/symbol (e.g. 1k2 in a 48 kHz channel = 40 sps).
+    int_decim = max(1, math.ceil(sps / 10.0)) if sps > 10.0 else 1
+    sps_post = sps / int_decim
+
+    chain: list = []
+    if decimate:  # SDR capture-rate → channel-rate first
+        chain.append(make_decimator(sdr_rate, float(sample_rate)))
+    # 1) Carson's-rule LPF before the discriminator — cut out-of-band noise. Skip when the
+    #    channel is already narrower than Carson's bandwidth.
+    carson = abs(deviation) + baud / 2.0
+    if carson < sample_rate / 2.0:
+        chain.append(gr_filter.fir_filter_ccf(
+            1, gr_filter.firdes.low_pass(1.0, sample_rate, carson, 0.1 * carson)))
+    # 2) Quadrature demod: instantaneous frequency scaled so ±deviation → ~±1.
+    chain.append(analog.quadrature_demod_cf(sample_rate / (2.0 * math.pi * deviation)))
+    # 3) Square-pulse matched filter (+ the internal decimation to ~10 sps).
+    sqlen = max(1, int(round(sample_rate / baud)))
+    chain.append(gr_filter.fir_filter_fff(int_decim, [1.0 / sqlen] * sqlen))
+    # 4) DC blocker — removes the carrier/Doppler offset bias (the fix for off-center birds).
+    #    Has a ~32-symbol settling delay, so it is skipped (``dc_block=False``) for the
+    #    short-burst cubesat path where it would eat the start of a frame.
+    if dc_block:
+        chain.append(gr_filter.dc_blocker_ff(int(math.ceil(sps_post * 32)), True))
+    # 5) RMS AGC — normalize amplitude so the Gardner TED gain stays consistent (gr-satellites
+    #    scales the time constant to ~50 symbols via 2e-2/sps).
+    chain.append(_RmsAgc(2e-2 / sps_post, 1.0, cplx=False))
+    # 6) Gardner symbol timing recovery at the post-decimation symbol rate (gr-satellites'
+    #    loop bandwidth 0.06 and timing limit 0.004*sps).
+    chain.append(digital.symbol_sync_ff(
+        digital.TED_GARDNER, sps_post, 0.06, 1.0, 1.47, 0.004 * sps_post, 1,
+        digital.constellation_bpsk().base(), digital.IR_PFB_NO_MF))
+    # 7) Slice to hard bits.
+    chain.append(digital.binary_slicer_fb())
     sink = _BitSink()
-    if decimate:  # SDR at capture rate → resample down to the channel rate, then demod
-        tb.connect(src, make_decimator(sdr_rate, float(sample_rate)), quad, ted, slicer, sink)
-    else:
-        tb.connect(src, quad, ted, slicer, sink)
+    chain.append(sink)
+    tb.connect(src, *chain)
     return sink
 
 
@@ -139,7 +193,17 @@ def connect_psk_demod(
     differentially encoded, so the Costas phase ambiguity doesn't flip the data."""
     sps = sample_rate / symbol_rate
     constel = (digital.constellation_qpsk() if order == 4 else digital.constellation_bpsk()).base()
-    agc = analog.agc_cc(1e-3, 1.0, 1.0)
+    # Front LPF (~2x baud) limits noise into the loops (mirrors gr-satellites' xlating filter).
+    lpf = None
+    lpf_cut = 2.0 * symbol_rate
+    if lpf_cut < sample_rate / 2.0:
+        lpf = gr_filter.fir_filter_ccf(
+            1, gr_filter.firdes.low_pass(1.0, sample_rate, lpf_cut, 0.2 * symbol_rate))
+    agc = _RmsAgc(2e-2 / sps, 1.0, cplx=True)  # RMS AGC, ~50-symbol time constant (gr-satellites)
+    # FLL band-edge: COARSE carrier-frequency recovery. The Costas loop tracks phase + only a
+    # small frequency offset; the FLL acquires the residual ~kHz offset first (mirrors
+    # gr-satellites' bpsk_demodulator — the PSK analog of the FSK DC-blocker fix).
+    fll = digital.fll_band_edge_cc(sps, excess_bw, 100, 2.0 * math.pi * 25.0 / sample_rate)
     ntaps = int(11 * sps) | 1  # odd
     rrc = gr_filter.fir_filter_ccf(
         1, gr_filter.firdes.root_raised_cosine(1.0, sample_rate, symbol_rate, excess_bw, ntaps)
@@ -155,7 +219,10 @@ def connect_psk_demod(
     sink = _BitSink()
     # constellation_decoder emits symbol INDICES; map_bb(pre_diff_code) applies the
     # constellation's Gray/bit assignment before unpacking (psk_demod does the same).
-    chain = [src, agc, rrc, sync, costas, decoder, diff]
+    chain = [src]
+    if lpf is not None:
+        chain.append(lpf)
+    chain += [agc, fll, rrc, sync, costas, decoder, diff]
     if constel.apply_pre_diff_code():
         chain.append(digital.map_bb(constel.pre_diff_code()))
     chain += [unpack, sink]
@@ -163,30 +230,28 @@ def connect_psk_demod(
     return sink
 
 
-def connect_afsk_demod(tb, src, sample_rate: float, *, baud: float = 1200.0) -> _BitSink:
-    """Connect a Bell-202 AFSK demod (1200/2200 Hz tones FM-carried, ``baud`` symbols)
-    onto ``src`` and return the bit sink. FM-demod to audio, then a delay-and-multiply
-    discriminator (classic soft-TNC method) turns the mark/space tones into a bipolar
-    stream → low-pass → Gardner symbol sync → slicer. NRZI/HDLC is handled downstream by
-    the deframer. Bench-pending — validate the discriminator delay against a real
-    AFSK capture (AFSK is rare on 401 MHz UHF; included for completeness)."""
-    sps = sample_rate / baud
-    audio = analog.quadrature_demod_cf(sample_rate / (2.0 * math.pi * 3000.0))  # NBFM → tones
-    delay_n = max(1, int(round(sample_rate / 1700.0)))  # ~half period of the tone centre
-    delayed = blocks.delay(gr.sizeof_float, delay_n)
-    mult = blocks.multiply_ff()
-    lpf = gr_filter.fir_filter_fff(1, gr_filter.firdes.low_pass(1.0, sample_rate, baud, baud / 2.0))
-    sync = digital.symbol_sync_ff(
-        digital.TED_GARDNER, sps, 0.045, 1.0, 1.0, 0.05, 1,
-        digital.constellation_bpsk().base(), digital.IR_MMSE_8TAP, 128, [],
-    )
-    slicer = digital.binary_slicer_fb()
-    sink = _BitSink()
-    tb.connect(src, audio)
-    tb.connect(audio, (mult, 0))
-    tb.connect(audio, delayed, (mult, 1))
-    tb.connect(mult, lpf, sync, slicer, sink)
-    return sink
+def connect_afsk_demod(
+    tb, src, sample_rate: float, *, baud: float = 1200.0,
+    mark_hz: float = 1200.0, space_hz: float = 2200.0,
+) -> _BitSink:
+    """Connect a Bell-202 AFSK demod (mark/space audio tones FM-carried) onto ``src`` and
+    return the bit sink. Mirrors gr-satellites' ``afsk_demodulator`` (GPLv3): FM-demod the
+    IQ to audio, frequency-shift the audio tone-centre to baseband, then run the upgraded
+    FSK demod on it — so AFSK inherits the DC blocker / matched filter / AGC for free. NRZI/
+    HDLC is handled downstream by the deframer. Bench-pending — AFSK is rare on 401 MHz UHF."""
+    af_carrier = (mark_hz + space_hz) / 2.0      # tone centre (Bell-202: 1700 Hz)
+    af_dev = abs(space_hz - mark_hz) / 2.0       # tone half-spacing (500 Hz)
+    # 1) FM-demod the IQ to real audio (scaling handled by the xlating + FSK demod).
+    audio = analog.quadrature_demod_cf(1.0)
+    # 2) Shift the tone-centre to baseband (real → complex) and limit to ~2x the deviation.
+    xlate = gr_filter.freq_xlating_fir_filter_fcf(
+        1, gr_filter.firdes.low_pass(1.0, sample_rate, 2.0 * af_dev, 0.1 * af_dev),
+        af_carrier, sample_rate)
+    tb.connect(src, audio, xlate)
+    # 3) Reuse the upgraded FSK demod on the complex baseband (its DC blocker absorbs any
+    #    residual tone-centre error; deviation = the tone half-spacing).
+    profile = endurosat.LinkProfile(symbol_rate_hz=baud, mod_index=2.0 * af_dev / baud)
+    return connect_gfsk_demod(tb, xlate, sample_rate, profile, decimate=False, sdr_rate=sample_rate)
 
 
 def build_rx_top_block(
@@ -210,8 +275,11 @@ def build_rx_top_block(
     if decimate:
         chan = make_decimator(sdr_rate, float(sample_rate))
         tb.connect(src, chan)
+    # dc_block=False: EnduroSat frames are short bursts; the DC blocker's ~32-symbol settling
+    # would eat the start of a frame. (The generic satellites fallback keeps it on by default.)
     sink = connect_gfsk_demod(
-        tb, chan, float(sample_rate), profile, decimate=False, sdr_rate=float(sample_rate)
+        tb, chan, float(sample_rate), profile,
+        decimate=False, sdr_rate=float(sample_rate), dc_block=False,
     )
     recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
     return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
