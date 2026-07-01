@@ -61,6 +61,7 @@ install(
     apps/modem.py                    # modem registry: modulation -> demod chain (docs/08)
     apps/framings.py                 # framing registry: framing -> deframe (docs/08)
     apps/fec.py                      # FEC registry skeleton (docs/08)
+    apps/grsat_synth.py              # synthetic SatYAML: reuse gr-satellites deframers (docs/08 Ph1)
     apps/gnuradio_gfsk.py            # bench engine helper (imported only by --engine gnuradio)
     apps/gnuradio_satellites.py      # gr-satellites bridge (imported by satellite_rx at decode time)
   DESTINATION ${GS_APPS_INSTALL_DIR}
