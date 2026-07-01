@@ -50,6 +50,33 @@ gr-satnogs/satnogs-client): see `../docs/07-multi-mission-framing.md`. The Endur
 mission keeps its dedicated, tested `dsp` path (`cubesat_gfsk_ax25_rx.py
 --framing endurosat`).
 
+## Universal modem + framing (docs/08)
+
+Beyond gr-satellites, the engine is a **three-registry composer** so it can demodulate + deframe
+*any documented downlink* (commercial/government/amateur), not just amateur AX.25. See
+[`../docs/08-universal-modem-framing-plan.md`](../docs/08-universal-modem-framing-plan.md) (plan) and
+[`../docs/09-universal-modem-framing-integration-changes.md`](../docs/09-universal-modem-framing-integration-changes.md)
+(the deferred backend/frontend/config changes it implies).
+
+* **Modem registry** — [`apps/modem.py`](apps/modem.py): `modulation_spec()` classifies the full
+  taxonomy — **Tier 1** FSK (2-FSK/GFSK/GMSK/MSK/CPFSK, M-FSK) · PSK (BPSK/DBPSK, QPSK/DQPSK/OQPSK,
+  8-PSK) · AFSK; **Tier 2** QAM 16–256 · APSK 16/32 · OFDM · DVB-S2/S2X; **Tier 3** OOK/ASK · CW/Morse
+  · NBFM/WFM/AM. `build_demod`/`build_mod` construct the chains (Tier-1 in
+  [`gnuradio_gfsk.py`](apps/gnuradio_gfsk.py); Tier-2/analog in
+  [`gnuradio_hirate.py`](apps/gnuradio_hirate.py)).
+* **FEC registry** — [`apps/fec.py`](apps/fec.py): numpy CCSDS randomizer, CRC-16/32, ASM, and
+  **Reed-Solomon RS(255,223)** ([`gfsk_ax25/reedsolomon.py`](apps/gfsk_ax25/reedsolomon.py)); Viterbi
+  / LDPC / Turbo / Golay declared for the bench / gr-satellites.
+* **Framing registry** — [`apps/framings.py`](apps/framings.py): local numpy deframers
+  (`ax25`, `endurosat`, **`argos`** BCH(31,21) PTT, **`ccsds_tm`** CCSDS TM/AOS transfer frame,
+  **`kiss`**/**`slip`** TNC), plus the whole gr-satellites vocabulary reused via a synthetic SatYAML
+  ([`grsat_synth.py`](apps/grsat_synth.py)).
+* **Composer** — [`apps/compose.py`](apps/compose.py): `plan_decode(rfLink)` → our-engine /
+  gr-satellites / race / record-only.
+
+The numpy codecs (RS, BCH, CCSDS, OOK, Morse, KISS/SLIP) are exhaustively unit-tested; the GNU-Radio
+demod/mod chains are **bench-validation-pending** (no GNU Radio in CI).
+
 ## Cubesat 2-GFSK / AX.25 (9k6) waveform
 
 `cubesat_gfsk_ax25_{rx,tx}.py` implement an EnduroSat-class UHF link: 2-GFSK
@@ -113,6 +140,10 @@ Reserved for later phases:
 * SoapySDR + at least one device module (``soapysdr-module-lms7`` for
   LimeSDR-mini, ``soapysdr-module-xtrx`` for XTRX, etc.)
 * For dev without real hardware: ``soapysdr-module-loopback``
+* **gr-satellites** (GPLv3) — the multi-mission decode engine (`satellite_rx.py`).
+* **Optional: gr-dvbs2rx** (GPLv3) — only for **DVB-S2/S2X** downlinks (the one core modulation
+  gap). Absence is handled gracefully — `gnuradio_hirate.connect_dvbs2_demod` returns None and the
+  modulation is treated as build-pending. Install only on stations that service DVB-S2 birds.
 
 Install on Debian/Ubuntu::
 
