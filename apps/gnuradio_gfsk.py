@@ -19,6 +19,7 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+import logging
 import math
 import queue
 
@@ -41,6 +42,8 @@ from gnuradio import analog, blocks, digital, gr
 from gnuradio import filter as gr_filter
 
 from gfsk_ax25 import ax25, endurosat, framing
+
+_log = logging.getLogger("gnuradio_gfsk")
 
 
 class _BitSink(gr.sync_block):
@@ -180,19 +183,30 @@ def connect_gfsk_demod(
 
 
 def connect_psk_demod(
-    tb, src, sample_rate: float, symbol_rate: float, *, order: int = 2, excess_bw: float = 0.35
+    tb, src, sample_rate: float, symbol_rate: float, *, order: int = 2,
+    differential: bool = True, offset: bool = False, excess_bw: float = 0.35,
 ) -> _BitSink:
     """Connect a coherent PSK demod chain onto ``src`` (already at the channel rate) and
-    return the bit sink. ``order`` selects the constellation: 2 = BPSK, 4 = QPSK.
+    return the bit sink. ``order`` selects the constellation: 2 = BPSK, 4 = QPSK, 8 = 8-PSK.
 
     AGC → RRC matched filter → Mueller&Müller symbol sync → Costas carrier recovery →
-    constellation decode → differential decode → (pre-diff Gray map) → unpack to hard
+    constellation decode → [differential decode] → (pre-diff Gray map) → unpack to hard
     bits. Mirrors GNU Radio's own ``digital.psk.psk_demod`` so the symbol→bit mapping is
-    correct for QPSK (a raw bit-unpack of the symbol index would scramble the Gray code).
-    Differential is the safe default for an unknown bird — most cubesat PSK downlinks are
-    differentially encoded, so the Costas phase ambiguity doesn't flip the data."""
+    correct for QPSK/8-PSK (a raw bit-unpack of the symbol index would scramble the Gray code).
+
+    ``differential`` toggles the DxPSK differential decoder (True resolves the Costas phase
+    ambiguity, correct for DBPSK/DQPSK; pass False for true coherent BPSK/QPSK). ``offset``
+    marks OQPSK — the half-symbol I/Q stagger demod is bench build-pending, so it is currently
+    treated as QPSK (logged); confirm against a real OQPSK bird before relying on it."""
     sps = sample_rate / symbol_rate
-    constel = (digital.constellation_qpsk() if order == 4 else digital.constellation_bpsk()).base()
+    if order == 8:
+        constel = digital.constellation_8psk().base()
+    elif order == 4:
+        constel = digital.constellation_qpsk().base()
+    else:
+        constel = digital.constellation_bpsk().base()
+    if offset:  # OQPSK: dedicated staggered-demod not built yet — best-effort as QPSK.
+        _log.info("connect_psk_demod: OQPSK offset handling bench-pending; treating as QPSK")
     # Front LPF (~2x baud) limits noise into the loops (mirrors gr-satellites' xlating filter).
     lpf = None
     lpf_cut = 2.0 * symbol_rate
@@ -214,7 +228,6 @@ def connect_psk_demod(
     )
     costas = digital.costas_loop_cc(0.04, order)
     decoder = digital.constellation_decoder_cb(constel)
-    diff = digital.diff_decoder_bb(order)
     unpack = blocks.unpack_k_bits_bb(constel.bits_per_symbol())  # symbol index → hard bits
     sink = _BitSink()
     # constellation_decoder emits symbol INDICES; map_bb(pre_diff_code) applies the
@@ -222,7 +235,9 @@ def connect_psk_demod(
     chain = [src]
     if lpf is not None:
         chain.append(lpf)
-    chain += [agc, fll, rrc, sync, costas, decoder, diff]
+    chain += [agc, fll, rrc, sync, costas, decoder]
+    if differential:  # DxPSK: resolve the Costas phase ambiguity (skip for coherent BPSK/QPSK)
+        chain.append(digital.diff_decoder_bb(order))
     if constel.apply_pre_diff_code():
         chain.append(digital.map_bb(constel.pre_diff_code()))
     chain += [unpack, sink]

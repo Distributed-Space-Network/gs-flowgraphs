@@ -16,18 +16,31 @@ import numpy as np
 from gfsk_ax25 import ax25, framing
 
 
-def test_modem_advertises_all_current_families():
-    assert modem.demod_families() == {
-        "gfsk", "fsk", "gmsk", "msk", "bpsk", "qpsk", "psk", "afsk"
-    }
+def test_modem_advertises_the_tier1_and_tier2_families():
+    fams = modem.demod_families()
+    # Tier-1 FSK + PSK + AFSK are all recognized …
+    assert {"gfsk", "fsk", "gmsk", "msk", "cpfsk"} <= fams
+    assert {"bpsk", "dbpsk", "qpsk", "dqpsk", "oqpsk", "8psk", "psk", "afsk"} <= fams
+    # … and the Tier-2 keys classify (they route elsewhere, not built here).
+    assert {"qam16", "qam256", "apsk32", "ofdm", "dvbs2"} <= fams
+    # TX modulator families cover the Tier-1 set (Tier-2 modulators come later).
+    assert {"gfsk", "bpsk", "qpsk", "afsk"} <= modem.mod_families()
 
 
-def test_framing_registry_lists_the_link_layers():
-    assert framings.known_framings() == ("ax25", "endurosat")
+def test_framing_registry_lists_local_and_grsatellites_layers():
+    assert framings.local_framings() == ("ax25", "endurosat", "argos")
+    known = framings.known_framings()
+    assert "ax25" in known and "argos" in known
+    # the gr-satellites vocabulary is advertised (reused via synthetic SatYAML, decoded upstream).
+    for f in ("USP", "AX100 ASM+Golay", "CCSDS Concatenated", "Mobitex"):
+        assert f in known
 
 
-def test_fec_registry_is_an_empty_skeleton():
-    assert fec.known_codes() == ()
+def test_fec_registry_advertises_codes_and_implements_the_numpy_ones():
+    codes = fec.known_codes()
+    for c in ("ccsds_randomizer", "crc16", "crc32", "asm", "reed_solomon", "golay"):
+        assert c in codes
+    assert fec.implemented_codes() == ("ccsds_randomizer", "crc16", "crc32", "asm")
 
 
 def test_deframe_empty_and_noise_return_no_match():
