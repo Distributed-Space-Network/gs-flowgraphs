@@ -4,13 +4,22 @@ from __future__ import annotations
 import compose
 
 
-def test_our_engine_only_local_framing():
-    # GFSK + our local AX.25 token, not catalogued, gr-sat framing string absent → our engine.
+def test_local_token_framing_is_our_engine_only():
+    # The LOCAL token "ax25" is not gr-satellites SatYAML vocabulary → our engine, no synthetic.
     plan = compose.plan_decode(
         {"modulation": "gfsk", "symbol_rate_hz": 9600, "framing": "ax25"}, catalogued=False)
     assert plan.our_modem and plan.our_framing and plan.our_engine
     assert not plan.grsat_catalogued
-    # gr-sat synthesizable too (gfsk + framing + baud) → this is actually a race
+    assert not plan.grsat_synthesizable and not plan.race
+
+
+def test_verbatim_satyaml_label_races_both_engines():
+    # The backend passes SatYAML labels VERBATIM (docs/10 P0-2): "AX.25 G3RUH" normalizes to the
+    # local ax25 deframer AND is valid gr-satellites vocabulary → both paths → race.
+    plan = compose.plan_decode(
+        {"modulation": "gfsk", "symbol_rate_hz": 9600, "framing": "AX.25 G3RUH"},
+        catalogued=False)
+    assert plan.our_framing and plan.our_engine
     assert plan.grsat_synthesizable and plan.race
 
 

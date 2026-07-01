@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 
-from gnuradio import analog, blocks, digital
+from gnuradio import blocks, digital
 from gnuradio import filter as gr_filter
 from gnuradio_gfsk import _BitSink, _RmsAgc  # reuse the shared bit sink + RMS AGC
 
@@ -37,8 +37,10 @@ def _coherent_bit_chain(tb, src, sample_rate, symbol_rate, constel, *, excess_bw
     ntaps = int(11 * sps) | 1
     rrc = gr_filter.fir_filter_ccf(
         1, gr_filter.firdes.root_raised_cosine(1.0, sample_rate, symbol_rate, excess_bw, ntaps))
+    # Gardner, not M&M: timing recovery sits BEFORE the carrier loop here, and M&M is
+    # decision-directed (degrades under residual rotation); Gardner is rotation-invariant.
     sync = digital.symbol_sync_cc(
-        digital.TED_MUELLER_AND_MULLER, sps, 0.045, 1.0, 1.0, 0.05, 1,
+        digital.TED_GARDNER, sps, 0.045, 1.0, 1.0, 0.05, 1,
         constel, digital.IR_MMSE_8TAP, 128, [])
     # constellation_receiver_cb does joint carrier (2nd-order loop) + constellation decode.
     receiver = digital.constellation_receiver_cb(constel, 0.06, -0.25, 0.25)
@@ -56,8 +58,11 @@ def _coherent_bit_chain(tb, src, sample_rate, symbol_rate, constel, *, excess_bw
 
 
 def connect_qam_demod(tb, src, sample_rate, symbol_rate, *, order=16):
-    """M-QAM demod (order 16/32/64/128/256) via the gray-coded rectangular QAM constellation."""
-    constel = digital.qam.qam_constellation(order, differential=False).base()
+    """M-QAM demod (order 16/32/64/128/256) via the gray-coded rectangular QAM constellation.
+    ``mod_code=GRAY_CODE`` is explicit — the constructor default is NO_CODE (natural binary),
+    which would scramble the bit assignment."""
+    constel = digital.qam.qam_constellation(
+        order, differential=False, mod_code=digital.mod_codes.GRAY_CODE).base()
     return _coherent_bit_chain(tb, src, sample_rate, symbol_rate, constel)
 
 
@@ -72,17 +77,12 @@ def connect_apsk_demod(tb, src, sample_rate, symbol_rate, *, order=16):
 
 
 def connect_ofdm_demod(tb, src, sample_rate):
-    """OFDM RX via ``digital.ofdm_rx`` (default 64-carrier / 16-CP profile). The packet payload is
-    emitted as a message PDU; wiring that to the bit/frame sink is confirmed on the bench."""
-    rx = digital.ofdm_rx(
-        fft_len=64, cp_len=16, packet_length_tag_key="len",
-        occupied_carriers=(list(range(-26, -21)) + list(range(-20, -7)) + list(range(-6, 0))
-                           + list(range(1, 7)) + list(range(8, 21)) + list(range(22, 27)),),
-        pilot_carriers=((-21, -7, 7, 21),), pilot_symbols=((1, 1, 1, -1),),
-        sync_word1=None, sync_word2=None, bps_header=1, bps_payload=1)
-    tb.connect(src, rx)
-    _log.info("hirate: OFDM ofdm_rx built; PDU→sink wiring bench-pending")
-    return rx  # PDU-producing block; caller taps its message port on the bench
+    """OFDM RX — BUILD-PENDING. ``digital.ofdm_rx`` outputs a tagged BYTE STREAM (not a PDU),
+    which the ``_BitSink``-based engine contract cannot drain yet; returning the raw block would
+    leave an unconnected stream port and abort ``tb.start()`` (costing the recording). Until the
+    byte-stream→frame adapter is built and bench-validated, report unsupported."""
+    _log.info("hirate: OFDM RX adapter build-pending; skipping (record-only for this pass)")
+    return None
 
 
 def connect_dvbs2_demod(tb, src, sample_rate, symbol_rate):
@@ -98,36 +98,32 @@ def connect_dvbs2_demod(tb, src, sample_rate, symbol_rate):
 
 
 def connect_analog_demod(tb, src, sample_rate, kind):
-    """Tier-3 analog voice/data demod → real float output. NBFM via ``analog.nbfm_rx`` (or a
-    quadrature demod), WFM via ``analog.wfm_rcv``, AM via ``analog.am_demod_cf``. Returns the
-    terminal block (an audio-rate float stream); the caller records/decodes it on the bench."""
-    if kind == "am":
-        demod = analog.am_demod_cf(channel_rate=int(sample_rate), audio_decim=1,
-                                   audio_pass=5000, audio_stop=5500)
-        tb.connect(src, demod)
-        return demod
-    if kind == "wfm":
-        demod = analog.wfm_rcv(quad_rate=int(sample_rate), audio_decimation=1)
-        tb.connect(src, demod)
-        return demod
-    quad = analog.quadrature_demod_cf(sample_rate / (2.0 * 3.141592653589793 * 5000.0))
-    tb.connect(src, quad)  # NBFM: quadrature discriminator (audio filtering added on the bench)
-    _log.info("hirate: NBFM quadrature demod built; audio LPF/de-emphasis bench-tuned")
-    return quad
+    """Tier-3 analog voice demod — BUILD-PENDING as an engine path. The analog blocks
+    (``nbfm_rx``/``wfm_rcv``/``am_demod_cf``) emit an audio-rate FLOAT stream, not the hard bits
+    the ``_BitSink`` engine contract drains; returning such a block with its output unconnected
+    would abort ``tb.start()`` and cost the recording. Analog voice already has its dedicated
+    spawnable app (``amateur_fm_narrowband_rx.py``); route analog missions there. Until an
+    audio-sink adapter is built for THIS engine, report unsupported (record-only)."""
+    _log.info("hirate: analog %s demod in the satellites engine is build-pending; "
+              "use the dedicated FM app (record-only for this pass)", kind)
+    return None
 
 
 def build_tier2_mod(spec, tb, src, sample_rate, symbol_rate):
-    """Tier-2 TX modulator: QAM via ``constellation_modulator``, OFDM via ``ofdm_tx``, DVB-S2 via
-    ``gr-dvbs2rx``. Bench-pending like the demods."""
+    """Tier-2 TX modulator: QAM/APSK via ``digital.generic_mod`` (``constellation_modulator`` is
+    a GRC-only wrapper, NOT a Python symbol), OFDM via ``ofdm_tx``, DVB-S2 via ``gr-dvbs2rx``.
+    Input contract: PACKED bytes (generic_mod unpacks internally). Bench-pending like the demods."""
     sps = max(2, int(round(sample_rate / max(symbol_rate, 1.0))))
     if spec.family == "qam":
-        constel = digital.qam.qam_constellation(spec.order, differential=False).base()
-        return digital.constellation_modulator(constel, differential=False, samples_per_symbol=sps)
+        constel = digital.qam.qam_constellation(
+            spec.order, differential=False, mod_code=digital.mod_codes.GRAY_CODE).base()
+        return digital.generic_mod(
+            constellation=constel, differential=False, samples_per_symbol=sps)
     if spec.family == "ofdm":
         return digital.ofdm_tx(fft_len=64, cp_len=16, packet_length_tag_key="len")
     if spec.family == "apsk":
         ctor = getattr(digital, f"constellation_{spec.order}apsk", None)
-        return None if ctor is None else digital.constellation_modulator(
-            ctor().base(), differential=False, samples_per_symbol=sps)
+        return None if ctor is None else digital.generic_mod(
+            constellation=ctor().base(), differential=False, samples_per_symbol=sps)
     _log.info("hirate: %s TX build-pending (gr-dvbs2rx for DVB-S2)", spec.kind)
     return None

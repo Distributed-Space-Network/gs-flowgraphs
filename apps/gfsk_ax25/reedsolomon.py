@@ -99,13 +99,14 @@ class RSCodec:
         return [0] + [self._poly_eval(msg, self._pow(self.gen, i + self.fcr))
                       for i in range(self.nsym)]
 
-    def _error_locator(self, synd):
+    def _error_locator(self, synd_terms, nsteps):
+        """Berlekamp-Massey over ``nsteps`` of ``synd_terms`` (S_0-first, no leading zero)."""
         err_loc = [1]
         old_loc = [1]
-        for i in range(self.nsym):
-            delta = synd[i + 1]
+        for i in range(nsteps):
+            delta = synd_terms[i]
             for j in range(1, len(err_loc)):
-                delta ^= self._mul(err_loc[-(j + 1)], synd[i + 1 - j])
+                delta ^= self._mul(err_loc[-(j + 1)], synd_terms[i - j])
             old_loc = old_loc + [0]
             if delta != 0:
                 if len(old_loc) > len(err_loc):
@@ -114,6 +115,16 @@ class RSCodec:
                     err_loc = new_loc
                 err_loc = self._poly_add(err_loc, self._poly_scale(old_loc, delta))
         return err_loc
+
+    def _forney_syndromes(self, synd, coord):
+        """Fold the erasure contribution out of the syndromes so Berlekamp-Massey sees the
+        (unknown-position) errors only. ``coord`` are erasure locations as x-exponents."""
+        fsynd = list(synd[1:])
+        for i in coord:
+            x = self._pow(self.gen, i)
+            for j in range(len(fsynd) - 1):
+                fsynd[j] = self._mul(fsynd[j], x) ^ fsynd[j + 1]
+        return fsynd
 
     def _find_errors(self, err_loc, nmess):
         errs = len(err_loc) - 1
@@ -159,18 +170,33 @@ class RSCodec:
             e[err_pos[i]] = self._mul(y, self._inv(denom))
         return self._poly_add(msg, e)
 
-    def decode(self, codeword):
+    def decode(self, codeword, erase_pos=None):
         """Correct ``codeword`` (255 bytes) and return the ``255-nsym`` message bytes, or ``None``
-        if it is beyond the correction capability (> nsym//2 symbol errors)."""
+        when beyond the correction capability. Errors-and-erasures: ``erase_pos`` (byte indexes
+        known-bad from the demodulator, e.g. low-confidence symbols) each cost ONE parity symbol
+        instead of two — capability is ``2·errors + erasures ≤ nsym`` (so up to ``nsym`` pure
+        erasures, vs ``nsym//2`` pure errors)."""
         msg = list(bytes(bytearray(int(b) & 0xFF for b in codeword)))
+        n = len(msg)
+        erase = sorted(set(int(p) for p in (erase_pos or [])))
+        if any(p < 0 or p >= n for p in erase):
+            raise ValueError("erasure position out of range")
+        if len(erase) > self.nsym:
+            return None  # more erasures than parity symbols — unrecoverable by construction
+        for p in erase:
+            msg[p] = 0  # erased values are untrusted; zero them for a defined syndrome
         synd = self._syndromes(msg)
         if max(synd) == 0:
-            return bytes(msg[:len(msg) - self.nsym])
-        err_loc = self._error_locator(synd)[::-1]  # orientation for the Chien search
-        err_pos = self._find_errors(err_loc, len(msg))
+            return bytes(msg[:n - self.nsym])
+        coord = [n - 1 - p for p in erase]  # erasure locations as x-exponents
+        fsynd = self._forney_syndromes(synd, coord)
+        # BM on the Forney syndromes finds the UNKNOWN-position errors only; the erasures'
+        # positions are known and appended for the single combined Forney correction.
+        err_loc = self._error_locator(fsynd, self.nsym - len(erase))[::-1]
+        err_pos = self._find_errors(err_loc, n)
         if err_pos is None:
             return None
-        fixed = self._correct(msg, synd, err_pos)
+        fixed = self._correct(msg, synd, erase + err_pos)
         if fixed is None or max(self._syndromes(fixed)) != 0:
             return None
-        return bytes(fixed[:len(fixed) - self.nsym])
+        return bytes(fixed[:n - self.nsym])

@@ -74,15 +74,16 @@ def plan_decode(params: dict | None, *, catalogued: bool = False) -> DecodePlan:
     a SatYAML for the bird (the caller knows this from the NORAD lookup)."""
     p = params or {}
     modulation = str(p.get("modulation") or "").strip().lower() or None
-    framing = p.get("framing")
-    fec = p.get("fec")
+    framing = str(p.get("framing")).strip() if p.get("framing") not in (None, "") else None
+    fec = str(p.get("fec")).strip() if p.get("fec") not in (None, "") else None
     try:
         baud = float(p.get("symbol_rate_hz") or 0.0)
     except (TypeError, ValueError):
         baud = 0.0
     spec = modem.modulation_spec(modulation) if modulation else None
-    local = {f.strip().lower() for f in framings.local_framings()}
-    our_framing = bool(framing) and framing.strip().lower() in local
+    # A framing is "ours" when the registry normalizes it to a LOCAL deframer — this accepts
+    # backend/SatYAML labels verbatim ("AX.25 G3RUH" → ax25), not just local tokens.
+    our_framing = framings.normalize_framing(framing) is not None
     return DecodePlan(
         modulation=modulation,
         symbol_rate=baud,

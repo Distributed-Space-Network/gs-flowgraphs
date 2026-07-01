@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Generic multi-mission satellite receiver (gr-satellites + fallback demods).
+"""Generic multi-mission satellite receiver (gr-satellites + the universal modem/framing).
 
 A spawn-contract flowgraph that records the wideband IQ of EVERY pass (the priority,
-SatNOGS-style) and decodes the bird when it can: gr-satellites (GPLv3, the canonical
-multi-mission decoder) when the ``satellite`` (NORAD id / SatYAML name) is in its
-catalog, otherwise the configured fallback demods (GS_FALLBACK_DEMODS) run in parallel —
-GFSK / FSK / GMSK, BPSK / QPSK / PSK, and AFSK — and frames come from whichever locks.
-So an uncatalogued 401 MHz LEO bird still yields IQ, plus a best-effort frame decode. For
-the EnduroSat mission use the dedicated, tested ``cubesat_gfsk_ax25_rx.py``
-(``--framing endurosat``) instead.
+SatNOGS-style) and decodes the bird when it can. Decode is fully BACKEND-DRIVEN (docs/08):
+gr-satellites (GPLv3, the canonical multi-mission decoder) when the ``satellite`` (NORAD id /
+SatYAML name) is in its catalog OR a synthetic SatYAML can be built from the backend's
+``(modulation, framing, baud)``, racing the ONE backend-specified demod from the modem
+registry (first CRC-valid frame wins). There is no brute-force demod bank
+(``GS_FALLBACK_DEMODS`` is deprecated and ignored). So an uncatalogued 401 MHz LEO bird still
+yields IQ, plus a best-effort frame decode. For the EnduroSat mission use the dedicated,
+tested ``cubesat_gfsk_ax25_rx.py`` (``--framing endurosat``) instead.
 
 BENCH-PENDING: needs GNU Radio + gr-satellites + gr-soapy; not runnable on the dev
 box (the gr-satellites pieces are imported lazily in the engine task).

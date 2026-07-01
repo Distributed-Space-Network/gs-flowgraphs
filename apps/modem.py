@@ -121,14 +121,19 @@ def mod_families() -> set[str]:
 
 
 # ── Chain construction (GNU Radio, lazy) ─────────────────────────────────────────────────────
-def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
+def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
+                *, differential: bool | None = None):
     """Build the GNU Radio demod chain for ``kind`` tapping ``src`` (already at the channel rate)
     and return its bit sink (``drain()`` → hard bits), or ``None`` if unsupported / build-pending.
 
     FSK → tuned quadrature-demod chain; PSK (2/4/8) → FLL+Costas chain (order from the spec);
     AFSK → FM-demod + tone xlate → FSK chain. Tier 2 (QAM/APSK/OFDM/DVB-S2) routes to the
     ``gnuradio_hirate`` bench constructors. M-FSK and offset/8-PSK are classified but their
-    dedicated slicer/loop is bench build-pending (return ``None`` with a log, never crash)."""
+    dedicated slicer/loop is bench build-pending (return ``None`` with a log, never crash).
+
+    ``differential`` is the backend's per-bird DxPSK flag (rfLink → params ``differential``):
+    True/False is honoured by the PSK chain; ``None`` (backend didn't say) keeps the robust
+    differential-on default — most cubesat PSK downlinks are differentially encoded."""
     import logging  # noqa: PLC0415
 
     spec = modulation_spec(kind)
@@ -155,14 +160,14 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
         return connect_gfsk_demod(
             tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate)
     if spec.family == "psk":
-        # RX: differential decode is the robust default for the fallback race — most cubesat PSK
-        # downlinks are differentially encoded, and the modulation NAME ("bpsk") doesn't tell us
-        # (gr-satellites carries that in a separate SatYAML flag). A per-bird `differential`
-        # rfLink field should drive this later (backend follow-up); spec.differential (name-
-        # derived) stays authoritative for TX. order/offset route 8-PSK/OQPSK (bench-pending loop).
+        # RX differential precedence: the backend's per-bird rfLink flag (``differential`` param)
+        # when supplied wins; otherwise the robust default True — most cubesat PSK downlinks are
+        # differentially encoded, a bare "bpsk" name doesn't say, and a "dbpsk" name agrees with
+        # the default anyway. order/offset route 8-PSK/OQPSK (bench-pending loop tuning).
+        rx_diff = differential if differential is not None else True
         return connect_psk_demod(
             tb, src, sample_rate, symbol_rate or 1200.0,
-            order=spec.order, differential=True, offset=spec.offset)
+            order=spec.order, differential=rx_diff, offset=spec.offset)
     if spec.family == "afsk":
         return connect_afsk_demod(tb, src, sample_rate, baud=symbol_rate or 1200.0)
     # mfsk — dedicated M-level slicer not built yet on the bench.
@@ -214,12 +219,17 @@ def _build_tier3_demod(spec, tb, src, sample_rate: float):
 
 
 def build_mod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
-    """Build the GNU Radio **modulator** chain for ``kind`` (TX): bytes/bits in → complex IQ out,
-    or ``None`` if unsupported / build-pending. Lazily imports ``gnuradio.digital``; bench-only.
+    """Build the GNU Radio **modulator** chain for ``kind`` (TX): **packed bytes** in → complex
+    IQ out, or ``None`` if unsupported / build-pending. Lazily imports ``gnuradio.digital``;
+    bench-only.
+
+    INPUT CONTRACT: GNU Radio's hierblock modulators (``gfsk_mod``/``psk_mod``/``generic_mod``)
+    default to ``do_unpack=True`` — they expect PACKED bytes and unpack internally. Feed
+    ``np.packbits(bits)``, never unpacked 0/1 bits (each bit would become 8 symbols).
 
     Maps the Tier-1 families to GNU Radio hierblocks: FSK→``gfsk_mod``/``gmsk_mod``, PSK→
-    ``psk_mod``/``constellation_modulator``. Construction is confirmed on the bench (no GNU Radio
-    in CI); the classification that selects the block is unit-tested via :func:`modulation_spec`."""
+    ``psk_mod``. Construction is confirmed on the bench (no GNU Radio in CI); the classification
+    that selects the block is unit-tested via :func:`modulation_spec`."""
     import logging  # noqa: PLC0415
 
     spec = modulation_spec(kind)
@@ -243,7 +253,10 @@ def build_mod(kind: str, tb, src, sample_rate: float, symbol_rate: float):
         return None
     sps = max(2, int(round(sample_rate / max(symbol_rate, 1.0))))
     if spec.family == "fsk":
-        h = 0.5 if spec.kind in ("gmsk", "msk", "cpfsk", "cpm") else 1.0
+        # h=0.5 across the whole FSK family: it is what our RX chain and grsat_synth's
+        # deviation default assume — a TX/RX modulation-index mismatch would put a 2x
+        # deviation error on our own loopback.
+        h = 0.5
         return digital.gfsk_mod(samples_per_symbol=sps, sensitivity=(3.14159 * h) / sps)
     if spec.family == "psk":
         return digital.psk_mod(

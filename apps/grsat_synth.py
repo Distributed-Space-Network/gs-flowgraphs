@@ -26,13 +26,40 @@ _MOD_INDEX = {"gmsk": 0.5, "msk": 0.5}
 _DEFAULT_MOD_INDEX = 0.5  # most cubesat GFSK / 2-FSK ~ h = 0.5
 
 
+# Needles for gr-satellites SatYAML framing families, for labels not in the advertised
+# (deliberately non-exhaustive) framings.grsatellites_framings() list. "ax.25" (with the dot)
+# matches SatYAML labels but NOT the local token "ax25" — local-only tokens are not
+# synthesizable (gr-satellites doesn't know them; our own engine deframes those).
+_GRSAT_NEEDLES = (
+    "ax.25", "ax100", "usp", "mobitex", "geoscan", "ao-40", "ccsds", "ngham", "u482c",
+    "fx.25", "snet", "openlst", "smog", "reaktor", "tt-64", "sanosat", "grizu", "aalto",
+    "lucky", "eseo", "fossasat", "qubik", "hades", "nusat",
+)
+
+
+def _grsat_framing(framing) -> bool:
+    """True when ``framing`` looks like gr-satellites SatYAML vocabulary: an exact
+    (case-insensitive) advertised label, or a label of a known family. Rejects local-only
+    tokens (``ax25``/``endurosat``/``kiss``/…) and garbage."""
+    import framings  # noqa: PLC0415 — sibling registry, import-safe
+
+    s = str(framing or "").strip().lower()
+    if not s:
+        return False
+    if s in {f.lower() for f in framings.grsatellites_framings()}:
+        return True
+    return any(n in s for n in _GRSAT_NEEDLES)
+
+
 def can_synthesize(modulation, baud, framing) -> bool:
-    """True when :func:`synthetic_satyaml` would succeed — i.e. gr-satellites can demodulate the
-    modulation (FSK/BPSK/AFSK family) and both ``framing`` and ``baud`` are present. Lets the
-    composer decide whether the gr-satellites (synthetic-SatYAML) path is available without
-    writing a file."""
+    """True when the gr-satellites synthetic-SatYAML path applies: gr-satellites can demodulate
+    the modulation (FSK/BPSK/AFSK family), ``baud`` is present, and ``framing`` is gr-satellites
+    vocabulary (validated — a local-only token like ``"ax25"`` is NOT synthesizable). Lets the
+    composer report the path without writing a file. NOTE: the runtime write path stays
+    slightly more permissive (any truthy framing) because ``gr_satellites_flowgraph``'s own
+    constructor is the authoritative validator and attempts are cheap + guarded."""
     kind = str(modulation or "").strip().lower()
-    return bool(_GRSAT_MOD.get(kind) and framing and baud)
+    return bool(_GRSAT_MOD.get(kind) and baud and _grsat_framing(framing))
 
 
 def synthetic_satyaml(norad, modulation, baud, framing, frequency_hz, *, name=None):

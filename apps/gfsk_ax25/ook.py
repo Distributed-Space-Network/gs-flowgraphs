@@ -23,9 +23,15 @@ def modulate(bits, sps: int, *, amp: float = 1.0, levels: int = 2) -> np.ndarray
     return np.repeat(env, sps).astype(np.complex128)
 
 
-def demodulate(iq, sps: int, *, offset: int = 0, levels: int = 2) -> np.ndarray:
+def demodulate(iq, sps: int, *, offset: int = 0, levels: int = 2,
+               min_separation: float = 3.0) -> np.ndarray:
     """Complex IQ → symbols. Integrates the magnitude over each ``sps``-sample symbol and slices
-    against an adaptive threshold (OOK: min/max midpoint; M-ASK: nearest of ``levels`` levels)."""
+    against an adaptive threshold (OOK: min/max midpoint; M-ASK: nearest of ``levels`` levels).
+
+    Signal gate (OOK): the min/max-midpoint slicer would emit *random bits on pure noise*, so
+    for ``levels == 2`` the two envelope classes must separate by at least ``min_separation``
+    within-class standard deviations — otherwise the input is judged unmodulated and an EMPTY
+    array is returned (no symbols detected). Set ``min_separation=0`` to disable the gate."""
     env = np.abs(np.asarray(iq, dtype=np.complex128))[offset:]
     n = len(env) // sps
     if n == 0:
@@ -35,6 +41,13 @@ def demodulate(iq, sps: int, *, offset: int = 0, levels: int = 2) -> np.ndarray:
     if hi - lo < 1e-12:  # flat — no modulation present
         return np.zeros(n, dtype=np.uint8)
     if levels == 2:
-        return (sym > (lo + hi) / 2.0).astype(np.uint8)
+        mid = (lo + hi) / 2.0
+        bits = sym > mid
+        if min_separation > 0 and bits.any() and (~bits).any():
+            hi_cls, lo_cls = sym[bits], sym[~bits]
+            spread = float(hi_cls.std() + lo_cls.std()) + 1e-12
+            if (float(hi_cls.mean()) - float(lo_cls.mean())) < min_separation * spread:
+                return np.empty(0, dtype=np.uint8)  # bimodality too weak: noise, not OOK
+        return bits.astype(np.uint8)
     step = (hi - lo) / (levels - 1)
     return np.clip(np.round((sym - lo) / step), 0, levels - 1).astype(np.uint8)

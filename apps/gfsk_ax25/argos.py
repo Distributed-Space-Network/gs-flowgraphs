@@ -58,9 +58,11 @@ def bch3121_decode(code31: int) -> int | None:
     return None
 
 
-# ── PTT deframer (parametric; default = documented Argos-2 PTT-A2) ────────────────────────────
-# BENCH/SPEC-CONFIRM: the frame-sync word and field widths below are the documented Argos-2
-# PTT-A2 values; confirm against a real 401 MHz PTT capture before trusting a bird's decode.
+# ── PTT deframer (parametric; sync is REQUIRED — no silent default) ──────────────────────────
+# BENCH/SPEC-CONFIRM: the constants below are the documented Argos-2 PTT-A2 values; confirm
+# against a real 401 MHz PTT capture before trusting a bird's decode. They are deliberately NOT
+# defaults on :func:`deframe` — an 8-bit sync + a BCH that accepts ~48 % of random words would
+# flood a noise capture with false frames if applied silently; callers must spell the sync out.
 ARGOS_PTT_A2_SYNC = 0xAC          # documented bit-sync/frame-sync (placeholder length; override)
 ARGOS_PTT_A2_SYNC_BITS = 8
 
@@ -79,8 +81,8 @@ def _int_of(bits: np.ndarray) -> int:
 def deframe(
     bits,
     *,
-    sync: int = ARGOS_PTT_A2_SYNC,
-    sync_bits: int = ARGOS_PTT_A2_SYNC_BITS,
+    sync: int,
+    sync_bits: int,
     payload_bits: int = 0,
 ) -> list[bytes]:
     """Locate PTT frames in a hard-bit stream and return each decoded message as bytes.

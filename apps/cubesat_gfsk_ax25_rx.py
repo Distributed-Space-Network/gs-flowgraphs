@@ -465,21 +465,34 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     _ = started
     ctx.start()
     last_doppler = 0.0
+    # Carry the tail bits across drain boundaries so a frame straddling one isn't lost
+    # (~5-10 % of frames otherwise, at 2000-bit AX.25 frames per ~2 s drain @9k6). The
+    # carried tail re-decodes last drain's frames — drop those repeats (genuine repeat
+    # beacons are slower than one drain period, so they are kept).
+    tail = np.empty(0, dtype=np.uint8)
+    tail_bits = 4096  # ~2 max-length AX.25 frames
+    last_frames: set[bytes] = set()
     try:
         while not stop_requested.is_set():
             await asyncio.sleep(_DECODE_PERIOD_S)
             if doppler["hz"] != last_doppler:
                 last_doppler = doppler["hz"]
                 ctx.set_doppler(last_doppler)  # retune the SoapySDR source
-            bits = ctx.drain_bits()  # np.uint8 hard bits recovered by GR
+            fresh = ctx.drain_bits()  # np.uint8 hard bits recovered by GR
+            bits = np.concatenate([tail, fresh]) if tail.size else fresh
+            if bits.size:
+                tail = bits[-tail_bits:].copy()
             if framing_kind == "endurosat":
                 # Bit-level EnduroSat deframe (fallback; the dsp engine's IQ-level
                 # StreamDecoder is the proven path and the default for endurosat).
-                for body in _endurosat_deframe_bits(bits):
-                    await _emit_frame(sockets, body, framing="endurosat", output_dir=out_dir)
+                frames = list(_endurosat_deframe_bits(bits))
             else:
-                for body in framing.decode(bits, scramble=profile.scramble, nrzi=profile.nrzi):
-                    await _emit_frame(sockets, body, framing="ax25", output_dir=out_dir)
+                frames = list(
+                    framing.decode(bits, scramble=profile.scramble, nrzi=profile.nrzi))
+            for body in frames:
+                if body not in last_frames:  # tail re-decode of last drain's frame
+                    await _emit_frame(sockets, body, framing=framing_kind, output_dir=out_dir)
+            last_frames = set(frames)
     finally:
         ctx.stop()
         ctx.wait()

@@ -189,15 +189,19 @@ def connect_psk_demod(
     """Connect a coherent PSK demod chain onto ``src`` (already at the channel rate) and
     return the bit sink. ``order`` selects the constellation: 2 = BPSK, 4 = QPSK, 8 = 8-PSK.
 
-    AGC → RRC matched filter → Mueller&Müller symbol sync → Costas carrier recovery →
+    AGC → RRC matched filter → Gardner symbol sync → Costas carrier recovery →
     constellation decode → [differential decode] → (pre-diff Gray map) → unpack to hard
-    bits. Mirrors GNU Radio's own ``digital.psk.psk_demod`` so the symbol→bit mapping is
-    correct for QPSK/8-PSK (a raw bit-unpack of the symbol index would scramble the Gray code).
+    bits. Gardner (not Mueller&Müller) because timing recovery runs BEFORE carrier recovery
+    here: M&M is decision-directed and degrades under the residual rotation the FLL leaves;
+    Gardner is rotation-invariant (same choice as gr-satellites' bpsk_demodulator).
 
-    ``differential`` toggles the DxPSK differential decoder (True resolves the Costas phase
-    ambiguity, correct for DBPSK/DQPSK; pass False for true coherent BPSK/QPSK). ``offset``
-    marks OQPSK — the half-symbol I/Q stagger demod is bench build-pending, so it is currently
-    treated as QPSK (logged); confirm against a real OQPSK bird before relying on it."""
+    ``differential`` toggles the DxPSK differential decoder. For order 2 it resolves the
+    Costas phase ambiguity (correct for DBPSK; pass False for true coherent BPSK). For
+    order > 2 the index-domain diff decode does NOT implement the DQPSK phase mapping
+    (gray-baked indices are not circular phase positions), so it is SKIPPED with a warning
+    until the psk_demod-equivalent mapping is bench-validated. ``offset`` marks OQPSK —
+    the half-symbol I/Q stagger demod is bench build-pending, so it is currently treated
+    as QPSK (logged); confirm against a real OQPSK bird before relying on it."""
     sps = sample_rate / symbol_rate
     if order == 8:
         constel = digital.constellation_8psk().base()
@@ -223,7 +227,7 @@ def connect_psk_demod(
         1, gr_filter.firdes.root_raised_cosine(1.0, sample_rate, symbol_rate, excess_bw, ntaps)
     )
     sync = digital.symbol_sync_cc(
-        digital.TED_MUELLER_AND_MULLER, sps, 0.045, 1.0, 1.0, 0.05, 1,
+        digital.TED_GARDNER, sps, 0.045, 1.0, 1.0, 0.05, 1,
         constel, digital.IR_MMSE_8TAP, 128, [],
     )
     costas = digital.costas_loop_cc(0.04, order)
@@ -236,8 +240,13 @@ def connect_psk_demod(
     if lpf is not None:
         chain.append(lpf)
     chain += [agc, fll, rrc, sync, costas, decoder]
-    if differential:  # DxPSK: resolve the Costas phase ambiguity (skip for coherent BPSK/QPSK)
+    if differential and order == 2:  # DBPSK: resolves the Costas 180° ambiguity
         chain.append(digital.diff_decoder_bb(order))
+    elif differential:
+        # Index-domain diff decode is NOT the DQPSK/D8PSK phase mapping (see docstring);
+        # decode coherently and let the deframer's own polarity tolerance do what it can.
+        _log.warning("connect_psk_demod: differential decode for order %d bench-pending; "
+                     "decoding coherently", order)
     if constel.apply_pre_diff_code():
         chain.append(digital.map_bb(constel.pre_diff_code()))
     chain += [unpack, sink]
@@ -319,7 +328,10 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
 
     sensitivity = math.pi * profile.mod_index / sps  # rad/sample at full deflection
     tb = gr.top_block("cubesat_gfsk_ax25_tx_gr")
-    src = blocks.vector_source_b(bits.astype(np.uint8).tolist(), repeat=False)
+    # gfsk_mod defaults to do_unpack=True: it expects PACKED bytes and unpacks internally.
+    # Feeding unpacked 0/1 bits would make each bit 8 symbols (8x-slow, garbled waveform).
+    # np.packbits pads the tail with zero bits — harmless after the closing HDLC flags.
+    src = blocks.vector_source_b(np.packbits(bits.astype(np.uint8)).tolist(), repeat=False)
     mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=profile.bt)
     sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, sample_rate)

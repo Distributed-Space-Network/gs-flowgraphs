@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import numpy as np
 
+# ASM constant single-sourced from the CCSDS framing module (the domain owner); re-exported
+# here so FEC-layer consumers keep one import point. fec→gfsk_ax25 is the established
+# dependency direction (gfsk_ax25.ccsds imports fec only lazily inside functions — no cycle).
+from gfsk_ax25.ccsds import ASM_CCSDS
 from gfsk_ax25.crc import crc16_ccitt_false, crc32_ieee
 from gfsk_ax25.reedsolomon import RS_NSYM_255_223, RSCodec
 
@@ -86,7 +90,7 @@ def reed_solomon_decode(codeword: bytes):
 
 
 # ── CCSDS Attached Sync Marker (ASM) ─────────────────────────────────────────────────────────
-ASM_CCSDS = 0x1ACFFC1D          # standard 32-bit CCSDS TM/AOS frame sync marker
+# ASM_CCSDS is imported at the top from gfsk_ax25.ccsds (single source).
 ASM_CCSDS_BYTES = ASM_CCSDS.to_bytes(4, "big")
 
 
