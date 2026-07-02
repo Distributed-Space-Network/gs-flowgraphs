@@ -68,8 +68,9 @@ Beyond gr-satellites, the engine is a **three-registry composer** so it can demo
   **Reed-Solomon RS(255,223)** ([`gfsk_ax25/reedsolomon.py`](apps/gfsk_ax25/reedsolomon.py)); Viterbi
   / LDPC / Turbo / Golay declared for the bench / gr-satellites.
 * **Framing registry** — [`apps/framings.py`](apps/framings.py): local numpy deframers
-  (`ax25`, `endurosat`, **`argos`** BCH(31,21) PTT, **`ccsds_tm`** CCSDS TM/AOS transfer frame,
-  **`kiss`**/**`slip`** TNC), plus the whole gr-satellites vocabulary reused via a synthetic SatYAML
+  (`ax25`, `endurosat`, **`ccsds_tm`** CCSDS TM/AOS transfer frame, **`kiss`** TNC — `argos`
+  and `slip` exist as codecs but are deliberately not registry-wired, see docs/10 §7/§10),
+  plus the whole gr-satellites vocabulary reused via a synthetic SatYAML
   ([`grsat_synth.py`](apps/grsat_synth.py)).
 * **Composer** — [`apps/compose.py`](apps/compose.py): `plan_decode(rfLink)` → our-engine /
   gr-satellites / race / record-only.

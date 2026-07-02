@@ -3,8 +3,8 @@
 Two classes of framing, so the registry is the single source of "what we can deframe":
 
   * **Local (numpy, here):** ``ax25`` (G3RUH-scrambled + plain), ``endurosat``/AirMAC,
-    ``ccsds_tm``, and ``kiss``/``slip``. (``argos``/PMT-A3 exists as :mod:`gfsk_ax25.argos`
-    but is NOT wired until its real frame sync is bench-confirmed — see ``_LOCAL`` below.)
+    ``ccsds_tm``, and ``kiss``. (``argos`` and ``slip`` are deliberately NOT wired — see the
+    ``_LOCAL`` comment below.)
   * **gr-satellites (upstream):** the ~50 gr-satellites deframers (AX.100, USP, Mobitex, GEOSCAN,
     AO-40 FEC, CCSDS Concatenated/RS, NGHam, U482C, …). These are NOT re-implemented here — they
     are reused whole by handing gr-satellites a synthetic SatYAML (see
@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import numpy as np
 
-# Link layers our own engine deframes in-process (numpy). ``ccsds_tm``/``kiss``/``slip`` run
-# ONLY when explicitly requested (CCSDS TM needs per-bird channel-coding params; KISS/SLIP have
-# no checksum) — kept out of autodetect to avoid spurious/mis-parametrized runs.
+# Link layers our own engine deframes in-process (numpy). ``ccsds_tm``/``kiss`` run ONLY when
+# explicitly requested (CCSDS TM needs per-bird channel-coding params; KISS has no checksum) —
+# kept out of autodetect to avoid spurious/mis-parametrized runs.
 # ``argos`` is deliberately NOT here: its documented sync is an 8-bit PLACEHOLDER and the
 # BCH(31,21) accepts ~48% of random words, so running it floods noise captures with false
 # frames (which would even win the engine race and gate off gr-satellites). The module
@@ -38,7 +38,8 @@ _LOCAL_AUTODETECT = ("ax25", "endurosat")
 GRSATELLITES_FRAMINGS = (
     "AX.25", "AX.25 G3RUH", "AX100 Mode 5", "AX100 Mode 6", "AX100 ASM+Golay",
     "USP", "Mobitex", "Mobitex-NX", "GEOSCAN", "AO-40 FEC", "AO-40 FEC short",
-    "AO-40 uncoded", "CCSDS Concatenated", "CCSDS Reed-Solomon", "NGHam", "NGHam no Reed Solomon",
+    "AO-40 uncoded", "CCSDS Concatenated", "CCSDS Reed-Solomon", "CCSDS Uncoded",
+    "NGHam", "NGHam no Reed Solomon",
     "U482C", "SNET", "OpenLST", "Reaktor Hello World", "SMOG-P RA", "SMOG-P Signalling",
     "FX.25 NRZI", "TT-64", "SanoSat", "Grizu-263A", "AALTO-1",
 )
@@ -105,11 +106,18 @@ def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     out: list[bytes] = []
     seen_prior_phases: set[bytes] = set()
     for off in range(8):
-        phase_frames = decode(bytes(np.packbits(arr[off:])), strict=True)
+        seg = arr[off:]
+        seg = seg[: seg.size - (seg.size % 8)]  # packbits ZERO-pads the tail — the pad can
+        # fabricate a trailing 0xC0 (11000000) and promote an unterminated chunk to a
+        # "bracketed" frame with a silently truncated payload
+        phase_frames = decode(bytes(np.packbits(seg)), strict=True)
         for f in phase_frames:
             # Dedup ACROSS phases only: a real frame decodes at exactly ONE alignment, so a
             # cross-phase duplicate is chance garbage — but two identical frames at the SAME
-            # phase are a genuine fast repeat beacon and must BOTH be kept.
+            # phase are a genuine fast repeat beacon and must BOTH be kept. Known residual: a
+            # mid-window demod clock SLIP puts genuinely-distinct identical beacons at two
+            # phases; the second is deduped (one frame lost per slip — accepted, KISS has no
+            # sequence numbers to distinguish them).
             if f not in seen_prior_phases:
                 out.append(f)
         seen_prior_phases.update(phase_frames)
