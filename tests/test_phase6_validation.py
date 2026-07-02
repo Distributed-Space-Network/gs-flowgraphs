@@ -68,7 +68,9 @@ def test_framing_argos_roundtrip_module_level():
     assert frames and int.from_bytes(frames[0][:3], "big") == msg
 
 
-_ROUNDTRIPPED_FRAMINGS = {"ax25", "endurosat", "ccsds_tm", "kiss", "slip", "argos"}
+# argos round-trips at MODULE level (with an explicit sync) but is not registry-wired
+# until its real frame sync is bench-confirmed (docs/10 recheck).
+_ROUNDTRIPPED_FRAMINGS = {"ax25", "endurosat", "ccsds_tm", "kiss", "slip"}
 
 
 def test_every_local_framing_is_round_trip_validated():

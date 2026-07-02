@@ -2,9 +2,9 @@
 
 Two classes of framing, so the registry is the single source of "what we can deframe":
 
-  * **Local (numpy, here):** ``ax25`` (G3RUH-scrambled + plain), ``endurosat``/AirMAC, and
-    ``argos`` (PTT/PMT-A3 — a framing gr-satellites does NOT have; see :mod:`gfsk_ax25.argos`).
-    Each is CRC/FCS/BCH-gated, so trying several is safe.
+  * **Local (numpy, here):** ``ax25`` (G3RUH-scrambled + plain), ``endurosat``/AirMAC,
+    ``ccsds_tm``, and ``kiss``/``slip``. (``argos``/PMT-A3 exists as :mod:`gfsk_ax25.argos`
+    but is NOT wired until its real frame sync is bench-confirmed — see ``_LOCAL`` below.)
   * **gr-satellites (upstream):** the ~50 gr-satellites deframers (AX.100, USP, Mobitex, GEOSCAN,
     AO-40 FEC, CCSDS Concatenated/RS, NGHam, U482C, …). These are NOT re-implemented here — they
     are reused whole by handing gr-satellites a synthetic SatYAML (see
@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import numpy as np
 
-# Link layers our own engine deframes in-process (numpy). ``argos`` and ``ccsds_tm`` run ONLY when
-# explicitly requested (Argos' sync is a placeholder pending bench confirmation; CCSDS TM needs
-# per-bird channel-coding params) — kept out of autodetect to avoid spurious/mis-parametrized runs.
-_LOCAL = ("ax25", "endurosat", "argos", "ccsds_tm", "kiss", "slip")
+# Link layers our own engine deframes in-process (numpy). ``ccsds_tm``/``kiss``/``slip`` run
+# ONLY when explicitly requested (CCSDS TM needs per-bird channel-coding params; KISS/SLIP have
+# no checksum) — kept out of autodetect to avoid spurious/mis-parametrized runs.
+# ``argos`` is deliberately NOT here: its documented sync is an 8-bit PLACEHOLDER and the
+# BCH(31,21) accepts ~48% of random words, so running it floods noise captures with false
+# frames (which would even win the engine race and gate off gr-satellites). The module
+# (gfsk_ax25.argos) stays, fully tested, for when the real full-length sync is bench-confirmed;
+# until then an argos bird plans as record-only.
+_LOCAL = ("ax25", "endurosat", "ccsds_tm", "kiss", "slip")
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
 
 # The gr-satellites framing vocabulary (SatYAML ``framing:`` strings) reused via synthetic
@@ -74,29 +79,32 @@ def normalize_framing(label) -> str | None:
         return "ax25"  # G3RUH-scrambled and plain both tried by the deframer
     if "endurosat" in s or "airmac" in s:
         return "endurosat"
-    if "argos" in s or "pmt-a3" in s:
-        return "argos"
     if "kiss" in s:
         return "kiss"
     if "slip" in s:
         return "slip"
-    if s in ("ccsds_tm", "ccsds tm", "ccsds", "ccsds aos"):
-        return "ccsds_tm"  # bare TM/AOS chain; coded CCSDS variants stay upstream
+    if s == "ccsds_tm":
+        return "ccsds_tm"  # EXPLICIT local token only: a bare "CCSDS" label means the bird's
+        # coding is unknown — spec CCSDS uses dual-basis RS/concatenated coding our local TM
+        # chain does not implement, so those decode upstream (gr-satellites), not here.
+    # "argos"/PMT-A3: module exists but its sync is a placeholder — record-only until benched.
     return None
 
 
 def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     """Byte-oriented framings (KISS/SLIP) after a bit-level demod have an arbitrary bit phase —
-    recover it by trying all 8 alignments. KISS/SLIP carry NO checksum, so "first phase that
-    yields frames" would happily return garbage from a wrong phase (any two spurious 0xC0 bytes
-    bracket a "frame"); instead pick the phase with the MOST FEND (0xC0) delimiter bytes — the
-    correct alignment maximizes it (every real frame contributes two), a wrong one only gets
-    chance hits."""
-    candidates = [bytes(np.packbits(arr[off:])) for off in range(8)]
-    best = max(candidates, key=lambda b: b.count(0xC0))
-    if best.count(0xC0) == 0:
-        return []
-    return decode(best)
+    recover it by trying all 8 alignments and picking the phase that yields the most PLAUSIBLE
+    frames under the decoder's strict mode (FEND-bracketed both sides, minimum length, and for
+    KISS a data-frame type byte). KISS/SLIP carry NO checksum, so weaker heuristics (first phase
+    with frames, or raw FEND counts) measurably return garbage from noise — strict-mode frame
+    count is the strongest signal available, and the residual noise acceptance of an
+    unchecksummed protocol is documented in gfsk_ax25.kiss."""
+    best: list[bytes] = []
+    for off in range(8):
+        frames = decode(bytes(np.packbits(arr[off:])), strict=True)
+        if len(frames) > len(best):
+            best = frames
+    return best
 
 
 def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | None]:
@@ -108,7 +116,7 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
     A gr-satellites-only framing label (e.g. ``"USP"``, ``"AX100 ASM+Golay"``) returns
     ``([], None)`` — that link layer is decoded upstream in the gr-satellites flowgraph
     (the synthetic-SatYAML path); the two run in parallel and the first valid frame wins."""
-    from gfsk_ax25 import argos, ccsds, endurosat_link, kiss  # noqa: PLC0415
+    from gfsk_ax25 import ccsds, endurosat_link, kiss  # noqa: PLC0415
     from gfsk_ax25 import framing as ax25_framing  # noqa: PLC0415
 
     arr = np.asarray(bits, dtype=np.uint8)
@@ -126,11 +134,6 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
             frames = []
             for scramble in (True, False):
                 frames.extend(ax25_framing.decode(arr, scramble=scramble, nrzi=True))
-        elif name == "argos":
-            # Explicit only. The documented PTT-A2 sync is BENCH-CONFIRM (argos.py); until then
-            # this registry path uses it deliberately — the module API requires it be spelled out.
-            frames = argos.deframe(
-                arr, sync=argos.ARGOS_PTT_A2_SYNC, sync_bits=argos.ARGOS_PTT_A2_SYNC_BITS)
         elif name == "ccsds_tm":  # explicit only — ASM+RS(255,223)+randomize+FECF chain
             frames = ccsds.deframe_tm(arr)
         elif name == "kiss":   # byte-oriented TNC framing — all 8 bit phases tried

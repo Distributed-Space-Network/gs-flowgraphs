@@ -466,12 +466,20 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     ctx.start()
     last_doppler = 0.0
     # Carry the tail bits across drain boundaries so a frame straddling one isn't lost
-    # (~5-10 % of frames otherwise, at 2000-bit AX.25 frames per ~2 s drain @9k6). The
-    # carried tail re-decodes last drain's frames — drop those repeats (genuine repeat
-    # beacons are slower than one drain period, so they are kept).
+    # (~5-10 % of frames otherwise, at 2000-bit AX.25 frames per ~2 s drain @9k6). Dedup is
+    # POSITIONAL: subtract exactly the frames the carried tail ALONE re-decodes (with
+    # multiplicity) — a payload-set dedup would permanently suppress genuine repeat beacons,
+    # which re-decode out of the tail every drain.
     tail = np.empty(0, dtype=np.uint8)
     tail_bits = 4096  # ~2 max-length AX.25 frames
-    last_frames: set[bytes] = set()
+
+    def _decode(bits_arr):
+        if framing_kind == "endurosat":
+            # Bit-level EnduroSat deframe (fallback; the dsp engine's IQ-level
+            # StreamDecoder is the proven path and the default for endurosat).
+            return list(_endurosat_deframe_bits(bits_arr))
+        return list(framing.decode(bits_arr, scramble=profile.scramble, nrzi=profile.nrzi))
+
     try:
         while not stop_requested.is_set():
             await asyncio.sleep(_DECODE_PERIOD_S)
@@ -479,20 +487,17 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
                 last_doppler = doppler["hz"]
                 ctx.set_doppler(last_doppler)  # retune the SoapySDR source
             fresh = ctx.drain_bits()  # np.uint8 hard bits recovered by GR
-            bits = np.concatenate([tail, fresh]) if tail.size else fresh
+            prev_tail = tail
+            bits = np.concatenate([prev_tail, fresh]) if prev_tail.size else fresh
             if bits.size:
                 tail = bits[-tail_bits:].copy()
-            if framing_kind == "endurosat":
-                # Bit-level EnduroSat deframe (fallback; the dsp engine's IQ-level
-                # StreamDecoder is the proven path and the default for endurosat).
-                frames = list(_endurosat_deframe_bits(bits))
-            else:
-                frames = list(
-                    framing.decode(bits, scramble=profile.scramble, nrzi=profile.nrzi))
+            frames = _decode(bits)
+            if prev_tail.size:
+                for body in _decode(prev_tail):  # already emitted last drain
+                    if body in frames:
+                        frames.remove(body)
             for body in frames:
-                if body not in last_frames:  # tail re-decode of last drain's frame
-                    await _emit_frame(sockets, body, framing=framing_kind, output_dir=out_dir)
-            last_frames = set(frames)
+                await _emit_frame(sockets, body, framing=framing_kind, output_dir=out_dir)
     finally:
         ctx.stop()
         ctx.wait()

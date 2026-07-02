@@ -190,7 +190,6 @@ class _FallbackDemod:
         self._locked: str | None = None  # framing discovered this pass when no hint was given
         self._hits: dict[str, int] = {}  # per-framing match count, to lock only on a confident one
         self._tail = np.empty(0, dtype=np.uint8)  # bits carried across drain boundaries
-        self._last_frames: set[bytes] = set()  # frames from the previous drain (tail re-decodes)
 
     def drain_frames(self) -> list[bytes]:
         # Backend gave the framing → use only that. Otherwise try all; once ONE framing has
@@ -198,17 +197,26 @@ class _FallbackDemod:
         # the rest of the pass so a spurious early match can't strand the real framing.
         use = self._framing or self._locked
         fresh = self._sink.drain()
-        bits = np.concatenate([self._tail, fresh]) if self._tail.size else fresh
+        prev_tail = self._tail
+        bits = np.concatenate([prev_tail, fresh]) if prev_tail.size else fresh
         self._tail = bits[-self._TAIL_BITS:].copy() if bits.size else self._tail
         frames, matched = framings.deframe(bits, use)
-        if matched and self._framing is None and self._locked is None:
+        # POSITIONAL dedup of the carry-over: frames decodable from the carried tail ALONE were
+        # already returned last drain — subtract exactly those, WITH multiplicity. (A payload-set
+        # dedup would permanently suppress genuine repeat beacons: an identical beacon re-decodes
+        # out of the tail every drain, refreshing the set forever.)
+        out = list(frames)
+        if prev_tail.size:
+            already, _ = framings.deframe(prev_tail, use)
+            for f in already:
+                if f in out:
+                    out.remove(f)  # one occurrence per tail re-decode
+        # Lock-counting uses only NEW frames: a single CRC fluke re-decoding out of the tail
+        # must not count twice and defeat the two-independent-hits guard.
+        if matched and out and self._framing is None and self._locked is None:
             self._hits[matched] = self._hits.get(matched, 0) + 1
             if self._hits[matched] >= self._LOCK_AFTER:
                 self._locked = matched
-        # The carried tail re-decodes frames already returned last drain — drop those repeats
-        # (genuine repeat beacons are slower than one ~2 s drain, so they are kept).
-        out = [f for f in frames if f not in self._last_frames]
-        self._last_frames = set(frames)
         return out
 
 

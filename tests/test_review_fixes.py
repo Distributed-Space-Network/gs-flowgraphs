@@ -26,8 +26,10 @@ from gfsk_ax25.reedsolomon import RSCodec
         ("AX.25 G3RUH", "ax25"), ("AX.25", "ax25"), ("ax25", "ax25"), ("APRS", "ax25"),
         ("EnduroSat", "endurosat"), ("AirMAC", "endurosat"),
         ("KISS", "kiss"), ("SLIP", "slip"),
-        ("ccsds_tm", "ccsds_tm"), ("CCSDS", "ccsds_tm"),
-        ("Argos PTT-A2", "argos"),
+        ("ccsds_tm", "ccsds_tm"),
+        # bare "CCSDS" = unknown coding (spec birds use dual-basis RS/concatenated we don't
+        # implement locally) -> upstream; argos = placeholder sync -> record-only until benched
+        ("CCSDS", None), ("Argos PTT-A2", None),
         # NOT local: AX.100 is not AX.25; FX.25 needs its RS layer; coded CCSDS variants;
         # gr-satellites-only vocabularies; garbage.
         ("AX100 ASM+Golay", None), ("FX.25 NRZI", None), ("CCSDS Concatenated", None),
@@ -151,3 +153,45 @@ def test_ook_gate_keeps_real_signal_and_can_be_disabled():
     # gate off -> noise slices to (garbage) bits rather than being rejected
     noise = rng.normal(0, 1, 800) + 1j * rng.normal(0, 1, 800)
     assert ook.demodulate(noise, sps=8, min_separation=0).size == 100
+
+
+# ── recheck round 2: KISS/SLIP strict mode (docs/10 ledger, adversarial recheck) ─────────────
+def test_kiss_noise_acceptance_is_bounded():
+    # KISS has no checksum, so noise acceptance can be reduced but NOT eliminated (there is
+    # nothing to verify). Pre-recheck a single noise drain emitted ~17 garbage "frames"; strict
+    # mode (bracketed both sides + data type byte + valid escapes + min length) must keep it to
+    # ~1 per drain window. (No race-poisoning risk: KISS is not gr-satellites vocabulary, so a
+    # KISS bird never races gr-satellites.)
+    total = 0
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        noise_bits = rng.integers(0, 2, 2400 * 8).astype(np.uint8)
+        frames, _ = framings.deframe(noise_bits, "KISS")
+        assert len(frames) <= 3, f"seed {seed}: {len(frames)} garbage frames in one window"
+        total += len(frames)
+    assert total <= 25  # ~1/window residual; the pre-recheck behavior would be ~340 here
+
+
+def test_kiss_real_frame_recovered_from_noise_surroundings():
+    # A real KISS frame embedded in noise must still be recovered at the correct phase: strict
+    # gating suppresses the wrong phases' chance frames, so the real phase wins the count.
+    rng = np.random.default_rng(4)
+    payload = b"real-kiss-frame-payload-123456"
+    wire = kiss.kiss_encode(payload)
+    lead = rng.integers(0, 256, 64, dtype=np.uint8).tobytes().replace(b"\xc0", b"\x00")
+    tail_noise = rng.integers(0, 256, 64, dtype=np.uint8).tobytes().replace(b"\xc0", b"\x00")
+    bits = np.unpackbits(np.frombuffer(lead + wire + tail_noise, dtype=np.uint8))
+    frames, matched = framings.deframe(bits, "kiss")
+    assert matched == "kiss" and payload in frames
+
+
+def test_kiss_strict_mode_gates():
+    # bracketed-both-sides: a trailing partial (no closing FEND) is dropped in strict mode
+    partial = kiss.kiss_encode(b"complete-frame-x")[:-1] + b"\x00\x01"
+    assert kiss.kiss_decode(partial, strict=True) == []
+    # non-data type byte dropped; short payload dropped
+    wire = bytes([kiss.FEND, 0x06]) + b"longenoughpayload" + bytes([kiss.FEND])
+    assert kiss.kiss_decode(wire, strict=True) == []
+    short = kiss.kiss_encode(b"tiny")
+    assert kiss.kiss_decode(short, strict=True) == []
+    assert kiss.kiss_decode(short) == [b"tiny"]  # non-strict unchanged
