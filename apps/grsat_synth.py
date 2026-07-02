@@ -48,6 +48,10 @@ def _grsat_framing(framing) -> bool:
         return False
     if s in {f.lower() for f in framings.grsatellites_framings()}:
         return True
+    if s == "ccsds":
+        return False  # gr-satellites has only QUALIFIED CCSDS labels (Reed-Solomon/
+        # Concatenated/Uncoded/...) — a bare "CCSDS" would fail its constructor, so the
+        # plan must not claim it synthesizable (the bird is record-only).
     return any(n in s for n in _GRSAT_NEEDLES)
 
 

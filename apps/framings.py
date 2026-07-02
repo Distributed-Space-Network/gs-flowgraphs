@@ -83,28 +83,30 @@ def normalize_framing(label) -> str | None:
         return "kiss"
     if "slip" in s:
         return "slip"
-    if s == "ccsds_tm":
-        return "ccsds_tm"  # EXPLICIT local token only: a bare "CCSDS" label means the bird's
-        # coding is unknown — spec CCSDS uses dual-basis RS/concatenated coding our local TM
-        # chain does not implement, so those decode upstream (gr-satellites), not here.
+    # NOTE: the explicit local token "ccsds_tm" is handled by the _LOCAL early-return above.
+    # A bare/coded "CCSDS" LABEL never maps locally: spec CCSDS uses dual-basis RS/concatenated
+    # coding our local TM chain does not implement — those decode upstream (gr-satellites).
     # "argos"/PMT-A3: module exists but its sync is a placeholder — record-only until benched.
     return None
 
 
 def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     """Byte-oriented framings (KISS/SLIP) after a bit-level demod have an arbitrary bit phase —
-    recover it by trying all 8 alignments and picking the phase that yields the most PLAUSIBLE
-    frames under the decoder's strict mode (FEND-bracketed both sides, minimum length, and for
-    KISS a data-frame type byte). KISS/SLIP carry NO checksum, so weaker heuristics (first phase
-    with frames, or raw FEND counts) measurably return garbage from noise — strict-mode frame
-    count is the strongest signal available, and the residual noise acceptance of an
-    unchecksummed protocol is documented in gfsk_ax25.kiss."""
-    best: list[bytes] = []
+    recover by decoding ALL 8 alignments in strict mode and returning the deduped UNION. Picking
+    a single "best" phase (by frame count or FEND density) measurably LOSES the real frame ~10%
+    of the time under noise: a wrong phase's chance frames can tie or beat the true phase's
+    count. The union never loses the real frame (its phase is always included); the cost is that
+    wrong phases can contribute a little extra chance garbage — KISS/SLIP carry NO checksum, so
+    some noise acceptance is irreducible (quantified in gfsk_ax25.kiss and the regression test).
+    """
+    out: list[bytes] = []
+    seen: set[bytes] = set()
     for off in range(8):
-        frames = decode(bytes(np.packbits(arr[off:])), strict=True)
-        if len(frames) > len(best):
-            best = frames
-    return best
+        for f in decode(bytes(np.packbits(arr[off:])), strict=True):
+            if f not in seen:
+                seen.add(f)
+                out.append(f)
+    return out
 
 
 def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | None]:

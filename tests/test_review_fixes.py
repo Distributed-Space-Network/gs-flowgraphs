@@ -159,17 +159,19 @@ def test_ook_gate_keeps_real_signal_and_can_be_disabled():
 def test_kiss_noise_acceptance_is_bounded():
     # KISS has no checksum, so noise acceptance can be reduced but NOT eliminated (there is
     # nothing to verify). Pre-recheck a single noise drain emitted ~17 garbage "frames"; strict
-    # mode (bracketed both sides + data type byte + valid escapes + min length) must keep it to
-    # ~1 per drain window. (No race-poisoning risk: KISS is not gr-satellites vocabulary, so a
-    # KISS bird never races gr-satellites.)
+    # mode (bracketed both sides + data type byte + valid escapes + min length + non-constant
+    # payload) with the ALL-PHASES UNION keeps it to ~2 per drain window — the union trades a
+    # little extra chance garbage for NEVER losing the real frame (a single-phase pick lost it
+    # ~10% of the time under noise). No race-poisoning risk: KISS is not gr-satellites
+    # vocabulary, so a KISS bird never races gr-satellites.
     total = 0
     for seed in range(20):
         rng = np.random.default_rng(seed)
         noise_bits = rng.integers(0, 2, 2400 * 8).astype(np.uint8)
         frames, _ = framings.deframe(noise_bits, "KISS")
-        assert len(frames) <= 3, f"seed {seed}: {len(frames)} garbage frames in one window"
+        assert len(frames) <= 6, f"seed {seed}: {len(frames)} garbage frames in one window"
         total += len(frames)
-    assert total <= 25  # ~1/window residual; the pre-recheck behavior would be ~340 here
+    assert total <= 55  # ~2/window residual; the pre-recheck behavior would be ~340 here
 
 
 def test_kiss_real_frame_recovered_from_noise_surroundings():
@@ -195,3 +197,24 @@ def test_kiss_strict_mode_gates():
     short = kiss.kiss_encode(b"tiny")
     assert kiss.kiss_decode(short, strict=True) == []
     assert kiss.kiss_decode(short) == [b"tiny"]  # non-strict unchanged
+
+
+def test_kiss_constant_idle_fill_between_frames_is_rejected():
+    # An idle gap of constant bytes between two frames is FEND-bracketed, type-0, escape-valid
+    # and long enough — without the non-constant gate it emitted one deterministic garbage
+    # "frame" per drain, forever (and positional dedup cannot subtract a chunk that was
+    # unbracketed in the previous tail).
+    wire = kiss.kiss_encode(b"first-frame-payload") + b"\x00" * 40 + kiss.kiss_encode(
+        b"second-frame-payload")
+    frames = kiss.kiss_decode(wire, strict=True)
+    assert frames == [b"first-frame-payload", b"second-frame-payload"]
+
+
+def test_bare_ccsds_label_is_not_synthesizable():
+    # gr-satellites has only QUALIFIED CCSDS labels; a bare "CCSDS" would fail its constructor,
+    # so the plan must say record-only rather than claim gr-satellites(synthetic).
+    assert not grsat_synth.can_synthesize("bpsk", 1200, "CCSDS")
+    assert grsat_synth.can_synthesize("bpsk", 1200, "CCSDS Concatenated")
+    plan = compose.plan_decode(
+        {"modulation": "bpsk", "symbol_rate_hz": 1200, "framing": "CCSDS"})
+    assert not plan.decodable  # record-only (+ the IQ recording, always)

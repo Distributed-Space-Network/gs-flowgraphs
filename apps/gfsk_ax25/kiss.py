@@ -83,8 +83,8 @@ def kiss_decode(stream: bytes, *, strict: bool = False) -> list[bytes]:
         payload = _unescape(chunk[1:], strict=strict)  # drop the command/port byte
         if payload is None:  # invalid escape sequence — protocol violation
             continue
-        if strict and len(payload) < _STRICT_MIN_PAYLOAD:
-            continue
+        if strict and (len(payload) < _STRICT_MIN_PAYLOAD or len(set(payload)) < 2):
+            continue  # too short, or constant idle fill (0x00 runs between frames) — not data
         if payload:
             out.append(payload)
     return out
@@ -108,8 +108,8 @@ def slip_decode(stream: bytes, *, strict: bool = False) -> list[bytes]:
         payload = _unescape(chunk, strict=strict)
         if payload is None:  # invalid escape sequence — protocol violation
             continue
-        if strict and len(payload) < _STRICT_MIN_PAYLOAD:
-            continue
+        if strict and (len(payload) < _STRICT_MIN_PAYLOAD or len(set(payload)) < 2):
+            continue  # too short, or constant idle fill — not data
         if payload:
             out.append(payload)
     return out
