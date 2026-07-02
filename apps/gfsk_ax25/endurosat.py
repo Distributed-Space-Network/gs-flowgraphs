@@ -86,9 +86,28 @@ def receive(
     recover_timing: bool = True,
 ) -> list[bytes]:
     """Baseband IQ -> list of valid AX.25 frame bodies (downlink/beacon)."""
+    return [
+        body
+        for body, _ in receive_with_offsets(
+            iq, sample_rate_hz, profile=profile, recover_timing=recover_timing
+        )
+    ]
+
+
+def receive_with_offsets(
+    iq: np.ndarray,
+    sample_rate_hz: float,
+    *,
+    profile: LinkProfile | None = None,
+    recover_timing: bool = True,
+) -> list[tuple[bytes, int]]:
+    """:func:`receive`, with each frame's opening-flag BIT index in the
+    demodulated stream. Bit index * samples-per-symbol approximates the frame's
+    sample position in ``iq`` to within a few symbols (symbol-timing recovery
+    jitter) — the positional identity :class:`StreamDecoder` dedups on."""
     p = profile or LinkProfile()
     bits = demodulate(iq, gfsk_params(sample_rate_hz, p), recover_timing=recover_timing)
-    return framing.decode(bits, scramble=p.scramble, nrzi=p.nrzi)
+    return framing.decode_with_offsets(bits, scramble=p.scramble, nrzi=p.nrzi)
 
 
 # Drain-boundary carry, in bits: ~2 max-length AX.25 frames, mirroring the GR
@@ -97,6 +116,12 @@ def receive(
 # 64-symbol moving-mean, the matched-filter span, and Gardner lock-in).
 _TAIL_BITS = 4096
 _TAIL_SETTLE_SYMBOLS = 128
+# Positional-dedup tolerance, in symbols: two decodes of the SAME frame from
+# different windows agree on its absolute position to within symbol-timing
+# jitter (Gardner phase walk over the carried tail — a few symbols). Distinct
+# back-to-back identical beacons are >= a whole frame apart (>=160 symbols for
+# the smallest AX.25 UI frame), so 32 separates the two cases with wide margin.
+_POS_TOL_SYMBOLS = 32
 
 
 class StreamDecoder:
@@ -112,13 +137,21 @@ class StreamDecoder:
     is now per-window, so a longer capture can never re-baseline it under the
     emitted count and silently drop a frame.
 
-    Dedup is POSITIONAL (docs/10 section 7): the frames that the carried tail
-    ALONE re-decodes were emitted on a previous call, so exactly those — with
-    multiplicity — are subtracted from the window's frames. A payload-set dedup
-    would permanently suppress genuine repeat beacons, which re-decode out of
-    the tail every drain. The tail spans ~2 max-length AX.25 frames plus the
-    demod's filter/timing history, so a frame straddling a drain boundary is
-    decoded whole from the carry on the next call.
+    Dedup is POSITIONAL (docs/10 section 7): every emitted frame is remembered
+    with its ABSOLUTE sample position (opening-flag bit index * sps), and a
+    re-decoded frame is dropped only when both its payload matches AND its
+    position falls within ``_POS_TOL_SYMBOLS`` of an already-emitted one. A
+    payload-set dedup would permanently suppress genuine repeat beacons; the
+    earlier tail-SUBTRACT dedup (decode the carried tail alone, subtract its
+    frames from the window's) assumed the demod is suffix-local — it is not
+    (capture-global RMS normalization + centered moving mean), so tail-alone
+    decode could miss a frame the window decode found (subtracting a NEW frame
+    instead: loss) or find one the window decode missed (subtracting nothing:
+    ~2-3 % duplicates under mixed-amplitude chunking, docs/J MED-1). Position
+    records are pruned once they fall out of the carried tail, so memory stays
+    bounded. The tail spans ~2 max-length AX.25 frames plus the demod's
+    filter/timing history, so a frame straddling a drain boundary is decoded
+    whole from the carry on the next call.
 
     Call ``decode_new`` on a timer (e.g. every few seconds) rather than per
     chunk; the app drives the cadence. ``push`` may run on a different thread
@@ -136,8 +169,11 @@ class StreamDecoder:
         self._sr = sample_rate_hz
         self._profile = profile or LinkProfile()
         self._recover_timing = recover_timing
-        sps = sample_rate_hz / self._profile.symbol_rate_hz
-        self._tail_max = int((_TAIL_BITS + _TAIL_SETTLE_SYMBOLS) * sps)
+        self._sps = sample_rate_hz / self._profile.symbol_rate_hz
+        self._tail_max = int((_TAIL_BITS + _TAIL_SETTLE_SYMBOLS) * self._sps)
+        self._pos_tol = int(_POS_TOL_SYMBOLS * self._sps)
+        self._consumed = 0  # absolute sample index just past the previous window
+        self._emitted: list[tuple[bytes, int]] = []  # (payload, absolute sample pos)
         self._lock = threading.Lock()
         self._chunks: list[np.ndarray] = []
         self._tail = np.empty(0, dtype=np.complex64)
@@ -155,20 +191,26 @@ class StreamDecoder:
         fresh = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
         tail = self._tail
         window = np.concatenate([tail, fresh]) if len(tail) else fresh
-        frames = receive(
+        window_start = self._consumed - len(tail)  # absolute pos of window[0]
+        out: list[bytes] = []
+        for body, bit_off in receive_with_offsets(
             window, self._sr, profile=self._profile, recover_timing=self._recover_timing
-        )
-        if len(tail):
-            for body in receive(
-                tail, self._sr, profile=self._profile, recover_timing=self._recover_timing
+        ):
+            pos = window_start + int(round(bit_off * self._sps))
+            if any(
+                body == prev_body and abs(pos - prev_pos) <= self._pos_tol
+                for prev_body, prev_pos in self._emitted
             ):
-                # Decoded from the carried samples alone => emitted on a previous
-                # call. Subtract WITH multiplicity (positional dedup) so genuine
-                # repeat beacons in the fresh samples still emit.
-                if body in frames:
-                    frames.remove(body)
+                continue  # the same frame, re-decoded out of the carried tail
+            self._emitted.append((body, pos))
+            out.append(body)
+        self._consumed += len(fresh)
         self._tail = window[-self._tail_max :].copy()
-        return frames
+        # A frame whose samples have left the carried tail can never re-decode:
+        # prune its record (bounded memory across a pass).
+        horizon = self._consumed - len(self._tail) - self._pos_tol
+        self._emitted = [(b, p) for b, p in self._emitted if p >= horizon]
+        return out
 
     def flush(self) -> list[bytes]:
         return self.decode_new()
@@ -187,5 +229,6 @@ __all__ = [
     "StreamDecoder",
     "gfsk_params",
     "receive",
+    "receive_with_offsets",
     "transmit",
 ]

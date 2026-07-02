@@ -88,6 +88,14 @@ def deframe(bits: np.ndarray) -> list[bytes]:
     byte-aligned fragments whose FCS verifies. Robust to preamble flag runs,
     bit offset, and trailing noise.
     """
+    return [body for body, _ in deframe_with_offsets(bits)]
+
+
+def deframe_with_offsets(bits: np.ndarray) -> list[tuple[bytes, int]]:
+    """Like :func:`deframe`, but each frame comes with the bit index of its
+    OPENING flag in ``bits`` — the positional identity a stream decoder needs to
+    tell "the same frame re-decoded from a carried tail" apart from "a genuinely
+    new, identical repeat beacon" (docs/J MED-1)."""
     bl = np.asarray(bits, dtype=np.uint8).tolist()
     n = len(bl)
     flag = list(FLAG_BITS)
@@ -103,7 +111,7 @@ def deframe(bits: np.ndarray) -> list[bytes]:
         else:
             i += 1
 
-    frames: list[bytes] = []
+    frames: list[tuple[bytes, int]] = []
     for k in range(len(starts) - 1):
         start = starts[k] + 8
         end = starts[k + 1]
@@ -114,7 +122,7 @@ def deframe(bits: np.ndarray) -> list[bytes]:
             continue
         body_fcs = bits_to_bytes(np.array(content, dtype=np.uint8))
         if len(body_fcs) >= _MIN_FRAME_OCTETS and fcs.check(body_fcs):
-            frames.append(body_fcs[:-2])
+            frames.append((body_fcs[:-2], starts[k]))
     return frames
 
 
@@ -124,5 +132,6 @@ __all__ = [
     "bits_to_bytes",
     "bytes_to_bits",
     "deframe",
+    "deframe_with_offsets",
     "frame",
 ]

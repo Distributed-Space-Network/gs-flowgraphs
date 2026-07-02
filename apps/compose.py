@@ -33,7 +33,8 @@ class DecodePlan:
     fec: str | None
     tier: int | None            # modem tier (1/2/3) or None if the modulation is unrecognized
     our_modem: bool             # our modem registry recognizes the modulation
-    our_framing: bool           # a local numpy deframer handles the framing
+    our_framing: bool           # a local numpy deframer handles the framing (no label →
+                                # the CRC-gated autodetect set, matching the engine)
     our_crc_gated: bool         # that deframer has a real integrity check (may win the race)
     grsat_catalogued: bool      # gr-satellites has a SatYAML for this bird
     grsat_synthesizable: bool   # a synthetic SatYAML can be built (FSK/BPSK/AFSK + framing + baud)
@@ -93,7 +94,18 @@ def plan_decode(params: dict | None, *, catalogued: bool = False) -> DecodePlan:
     spec = modem.modulation_spec(modulation) if modulation else None
     # A framing is "ours" when the registry normalizes it to a LOCAL deframer — this accepts
     # backend/SatYAML labels verbatim ("AX.25 G3RUH" → ax25), not just local tokens.
-    our_framing = framings.normalize_framing(framing) is not None
+    if framing is not None:
+        our_framing = framings.normalize_framing(framing) is not None
+        our_crc_gated = framings.is_crc_gated(framing)
+    else:
+        # No framing label: the engine still builds modulation fallbacks and
+        # framings.deframe AUTODETECTS across the registry's autodetect set, so the plan
+        # must report the same — the race exists, and ours can win exactly when every
+        # autodetected framing is CRC-gated (it is, by the registry's construction).
+        # Derived from the same registry tuple the engine consumes (docs/J LOW-2).
+        auto = framings.autodetect_framings()
+        our_framing = bool(auto)
+        our_crc_gated = bool(auto) and all(framings.is_crc_gated(f) for f in auto)
     return DecodePlan(
         modulation=modulation,
         symbol_rate=baud,
@@ -102,7 +114,7 @@ def plan_decode(params: dict | None, *, catalogued: bool = False) -> DecodePlan:
         tier=spec.tier if spec else None,
         our_modem=spec is not None,
         our_framing=our_framing,
-        our_crc_gated=framings.is_crc_gated(framing),  # single source: the framings registry
+        our_crc_gated=our_crc_gated,  # single source: the framings registry (see above)
         grsat_catalogued=bool(catalogued),
         grsat_synthesizable=grsat_synth.can_synthesize(modulation, baud, framing),
     )

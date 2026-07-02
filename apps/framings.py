@@ -62,6 +62,14 @@ def grsatellites_framings() -> tuple[str, ...]:
     return GRSATELLITES_FRAMINGS
 
 
+def autodetect_framings() -> tuple[str, ...]:
+    """Local framings :func:`deframe` tries when NO framing label is given (all CRC-gated by
+    construction — see the ``_LOCAL_AUTODETECT`` comment). The composer derives the
+    absent-framing decode plan from this same tuple so plan and engine cannot drift
+    (docs/J LOW-2)."""
+    return _LOCAL_AUTODETECT
+
+
 def crc_gated_framings() -> tuple[str, ...]:
     """Local framings whose deframer validates a real integrity check (FCS/CRC/RS) — the only
     ones allowed to declare an engine-race win (docs/10 MED-1)."""

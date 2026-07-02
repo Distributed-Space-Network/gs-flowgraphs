@@ -97,6 +97,43 @@ def test_per_element_gains() -> None:
     assert "gain_default" not in applied
 
 
+def test_per_element_gains_win_over_overall_gain() -> None:
+    # docs/J LOW-3: SoapySDR's overall setGain RE-DISTRIBUTES across elements,
+    # so applying it after the per-element staging overrides the staging. The
+    # documented precedence (sdr_env: GAINS wins over GAIN_DB) means the overall
+    # gain must not be applied at all when per-element gains took effect.
+    src = FakeSoapy()
+    applied = configure_soapy_source(
+        src, {"sdr_gains": {"PAD": 40, "IAMP": 6}, "sdr_gain_db": 20.0}
+    )
+    assert (0, "PAD", 40.0) in src.gains
+    assert (0, "IAMP", 6.0) in src.gains
+    assert (0, 20.0) not in src.gains  # overall NOT applied on top of the staging
+    assert applied["gains"] == {"PAD": 40.0, "IAMP": 6.0}
+    assert "gain_db" not in applied and "gain_default" not in applied
+
+
+def test_env_gains_plus_gain_db_apply_only_the_staging(monkeypatch) -> None:
+    # Same precedence through the station-env merge path (the probe's M1 seam).
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_GAINS", "PAD=40,IAMP=6")
+    monkeypatch.setenv("GS_SDR_GAIN_DB", "20")
+    src = FakeSoapy()
+    configure_soapy_source(src, merge_sdr_params({}))
+    assert (0, "PAD", 40.0) in src.gains and (0, "IAMP", 6.0) in src.gains
+    assert all(len(call) != 2 for call in src.gains)  # no overall set_gain call
+
+
+def test_overall_gain_still_applies_when_gains_dict_is_all_garbage() -> None:
+    # A gains dict with no usable entry must not eat the overall gain.
+    src = FakeSoapy()
+    applied = configure_soapy_source(
+        src, {"sdr_gains": {"LNA": "loud", 7: 3}, "sdr_gain_db": 18.0}
+    )
+    assert src.gains == [(0, 18.0)]
+    assert applied["gain_db"] == 18.0 and "gains" not in applied
+
+
 def test_agc_on_suppresses_default_gain() -> None:
     src = FakeSoapy()
     applied = configure_soapy_source(src, {"sdr_agc": True})

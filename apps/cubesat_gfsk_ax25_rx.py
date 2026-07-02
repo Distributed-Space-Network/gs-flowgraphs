@@ -450,6 +450,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
     reader_task = loop.run_in_executor(None, _reader)
 
     async def _decode_loop() -> None:
+        decode_errors = 0
         while not stop_requested.is_set():
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(stop_requested.wait(), _DECODE_PERIOD_S)
@@ -458,7 +459,22 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             # Decode OFF the event loop (docs/10 MED-3): a long demod must never
             # stall command/status handling. The decoders lock their chunk
             # hand-off, so pushes from the loop thread stay safe meanwhile.
-            for body in await asyncio.to_thread(decoder.decode_new):
+            try:
+                bodies = await asyncio.to_thread(decoder.decode_new)
+            except Exception:  # noqa: BLE001 — docs/J HIGH-1: a decoder bug must
+                # not end live decode. Unhandled, this task's exception would
+                # vanish into gather(return_exceptions=True) below and every
+                # later drain of the pass would be silently dropped. Log it
+                # (rate-limited: one bad window tends to mean many) and keep
+                # draining — the decoder's buffer hand-off already completed, so
+                # the next drain starts clean.
+                decode_errors += 1
+                if decode_errors <= 3 or decode_errors % 50 == 0:
+                    log.exception(
+                        "decode_new failed (error #%d); decode loop continues", decode_errors
+                    )
+                continue
+            for body in bodies:
                 await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
@@ -480,7 +496,12 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
         # decode_new already consumed from the buffer in its worker thread. The
         # loop wakes promptly on stop_requested; then flush the remainder.
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
-        for body in await asyncio.to_thread(decoder.flush):
+        try:
+            leftovers = await asyncio.to_thread(decoder.flush)
+        except Exception:  # noqa: BLE001 — docs/J HIGH-1: never die invisibly
+            log.exception("final flush decode failed; frames in the last window not emitted")
+            leftovers = []
+        for body in leftovers:
             await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
 
 
@@ -499,6 +520,7 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
 
     from gfsk_ax25 import framing
 
+    log = logging.getLogger("cubesat_gfsk_ax25_rx")
     framing_kind = _select_framing(params)
     out_dir = getattr(args, "output_dir", None)  # frames.jsonl alongside the IQ
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
@@ -560,6 +582,23 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     finally:
         ctx.stop()
         ctx.wait()
+        # Final drain at stop (docs/J LOW-4, mirroring the dsp engine's flush):
+        # bits recovered in the last <=_DECODE_PERIOD_S — the LOS end of the pass
+        # — still sit in the GR sink when stop lands. Stop/wait first so GR has
+        # flushed its pipeline, then decode once more with the same tail-carry
+        # dedup as the loop body. A decode error here must not break teardown.
+        try:
+            fresh = ctx.drain_bits()
+            bits = np.concatenate([tail, fresh]) if tail.size else fresh
+            frames = _decode(bits)
+            if tail.size:
+                for body in _decode(tail):  # already emitted on the last drain
+                    if body in frames:
+                        frames.remove(body)
+            for body in frames:
+                await _emit_frame(sockets, body, framing=framing_kind, output_dir=out_dir)
+        except Exception:  # noqa: BLE001 — docs/J HIGH-1: never die invisibly
+            log.exception("final GR drain failed; frames from the last window not emitted")
 
 
 # ----------------------------------------------------------------------

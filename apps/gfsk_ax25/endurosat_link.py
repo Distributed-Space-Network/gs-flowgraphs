@@ -175,16 +175,29 @@ def receive(
 
 
 def find_bursts(
-    iq: np.ndarray, sample_rate_hz: float, *, min_ms: float = 2.0, threshold_mult: float = 4.0
+    iq: np.ndarray,
+    sample_rate_hz: float,
+    *,
+    min_ms: float = 2.0,
+    threshold_mult: float = 4.0,
+    threshold: float | None = None,
 ) -> list[tuple[int, int]]:
-    """(start, end) sample indices of on-air bursts via a magnitude gate."""
+    """(start, end) sample indices of on-air bursts via a magnitude gate.
+
+    ``threshold`` (absolute) overrides the capture-local estimate — the
+    :class:`StreamDecoder` passes its persistent noise-floor gate so a
+    signal-dense window can't re-baseline the gate (docs/J HIGH-2). Without it
+    the noise floor comes from a low percentile of THIS capture, so the caller
+    must ensure the capture is mostly-quiet (>=10 % off-air). The former
+    ``mag.max()*0.08`` relative term is gone (docs/J MED-2): it masked any burst
+    weaker than 1/12.5 of the strongest one sharing the capture. A percentile
+    floor pulled up by a spur can only ADD false bursts, and those fail CRC in
+    ``receive`` — wasted demod cycles, never wrong output.
+    """
     mag = np.abs(np.asarray(iq))
     if len(mag) == 0:
         return []
-    # Noise floor from a low percentile (robust whether bursts are sparse, as in
-    # a 10 s capture, or dense); median would overshoot when signal isn't sparse.
-    floor = float(np.percentile(mag, 10))
-    thr = max(floor * threshold_mult, float(mag.max()) * 0.08)
+    thr = float(np.percentile(mag, 10)) * threshold_mult if threshold is None else threshold
     on = (mag > thr).astype(np.int8)
     d = np.diff(on, prepend=0, append=0)
     starts = np.flatnonzero(d == 1)
@@ -202,6 +215,19 @@ _MIN_FRAME_BITS = 6 * 8
 # ~= 114 ms at 9k6) so real packet trains are never force-cut, yet it bounds the
 # retained IQ if a continuous carrier/interferer holds the gate open.
 _MAX_DEFER_S = 5.0
+# Persistent noise-floor estimator (docs/J HIGH-2). The per-window candidate is
+# the quietest ~1 ms block's low percentile, so any >=1 ms off-air gap in the
+# window reads the true floor even when >90 % of the window is signal (where a
+# whole-window percentile lands ON the constant GFSK envelope and gates every
+# burst out). Same gate multiplier as ``find_bursts``.
+_FLOOR_BLOCK_MS = 1.0
+_FLOOR_GATE_MULT = 4.0
+_FLOOR_EMA_ALPHA = 0.25
+# A window whose 90th/10th magnitude percentiles are this close is a constant
+# envelope (wall-to-wall signal): complex-Gaussian noise spans ~4.7x between
+# those percentiles, GFSK ~1x. Used only to refuse a signal-level floor SEED
+# when the pass starts mid-transmission.
+_FLAT_ENVELOPE_RATIO = 2.0
 
 
 class StreamDecoder:
@@ -215,18 +241,35 @@ class StreamDecoder:
 
     No-loss / no-duplicate argument (docs/10 review, HIGH-1): every sample is
     burst-gated and decoded EXACTLY ONCE — each call decodes a window of new
-    samples and then discards it. The gate threshold (``find_bursts``: noise
-    floor vs. ``mag.max()*0.08``) therefore adapts only WITHIN one window and can
-    never re-baseline an earlier, already-emitted decode. The old whole-capture
-    redecode + count-based dedup was NOT prefix-stable: a strong culmination
-    burst raised ``mag.max()`` over the whole growing capture, pushed an earlier
-    weak (already-emitted) burst below the gate, and the ``frames[emitted:]``
-    slice then silently dropped one new frame forever. The only samples seen by
-    two windows are the ``_carry`` samples kept for gate/settling context, and
+    samples and then discards it. The gate threshold is a PERSISTENT noise-floor
+    estimate times the gate multiplier (docs/J HIGH-2), never a window-local
+    statistic: a window filled >90 % by a continuous packet train (the AirMAC
+    bulk-download profile) pushes any window-local percentile up to the constant
+    GFSK envelope, which turned the gate to 4x signal and silently discarded the
+    whole train — and the deferral then concentrated the ON region into the next
+    window, making it worse. The floor updates per window from the quietest ~1 ms
+    block: downward immediately (signal only ever biases the candidate UP),
+    upward by EMA and only when the candidate is below the gate itself — a dense
+    window can never raise it. The old whole-capture redecode + count-based
+    dedup was NOT prefix-stable: a strong culmination burst raised the
+    whole-capture ``mag.max()`` gate term, pushed an earlier weak
+    (already-emitted) burst below the gate, and the ``frames[emitted:]`` slice
+    then silently dropped one new frame forever. The only samples seen by two
+    windows are the ``_carry`` samples kept for gate/settling context, and
     ``_carry`` is strictly shorter than the shortest CRC-valid frame, so the
-    overlap can never re-yield a frame => no double emission. Identical payloads
-    in different bursts are distinct frames and each is emitted (positional
-    dedup semantics, docs/10 section 7).
+    overlap can never re-yield a frame => no double emission (a re-gated carry
+    fragment is also shorter than the demod's 64-symbol kernel, which yields no
+    bits by construction — see ``gfsk.demodulate``). Identical payloads in
+    different bursts are distinct frames and each is emitted (positional dedup
+    semantics, docs/10 section 7).
+
+    Pathological start (pass begins mid-transmission): the first window is
+    wall-to-wall constant envelope, so there is no noise reference to seed the
+    floor from — seeding at signal level would gate everything out. Such windows
+    (flat envelope, no floor yet) are DEFERRED un-gated; the first window with
+    any quiet block seeds the floor and the carried train decodes. If the
+    deferral cap (or flush) lands first, the whole window is decoded as ONE
+    burst rather than discarded.
 
     A burst still above the gate at the window edge is deferred — carried whole
     into the next window so it is decoded once, complete — with the deferral
@@ -256,6 +299,8 @@ class StreamDecoder:
         min_frame = int(_MIN_FRAME_BITS * sample_rate_hz / symbol_rate_hz)
         self._carry = min(self._guard, max(min_frame - 1, 0) // 2)
         self._max_defer = int(sample_rate_hz * _MAX_DEFER_S)
+        self._floor_block = max(1, int(sample_rate_hz * _FLOOR_BLOCK_MS / 1000.0))
+        self._noise_floor: float | None = None  # persistent across windows (HIGH-2)
         self._lock = threading.Lock()
         self._chunks: list[np.ndarray] = []
         self._pending = np.empty(0, dtype=np.complex64)
@@ -281,9 +326,24 @@ class StreamDecoder:
         window = parts[0] if len(parts) == 1 else np.concatenate(parts)
         if not len(window):  # e.g. only empty chunks pushed
             return []
-        cut = len(window) if final else self._cut_point(window)
+        mag = np.abs(window)
+        thr = self._update_floor(mag)
+        if thr is None:
+            # No noise reference yet (pass started mid-transmission; window is
+            # wall-to-wall signal). Defer un-gated until a quiet block seeds the
+            # floor; past the cap (or at flush) decode the window as ONE burst —
+            # a signal-level gate would discard it instead.
+            if not final and len(window) <= self._max_defer:
+                with self._lock:
+                    self._pending = window.copy()
+                return []
+            cut = len(window)
+            bursts = [(0, len(window))]
+        else:
+            cut = len(window) if final else self._cut_point(mag, thr)
+            bursts = find_bursts(window[:cut], self._sr, threshold=thr)
         out: list[bytes] = []
-        for s, e in find_bursts(window[:cut], self._sr):
+        for s, e in bursts:
             seg = window[max(0, s - self._guard) : e + self._guard]
             out.extend(
                 receive(
@@ -301,18 +361,47 @@ class StreamDecoder:
             self._pending = keep
         return out
 
-    def _cut_point(self, window: np.ndarray) -> int:
+    def _update_floor(self, mag: np.ndarray) -> float | None:
+        """Fold this window into the persistent noise floor; return the absolute
+        gate threshold, or ``None`` while no floor can be seeded (see class
+        docstring). A floor seeded at exactly 0 (ideal silence, synthetic
+        captures) gates on "any non-zero sample", which is correct there; real
+        front-ends always present noise, so the estimate stays positive."""
+        nb = len(mag) // self._floor_block
+        if nb == 0:
+            cand = float(np.percentile(mag, 10))
+        else:
+            blocks = mag[: nb * self._floor_block].reshape(nb, self._floor_block)
+            cand = float(np.percentile(blocks, 10, axis=1).min())
+        f = self._noise_floor
+        if f is None:
+            p10, p90 = (float(v) for v in np.percentile(mag, (10, 90)))
+            if p90 < _FLAT_ENVELOPE_RATIO * p10:
+                return None  # constant envelope — signal, not a usable noise seed
+            self._noise_floor = cand
+        elif cand < f:
+            # Signal only ever biases the candidate UP: a lower reading is always
+            # closer to the true floor (and the instant-recovery path after a
+            # too-high seed).
+            self._noise_floor = cand
+        elif cand <= f * _FLOOR_GATE_MULT:
+            # Below the gate itself => consistent with the current noise regime:
+            # track slow rises (gain/AGC drift, interference) with an EMA.
+            self._noise_floor = f + _FLOOR_EMA_ALPHA * (cand - f)
+        # else: quietest block is above the gate — the window is signal-dense
+        # (packet train); it must NEVER raise the floor (HIGH-2).
+        return self._noise_floor * _FLOOR_GATE_MULT
+
+    def _cut_point(self, mag: np.ndarray, thr: float) -> int:
         """End of the fully-decodable prefix: defer an ON region touching the
-        window edge (a burst likely still arriving), capped at ``_max_defer``."""
-        mag = np.abs(window)
-        floor = float(np.percentile(mag, 10))
-        thr = max(floor * 4.0, float(mag.max()) * 0.08)  # same gate as find_bursts
+        window edge (a burst likely still arriving), capped at ``_max_defer``.
+        ``thr`` is the same persistent-floor gate ``find_bursts`` uses."""
         if mag[-1] <= thr:
-            return len(window)
+            return len(mag)
         off = np.flatnonzero(mag <= thr)
         start = int(off[-1]) + 1 if len(off) else 0
-        if len(window) - start > self._max_defer:
-            return len(window)  # continuous carrier: force-decode, bound the buffer
+        if len(mag) - start > self._max_defer:
+            return len(mag)  # continuous carrier: force-decode, bound the buffer
         return max(0, start - self._guard)
 
 

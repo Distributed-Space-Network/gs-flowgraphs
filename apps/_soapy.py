@@ -16,6 +16,8 @@ Honoured ``params`` keys (all optional):
   * ``sdr_antenna``  (str)             -- e.g. "LNAL", "RX2"; ``src.set_antenna``
   * ``sdr_agc``      (bool)            -- hardware AGC on/off; ``set_gain_mode``
   * ``sdr_gain_db``  (number)          -- overall gain; ``src.set_gain(ch, db)``
+                                          (applied only when ``sdr_gains`` is absent
+                                          -- per-element staging wins)
   * ``sdr_gains``    (dict[str,num])   -- per-element gains, e.g.
                                           {"LNA": 20, "TIA": 6, "PGA": 0}
 When none of the gain keys are given and AGC is not enabled, ``default_gain_db``
@@ -83,8 +85,13 @@ def configure_soapy_source(
         if elems:
             applied["gains"] = elems
 
+    # Per-element staging WINS over the overall gain (the documented GS_SDR_GAINS
+    # precedence — see sdr_env): SoapySDR's overall setGain re-distributes across
+    # the elements, so applying it after the staging would override it (docs/J
+    # LOW-3). Overall gain applies only when no per-element gain took effect,
+    # matching the dsp RX path's elif chain.
     overall = p.get("sdr_gain_db")
-    if _is_number(overall):
+    if not gave_gain and _is_number(overall):
         src.set_gain(channel, float(overall))  # type: ignore[arg-type]
         applied["gain_db"] = float(overall)  # type: ignore[arg-type]
         gave_gain = True

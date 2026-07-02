@@ -46,12 +46,25 @@ def decode(
     nrzi: bool = True,
 ) -> list[bytes]:
     """Received bit stream -> list of valid AX.25 frame bodies (FCS-checked)."""
+    return [body for body, _ in decode_with_offsets(bits, scramble=scramble, nrzi=nrzi)]
+
+
+def decode_with_offsets(
+    bits: np.ndarray,
+    *,
+    scramble: bool = True,
+    nrzi: bool = True,
+) -> list[tuple[bytes, int]]:
+    """:func:`decode`, with each frame's opening-flag bit index in ``bits``.
+    Descrambling and NRZI are 1:1 per-bit maps, so the index in the decoded
+    stream IS the index in the raw demodulated stream — usable as a positional
+    frame identity by the stream decoders (docs/J MED-1)."""
     out = np.asarray(bits, dtype=np.uint8)
     if scramble:
         out = g3ruh.descramble(out)
     if nrzi:
         out = g3ruh.nrzi_decode(out)
-    return hdlc.deframe(out)
+    return hdlc.deframe_with_offsets(out)
 
 
-__all__ = ["decode", "encode"]
+__all__ = ["decode", "decode_with_offsets", "encode"]

@@ -126,6 +126,15 @@ def demodulate(iq: np.ndarray, params: GfskParams, *, recover_timing: bool = Tru
     disc = np.angle(iq[1:] * np.conj(iq[:-1]))
     # Remove slow carrier/Doppler bias (window ~ many symbols).
     win = max(1, int(round(params.sps * 64)))
+    if len(disc) < win:
+        # Input shorter than the bias-removal kernel: numpy's 'same' convolution
+        # returns kernel-length output for a shorter input, so the subtraction
+        # below would broadcast-fail. No decodable frame fits in < 64 symbols
+        # (the shortest on-air packet of either link layer here — preamble/flags
+        # included — is longer), and such inputs always raised before this guard,
+        # so returning no bits rejects nothing that ever decoded: these are burst
+        # fragments (e.g. a segmenter carry), not frames.
+        return np.empty(0, dtype=np.uint8)
     disc = disc - _moving_mean(disc, win)
     # Matched filter (same Gaussian as TX).
     mf = np.convolve(disc, gaussian_taps(params), mode="same")
