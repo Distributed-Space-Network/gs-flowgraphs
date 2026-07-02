@@ -3,7 +3,8 @@
 
 Decodes a 2-GFSK, G3RUH-scrambled, AX.25-framed downlink (beacon + packets) and
 emits one ``frame_received`` status event per valid frame plus the raw frame
-bytes on the data socket (``data_format = "raw_bits"`` -> RAW_BITS artifact).
+bytes on the data socket (``data_format = "raw_bytes"`` -> gs-client's RAW_BITS
+artifact spec, an explicit key in its ``spec_for_data_format`` map).
 
 Two interchangeable engines, selected by ``--engine`` / ``GS_FLOWGRAPH_ENGINE``
 env / params-file ``engine`` key (default ``gnuradio``):
@@ -46,6 +47,7 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
+from framings import normalize_framing
 
 from gfsk_ax25 import ax25, endurosat, endurosat_link
 
@@ -81,18 +83,43 @@ def _select_engine(args, params: dict[str, object]) -> str:
     return engine
 
 
-def _select_framing(params: dict[str, object]) -> str:
-    """ax25 (default, compat) | endurosat (chip-packet, the real Gen-2 link).
+# Link layers THIS app can deframe. Anything else runs record-only (IQ capture,
+# no deframe) — never silently a wrong link layer.
+_APP_FRAMINGS = ("ax25", "endurosat")
+_warned_framings: set[str] = set()  # one WARNING per unknown label per process
 
-    Via GS_FLOWGRAPH_FRAMING env or a params ``framing`` key. EnduroSat payloads
-    are the opaque (encrypted) AirMAC frames — the orchestrator handles those.
+
+def _select_framing(params: dict[str, object]) -> str | None:
+    """``"ax25"`` (default, compat) | ``"endurosat"`` (chip-packet, the real
+    Gen-2 link) | ``None`` (record-only: IQ capture continues, no deframe).
+
+    The label — GS_FLOWGRAPH_FRAMING env or the params ``framing`` key — arrives
+    VERBATIM from gs-client (backend/SatYAML vocabulary, e.g. "AX.25 G3RUH",
+    "EnduroSat AirMAC"). It is routed through ``framings.normalize_framing``,
+    the system's SINGLE normalization point (docs/10 P0-2) — this app keeps no
+    second exact-token vocabulary. A missing/blank label keeps the app's
+    historical AX.25 default; a label that doesn't normalize to a framing this
+    app implements must NOT silently become ax25 (a wrong link layer): the pass
+    runs record-only, with one WARNING. EnduroSat payloads are the opaque
+    (encrypted) AirMAC frames — the orchestrator handles those.
     """
-    framing = (
+    label = str(
         os.environ.get("GS_FLOWGRAPH_FRAMING", "")
-        or (str(params.get("framing", "")) if isinstance(params, dict) else "")
-        or "ax25"
-    ).lower()
-    return framing if framing in ("ax25", "endurosat") else "ax25"
+        or (params.get("framing", "") if isinstance(params, dict) else "")
+    ).strip()
+    if not label:
+        return "ax25"
+    local = normalize_framing(label)
+    if local in _APP_FRAMINGS:
+        return local
+    if label not in _warned_framings:
+        _warned_framings.add(label)
+        logging.getLogger("cubesat_gfsk_ax25_rx").warning(
+            "framing %r is not one this app deframes (%s); recording IQ without deframing",
+            label,
+            "/".join(_APP_FRAMINGS),
+        )
+    return None
 
 
 def _profile_from_params(params: dict[str, object]) -> endurosat.LinkProfile:
@@ -163,6 +190,20 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25", output_dir
         logging.getLogger("cubesat_gfsk_ax25_rx").warning("data socket closed; frame not stored")
     if output_dir:  # persist {raw, deframed} alongside the IQ (S3/temp handled by gs-client)
         _append_frame_record(output_dir, body, framing, ui)
+
+
+class _NullStreamDecoder:
+    """Record-only stand-in (unknown framing): accepts IQ, never yields frames.
+    The IQ recording and status plumbing run unchanged — a missing deframer must
+    never cost the capture (docs/10 null-decode rule)."""
+
+    def push(self, _chunk) -> None:
+        return None
+
+    def decode_new(self) -> list[bytes]:
+        return []
+
+    flush = decode_new
 
 
 # ----------------------------------------------------------------------
@@ -356,8 +397,10 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             mod_index=float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
             bt=float(params.get("bt", endurosat_link.DEFAULT_BT)),
         )
-    else:
+    elif framing == "ax25":
         decoder = endurosat.StreamDecoder(sample_rate, profile=profile, recover_timing=True)
+    else:  # unknown framing (already warned): record-only — keep the IQ, no deframe
+        decoder = _NullStreamDecoder()
 
     # Digital Doppler NCO. ``doppler`` is shared with the command handler, so a
     # set_doppler mid-pass is picked up here on the next chunk; nco_phase keeps
@@ -368,11 +411,14 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
         sockets.status_writer,
         {
             "event": "ready",
-            "data_format": "raw_bits",
+            # "raw_bytes" is an explicit key in gs-client's spec_for_data_format map
+            # (same RAW_BITS spec the old undeclared "raw_bits" label reached only
+            # via the unknown-label fallback — docs/10 LOW-7 label drift).
+            "data_format": "raw_bytes",
             "sample_rate": int(sample_rate),
             "symbol_rate": int(profile.symbol_rate_hz),
             "engine": "dsp",
-            "framing": framing,
+            "framing": framing or "record_only",
             "flowgraph_version": VERSION,
         },
     )
@@ -405,8 +451,14 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
 
     async def _decode_loop() -> None:
         while not stop_requested.is_set():
-            await asyncio.sleep(_DECODE_PERIOD_S)
-            for body in decoder.decode_new():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop_requested.wait(), _DECODE_PERIOD_S)
+            if stop_requested.is_set():
+                break
+            # Decode OFF the event loop (docs/10 MED-3): a long demod must never
+            # stall command/status handling. The decoders lock their chunk
+            # hand-off, so pushes from the loop thread stay safe meanwhile.
+            for body in await asyncio.to_thread(decoder.decode_new):
                 await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
@@ -424,10 +476,12 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             decoder.push(chunk)
     finally:
         stop_requested.set()
-        decode_task.cancel()
-        for body in decoder.flush():
-            await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
+        # AWAIT (never cancel) the decode task: a cancel could discard frames a
+        # decode_new already consumed from the buffer in its worker thread. The
+        # loop wakes promptly on stop_requested; then flush the remainder.
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
+        for body in await asyncio.to_thread(decoder.flush):
+            await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
 
 
 # ----------------------------------------------------------------------
@@ -453,10 +507,11 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
         sockets.status_writer,
         {
             "event": "ready",
-            "data_format": "raw_bits",
+            # "raw_bytes": explicit gs-client spec_for_data_format key (LOW-7 drift).
+            "data_format": "raw_bytes",
             "sample_rate": int(sample_rate),
             "engine": "gnuradio",
-            "framing": framing_kind,
+            "framing": framing_kind or "record_only",
             "flowgraph_version": VERSION,
         },
     )
@@ -474,6 +529,10 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     tail_bits = 4096  # ~2 max-length AX.25 frames
 
     def _decode(bits_arr):
+        if framing_kind is None:
+            # Unknown framing (already warned): record-only — never parse a
+            # foreign link layer as AX.25 (docs/10 LOW-3 / P0-2).
+            return []
         if framing_kind == "endurosat":
             # Bit-level EnduroSat deframe (fallback; the dsp engine's IQ-level
             # StreamDecoder is the proven path and the default for endurosat).

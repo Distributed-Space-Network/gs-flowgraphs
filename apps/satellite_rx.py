@@ -95,7 +95,11 @@ async def amain(args) -> int:
         sockets.status_writer,
         {
             "event": "ready",
-            "data_format": "frames",
+            # "frames_jsonl" is an explicit key in gs-client's spec_for_data_format
+            # map ("frames" was unmapped label drift — it silently fell back to the
+            # RAW_BITS spec). Informational here: this app never writes the data
+            # socket; its frames product ships via the gr-satellites path.
+            "data_format": "frames_jsonl",
             "engine": "gnuradio",
             "decoder": "gr-satellites",
             "satellite": satellite,

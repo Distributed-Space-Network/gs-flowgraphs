@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import re
 import struct
+import threading
 
 import numpy as np
 
@@ -192,13 +193,48 @@ def find_bursts(
     return [(int(s), int(e)) for s, e in zip(starts, ends, strict=False) if (e - s) > min_samp]
 
 
+# The shortest CRC-valid on-wire frame the deframer can accept: one preamble byte
+# (``_SYNC_RE`` needs at least one 0xAA repetition) + sync + length + 1-byte
+# payload + CRC-16 = 6 bytes. Used to cap the re-scanned carry below one frame.
+_MIN_FRAME_BITS = 6 * 8
+# Ceiling on how long an unfinished (still-above-gate) burst may be deferred
+# across ``decode_new`` calls. Generous vs. the longest legal packet (137 bytes
+# ~= 114 ms at 9k6) so real packet trains are never force-cut, yet it bounds the
+# retained IQ if a continuous carrier/interferer holds the gate open.
+_MAX_DEFER_S = 5.0
+
+
 class StreamDecoder:
     """Incremental burst-based EnduroSat RX for the flowgraph app.
 
-    Buffers IQ chunks across a pass; ``decode_new`` segments bursts and returns
-    only payloads not previously returned (frame order is prefix-stable as the
-    buffer grows, so slicing past the emitted count never re-emits). Drive
-    ``decode_new`` on a timer; the app handles the cadence.
+    Buffers IQ chunks across a pass; each ``decode_new`` call segments and
+    decodes the bursts in the samples accumulated since the previous call and
+    returns their payloads. Drive ``decode_new`` on a timer; the app handles the
+    cadence. ``push`` may run on a different thread than ``decode_new`` (the app
+    decodes off its event loop); a lock guards the chunk hand-off.
+
+    No-loss / no-duplicate argument (docs/10 review, HIGH-1): every sample is
+    burst-gated and decoded EXACTLY ONCE — each call decodes a window of new
+    samples and then discards it. The gate threshold (``find_bursts``: noise
+    floor vs. ``mag.max()*0.08``) therefore adapts only WITHIN one window and can
+    never re-baseline an earlier, already-emitted decode. The old whole-capture
+    redecode + count-based dedup was NOT prefix-stable: a strong culmination
+    burst raised ``mag.max()`` over the whole growing capture, pushed an earlier
+    weak (already-emitted) burst below the gate, and the ``frames[emitted:]``
+    slice then silently dropped one new frame forever. The only samples seen by
+    two windows are the ``_carry`` samples kept for gate/settling context, and
+    ``_carry`` is strictly shorter than the shortest CRC-valid frame, so the
+    overlap can never re-yield a frame => no double emission. Identical payloads
+    in different bursts are distinct frames and each is emitted (positional
+    dedup semantics, docs/10 section 7).
+
+    A burst still above the gate at the window edge is deferred — carried whole
+    into the next window so it is decoded once, complete — with the deferral
+    capped at ``_MAX_DEFER_S`` (a longer ON region is force-decoded so a
+    continuous carrier cannot grow the buffer without bound; only a frame
+    straddling that pathological forced cut can be missed, and it was never
+    decoded before, so nothing once-emitted is ever lost). Per-call cost is
+    O(new samples) and retained IQ is bounded (docs/10 MED-3).
     """
 
     def __init__(
@@ -215,20 +251,41 @@ class StreamDecoder:
         self._mod_index = mod_index
         self._bt = bt
         self._guard = int(sample_rate_hz * guard_ms / 1000.0)
+        # Re-scanned overlap: capped BELOW the shortest CRC-valid frame so the
+        # only twice-seen samples can never re-emit a frame (see class docstring).
+        min_frame = int(_MIN_FRAME_BITS * sample_rate_hz / symbol_rate_hz)
+        self._carry = min(self._guard, max(min_frame - 1, 0) // 2)
+        self._max_defer = int(sample_rate_hz * _MAX_DEFER_S)
+        self._lock = threading.Lock()
         self._chunks: list[np.ndarray] = []
-        self._emitted = 0
+        self._pending = np.empty(0, dtype=np.complex64)
 
     def push(self, iq_chunk: np.ndarray) -> None:
-        self._chunks.append(np.asarray(iq_chunk, dtype=np.complex64))
+        chunk = np.asarray(iq_chunk, dtype=np.complex64)
+        with self._lock:
+            self._chunks.append(chunk)
 
     def decode_new(self) -> list[bytes]:
-        if not self._chunks:
+        return self._decode(final=False)
+
+    def flush(self) -> list[bytes]:
+        return self._decode(final=True)
+
+    def _decode(self, *, final: bool) -> list[bytes]:
+        with self._lock:
+            chunks, self._chunks = self._chunks, []
+            pending, self._pending = self._pending, np.empty(0, dtype=np.complex64)
+        parts = ([pending] if len(pending) else []) + chunks
+        if not parts:
             return []
-        iq = np.concatenate(self._chunks)
-        frames: list[bytes] = []
-        for s, e in find_bursts(iq, self._sr):
-            seg = iq[max(0, s - self._guard) : e + self._guard]
-            frames.extend(
+        window = parts[0] if len(parts) == 1 else np.concatenate(parts)
+        if not len(window):  # e.g. only empty chunks pushed
+            return []
+        cut = len(window) if final else self._cut_point(window)
+        out: list[bytes] = []
+        for s, e in find_bursts(window[:cut], self._sr):
+            seg = window[max(0, s - self._guard) : e + self._guard]
+            out.extend(
                 receive(
                     seg,
                     self._sr,
@@ -237,12 +294,26 @@ class StreamDecoder:
                     bt=self._bt,
                 )
             )
-        new = frames[self._emitted :]
-        self._emitted = len(frames)
-        return new
+        # Keep the deferred (un-decoded) region plus a sub-frame carry for gate
+        # context; anything pushed while decoding is in ``_chunks`` and follows.
+        keep = window[max(0, cut - self._carry) :].copy()
+        with self._lock:
+            self._pending = keep
+        return out
 
-    def flush(self) -> list[bytes]:
-        return self.decode_new()
+    def _cut_point(self, window: np.ndarray) -> int:
+        """End of the fully-decodable prefix: defer an ON region touching the
+        window edge (a burst likely still arriving), capped at ``_max_defer``."""
+        mag = np.abs(window)
+        floor = float(np.percentile(mag, 10))
+        thr = max(floor * 4.0, float(mag.max()) * 0.08)  # same gate as find_bursts
+        if mag[-1] <= thr:
+            return len(window)
+        off = np.flatnonzero(mag <= thr)
+        start = int(off[-1]) + 1 if len(off) else 0
+        if len(window) - start > self._max_defer:
+            return len(window)  # continuous carrier: force-decode, bound the buffer
+        return max(0, start - self._guard)
 
 
 __all__ = [

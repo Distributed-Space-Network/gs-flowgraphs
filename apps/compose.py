@@ -17,6 +17,7 @@ engine (``gnuradio_satellites.build_satellites_rx``) consults this to select + l
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import framings
@@ -33,6 +34,7 @@ class DecodePlan:
     tier: int | None            # modem tier (1/2/3) or None if the modulation is unrecognized
     our_modem: bool             # our modem registry recognizes the modulation
     our_framing: bool           # a local numpy deframer handles the framing
+    our_crc_gated: bool         # that deframer has a real integrity check (may win the race)
     grsat_catalogued: bool      # gr-satellites has a SatYAML for this bird
     grsat_synthesizable: bool   # a synthetic SatYAML can be built (FSK/BPSK/AFSK + framing + baud)
 
@@ -52,12 +54,20 @@ class DecodePlan:
         return self.our_engine and self.grsatellites
 
     @property
+    def race_ours_can_win(self) -> bool:
+        """In a race, our engine may declare the win ONLY when its framing carries a real
+        integrity check (``framings.is_crc_gated`` — docs/10 MED-1). Otherwise (KISS) our
+        frames are products but never gate off gr-satellites; :func:`race_winner` agrees."""
+        return self.race and self.our_crc_gated
+
+    @property
     def decodable(self) -> bool:
         return self.our_engine or self.grsatellites
 
     def describe(self) -> str:
         if self.race:
-            paths = "race(ours+gr-satellites)"
+            paths = ("race(ours+gr-satellites)" if self.our_crc_gated
+                     else "race(ours+gr-satellites; ours ungated — no CRC)")
         elif self.our_engine:
             paths = "our-engine"
         elif self.grsatellites:
@@ -92,6 +102,28 @@ def plan_decode(params: dict | None, *, catalogued: bool = False) -> DecodePlan:
         tier=spec.tier if spec else None,
         our_modem=spec is not None,
         our_framing=our_framing,
+        our_crc_gated=framings.is_crc_gated(framing),  # single source: the framings registry
         grsat_catalogued=bool(catalogued),
         grsat_synthesizable=grsat_synth.can_synthesize(modulation, baud, framing),
     )
+
+
+def race_winner(our_matched_framings: Iterable[str | None], grsat_produced: bool) -> str | None:
+    """The engine-race decision for ONE drain window — pure, so the GNU-Radio engine's valve
+    logic is unit-testable without GNU Radio (``gnuradio_satellites._SatContext`` calls this).
+
+    ``our_matched_framings``: the framing labels (any vocabulary) that produced OUR engine's new
+    frames this window; ``grsat_produced``: gr-satellites emitted at least one frame. Returns
+    ``"ours"`` / ``"grsatellites"`` / ``None`` (no winner yet — keep racing).
+
+    Only a framing with a REAL integrity check may declare our win (``framings.is_crc_gated`` —
+    docs/10 MED-1): KISS has no checksum and decodes ~2 garbage frames per noise drain, so a
+    KISS "hit" must never gate off the real gr-satellites decoder for the pass (its frames are
+    still emitted as products). gr-satellites deframers all validate CRC/FEC, so any PDU from it
+    counts. On a tie within one window OUR engine wins (it's the backend-specified primary),
+    but only when CRC-gated."""
+    if any(framings.is_crc_gated(f) for f in our_matched_framings):
+        return "ours"
+    if grsat_produced:
+        return "grsatellites"
+    return None

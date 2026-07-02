@@ -31,6 +31,7 @@ import os
 import queue
 import tempfile
 
+import compose  # decode composer (plan + race decision); numpy-only, import-safe
 import framings  # framing registry (deframe dispatch); numpy-only, import-safe
 import numpy as np
 import pmt  # PMT is a standalone top-level module in GNU Radio 3.10 (NOT gr.pmt)
@@ -140,17 +141,24 @@ class _SatContext:
         # decoded). ``our_frames`` carry the demod name (e.g. "gfsk2400"); gr-satellites PDUs
         # are "gr-satellites".
         our_frames: list[tuple[str, bytes]] = []
+        our_matched: list[str] = []  # framings that produced our NEW frames (race gating input)
         for fb in list(self._fallbacks):
-            our_frames.extend((fb.name, f) for f in fb.drain_frames())
+            got = fb.drain_frames()
+            our_frames.extend((fb.name, f) for f in got)
+            if fb.race_framing is not None:
+                our_matched.append(fb.race_framing)
         gr_frames: list[tuple[str, bytes]] = [("gr-satellites", f) for f in self._sink.drain()]
         # Race: the first to produce a CRC-valid frame wins; gate off the loser. Only while
-        # both ran (both valves set). On a tie within one drain, OUR engine wins (it's the
-        # backend-specified primary). Idempotent.
+        # both ran (both valves set). The decision is compose.race_winner (pure, unit-tested):
+        # only a CRC/FCS/RS-gated framing may declare OUR win — checksum-less KISS "frames"
+        # are products but never gate off gr-satellites (docs/10 MED-1). Ties within one
+        # drain go to OUR engine (the backend-specified primary). Idempotent.
         if self._winner is None and self._valve_ours is not None and self._valve_grsat is not None:
-            if our_frames:
+            winner = compose.race_winner(our_matched, bool(gr_frames))
+            if winner == "ours":
                 self._winner = "ours"
                 self._gate_off(self._valve_grsat, "gr-satellites")
-            elif gr_frames:
+            elif winner == "grsatellites":
                 self._winner = "grsatellites"
                 self._gate_off(self._valve_ours, "our engine")
         # Dedup WITHIN this drain only (a frame both engines decoded in the same window) — NOT
@@ -190,6 +198,9 @@ class _FallbackDemod:
         self._locked: str | None = None  # framing discovered this pass when no hint was given
         self._hits: dict[str, int] = {}  # per-framing match count, to lock only on a confident one
         self._tail = np.empty(0, dtype=np.uint8)  # bits carried across drain boundaries
+        # The LOCAL framing that produced the last drain's NEW frames (None if none). The race
+        # gate feeds this to compose.race_winner: only a CRC-gated framing may win (MED-1).
+        self.race_framing: str | None = None
 
     def drain_frames(self) -> list[bytes]:
         # Backend gave the framing → use only that. Otherwise try all; once ONE framing has
@@ -211,6 +222,7 @@ class _FallbackDemod:
             for f in already:
                 if f in out:
                     out.remove(f)  # one occurrence per tail re-decode
+        self.race_framing = matched if out else None  # what produced the NEW frames (race input)
         # Lock-counting uses only NEW frames: a single CRC fluke re-decoding out of the tail
         # must not count twice and defeat the two-independent-hits guard.
         if matched and out and self._framing is None and self._locked is None:
@@ -401,7 +413,6 @@ def build_satellites_rx(
     # the backend rfLink implies. The construction below still drives the graph; the plan is the
     # single explanation of the choice (and the seam a future satellite_rx composition builds on).
     try:
-        import compose  # noqa: PLC0415 — pure, import-safe
         _log.info("decode plan: %s",
                   compose.plan_decode(params, catalogued=fg is not None).describe())
     except Exception as e:  # noqa: BLE001 — planning must never block decoding

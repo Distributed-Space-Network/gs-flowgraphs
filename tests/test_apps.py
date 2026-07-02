@@ -59,9 +59,17 @@ def test_version(capsys):
 
 def test_framing_selection(monkeypatch):
     monkeypatch.delenv("GS_FLOWGRAPH_FRAMING", raising=False)
-    assert rxapp._select_framing({}) == "ax25"  # default
+    assert rxapp._select_framing({}) == "ax25"  # default (no label at all)
     assert rxapp._select_framing({"framing": "endurosat"}) == "endurosat"
-    assert rxapp._select_framing({"framing": "bogus"}) == "ax25"  # fallback (no env)
+    # Verbatim backend/SatYAML labels route through framings.normalize_framing —
+    # the system's single normalization point (docs/10 P0-2/LOW-3).
+    assert rxapp._select_framing({"framing": "EnduroSat AirMAC"}) == "endurosat"
+    assert rxapp._select_framing({"framing": "AX.25 G3RUH"}) == "ax25"
+    # A label this app can't deframe must NOT silently become ax25 (a wrong link
+    # layer) — it plans record-only (None).
+    assert rxapp._select_framing({"framing": "bogus"}) is None
+    assert rxapp._select_framing({"framing": "USP"}) is None  # gr-satellites-only
+    assert rxapp._select_framing({"framing": "kiss"}) is None  # local, not this app
     monkeypatch.setenv("GS_FLOWGRAPH_FRAMING", "endurosat")
     assert rxapp._select_framing({}) == "endurosat"  # env override
 

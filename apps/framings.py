@@ -31,6 +31,12 @@ import numpy as np
 # (gfsk_ax25.kiss.slip_*) remains for its real use, byte-exact TNC/serial pipes (uplink/relay).
 _LOCAL = ("ax25", "endurosat", "ccsds_tm", "kiss")
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
+# Local framings whose deframer verifies a REAL integrity check (AX.25 FCS, EnduroSat CRC-16,
+# CCSDS RS+FECF) before emitting a frame. Only these may declare a win in the engine race
+# (docs/10 MED-1): ``kiss`` carries NO checksum and measurably passes ~2 chance "frames" per
+# noise drain, so a KISS hit on the first drain must never gate off the real gr-satellites
+# decoder for the whole pass. KISS frames are still emitted as products — they just can't gate.
+_CRC_GATED = ("ax25", "endurosat", "ccsds_tm")
 
 # The gr-satellites framing vocabulary (SatYAML ``framing:`` strings) reused via synthetic
 # SatYAML — advertised here, decoded in the gr-satellites flowgraph. Representative of the ~50
@@ -54,6 +60,20 @@ def grsatellites_framings() -> tuple[str, ...]:
     """Framings deframed by reusing gr-satellites (via synthetic SatYAML) — advertised, not
     re-implemented here."""
     return GRSATELLITES_FRAMINGS
+
+
+def crc_gated_framings() -> tuple[str, ...]:
+    """Local framings whose deframer validates a real integrity check (FCS/CRC/RS) — the only
+    ones allowed to declare an engine-race win (docs/10 MED-1)."""
+    return _CRC_GATED
+
+
+def is_crc_gated(label) -> bool:
+    """True when ``label`` (ANY vocabulary — local token or backend/SatYAML label) normalizes to
+    a local deframer that validates a real integrity check before emitting a frame. Frames from a
+    non-gated framing (``kiss`` — no checksum) are still products, but they may NOT win the
+    engine race and starve gr-satellites (docs/10 MED-1)."""
+    return normalize_framing(label) in _CRC_GATED
 
 
 def known_framings() -> tuple[str, ...]:

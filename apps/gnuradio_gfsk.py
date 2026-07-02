@@ -234,8 +234,8 @@ def connect_psk_demod(
     decoder = digital.constellation_decoder_cb(constel)
     unpack = blocks.unpack_k_bits_bb(constel.bits_per_symbol())  # symbol index → hard bits
     sink = _BitSink()
-    # constellation_decoder emits symbol INDICES; map_bb(pre_diff_code) applies the
-    # constellation's Gray/bit assignment before unpacking (psk_demod does the same).
+    # constellation_decoder emits symbol INDICES; the inverted pre-diff code (below) undoes
+    # the constellation's Gray/bit assignment before unpacking (generic_demod does the same).
     chain = [src]
     if lpf is not None:
         chain.append(lpf)
@@ -248,7 +248,11 @@ def connect_psk_demod(
         _log.warning("connect_psk_demod: differential decode for order %d bench-pending; "
                      "decoding coherently", order)
     if constel.apply_pre_diff_code():
-        chain.append(digital.map_bb(constel.pre_diff_code()))
+        # RX applies the INVERSE of the constellation's pre-diff code to the decoded symbol
+        # indices — GR's generic_demod does map_bb(mod_codes.invert_code(...)); the forward
+        # code is TX-side (generic_mod). Dead today (apply_pre_diff_code() is False for every
+        # constellation used here) but must be the inverse if a pre-diff-coded one lands.
+        chain.append(digital.map_bb(digital.mod_codes.invert_code(constel.pre_diff_code())))
     chain += [unpack, sink]
     tb.connect(*chain)
     return sink
@@ -271,11 +275,18 @@ def connect_afsk_demod(
     xlate = gr_filter.freq_xlating_fir_filter_fcf(
         1, gr_filter.firdes.low_pass(1.0, sample_rate, 2.0 * af_dev, 0.1 * af_dev),
         af_carrier, sample_rate)
-    tb.connect(src, audio, xlate)
     # 3) Reuse the upgraded FSK demod on the complex baseband (its DC blocker absorbs any
     #    residual tone-centre error; deviation = the tone half-spacing).
     profile = endurosat.LinkProfile(symbol_rate_hz=baud, mod_index=2.0 * af_dev / baud)
-    return connect_gfsk_demod(tb, xlate, sample_rate, profile, decimate=False, sdr_rate=sample_rate)
+    # Construct + wire the FSK chain BEFORE connecting anything to ``src`` (null_sink rule,
+    # docs/10 A4/A5 class): if an FSK-chain constructor raises (absurd baud → sps < 1), the
+    # caller catches it — but an already-connected src→audio→xlate tap would leave xlate's
+    # output dangling, abort tb.start(), and cost the IQ RECORDING. connect_gfsk_demod itself
+    # builds every block first and connects last, so a raise leaves the graph untouched.
+    sink = connect_gfsk_demod(
+        tb, xlate, sample_rate, profile, decimate=False, sdr_rate=sample_rate)
+    tb.connect(src, audio, xlate)
+    return sink
 
 
 def build_rx_top_block(
@@ -337,6 +348,10 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
     sink.set_sample_rate(0, sample_rate)
     sink.set_frequency(0, float(args.center_freq_hz))  # TX: no LO offset (mod at baseband 0)
     configure_soapy_source(sink, merge_sdr_params(params))  # TX antenna + gain (PA drive)
+    # Analog TX filter ≈ the SDR sample rate, NOT the narrow channel width — the latter is
+    # below the device filter floor (~0.8 MHz on the XTRX) and would break the path (same
+    # treatment as the FM TX app). TX levels are BENCH-PENDING.
+    sink.set_bandwidth(0, sample_rate)
     tb.connect(src, mod, sink)
     tb.run()
 

@@ -51,16 +51,21 @@ def _coherent_bit_chain(tb, src, sample_rate, symbol_rate, constel, *, excess_bw
         chain.append(lpf)
     chain += [agc, fll, rrc, sync, receiver]
     if constel.apply_pre_diff_code():
-        chain.append(digital.map_bb(constel.pre_diff_code()))
+        # RX applies the INVERSE of the pre-diff code to the decoded symbol indices — GR's
+        # generic_demod does map_bb(mod_codes.invert_code(...)); the forward code is TX-side.
+        # Dead today (apply_pre_diff_code() is False for the constellations used) but must be
+        # the inverse if a pre-diff-coded constellation lands.
+        chain.append(digital.map_bb(digital.mod_codes.invert_code(constel.pre_diff_code())))
     chain += [unpack, sink]
     tb.connect(*chain)
     return sink
 
 
 def connect_qam_demod(tb, src, sample_rate, symbol_rate, *, order=16):
-    """M-QAM demod (order 16/32/64/128/256) via the gray-coded rectangular QAM constellation.
-    ``mod_code=GRAY_CODE`` is explicit — the constructor default is NO_CODE (natural binary),
-    which would scramble the bit assignment."""
+    """M-QAM demod (order 16/64/256 — square constellations only; GR 3.10's gray-coded
+    constructor RAISES for the cross constellations 32/128, which the caller's build guard
+    treats as build-failed/record-only). ``mod_code=GRAY_CODE`` is explicit — the constructor
+    default is NO_CODE (natural binary), which would scramble the bit assignment."""
     constel = digital.qam.qam_constellation(
         order, differential=False, mod_code=digital.mod_codes.GRAY_CODE).base()
     return _coherent_bit_chain(tb, src, sample_rate, symbol_rate, constel)

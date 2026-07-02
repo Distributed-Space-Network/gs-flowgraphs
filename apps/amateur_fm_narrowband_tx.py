@@ -110,8 +110,20 @@ def build_top_block(
     fm_mod = analog.frequency_modulator_fc(sensitivity)
 
     # ----------------------------------------------------- interpolate
-    # Audio -> SDR rate.
-    interp = max(1, args.sample_rate // _AUDIO_RATE_HZ)
+    # Audio -> SDR rate. The SDR rate MUST be an exact integer multiple of the
+    # 48 kHz audio rate: a truncating ``//`` on a non-multiple (e.g. 2.048 Msps
+    # -> interp 42 -> 2.016 Msps fed to a 2.048 Msps sink) silently mistunes
+    # every audio tone by the rate ratio (~1.6 %). Refuse loudly instead
+    # (docs/10 LOW-6).
+    sdr_rate = int(args.sample_rate)
+    if sdr_rate < _AUDIO_RATE_HZ or sdr_rate % _AUDIO_RATE_HZ != 0:
+        raise ValueError(
+            f"--sample-rate {args.sample_rate} is not an integer multiple of the "
+            f"{_AUDIO_RATE_HZ} Hz audio rate; the integer interpolator would feed the "
+            f"sink at {max(1, sdr_rate // _AUDIO_RATE_HZ) * _AUDIO_RATE_HZ} Hz and "
+            "mistune the audio. Use an exact multiple (e.g. 96000, 1920000, 2400000)."
+        )
+    interp = sdr_rate // _AUDIO_RATE_HZ
     interp_taps = gr_filter.firdes.low_pass(
         gain=float(interp),
         sampling_freq=float(args.sample_rate),
