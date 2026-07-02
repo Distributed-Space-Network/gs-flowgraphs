@@ -25,7 +25,7 @@ from gfsk_ax25.reedsolomon import RSCodec
     [
         ("AX.25 G3RUH", "ax25"), ("AX.25", "ax25"), ("ax25", "ax25"), ("APRS", "ax25"),
         ("EnduroSat", "endurosat"), ("AirMAC", "endurosat"),
-        ("KISS", "kiss"), ("SLIP", "slip"),
+        ("KISS", "kiss"), ("SLIP", None),  # slip = byte-pipe codec only (docs/10 §10)
         ("ccsds_tm", "ccsds_tm"),
         # bare "CCSDS" = unknown coding (spec birds use dual-basis RS/concatenated we don't
         # implement locally) -> upstream; argos = placeholder sync -> record-only until benched
@@ -218,3 +218,12 @@ def test_bare_ccsds_label_is_not_synthesizable():
     plan = compose.plan_decode(
         {"modulation": "bpsk", "symbol_rate_hz": 1200, "framing": "CCSDS"})
     assert not plan.decodable  # record-only (+ the IQ recording, always)
+
+
+def test_kiss_identical_fast_repeat_beacons_in_one_drain_both_emit():
+    # Round 3: the union dedup must be ACROSS phases only — two identical frames at the SAME
+    # phase are a genuine fast repeat beacon (a global seen-set emitted only one).
+    wire = kiss.kiss_encode(b"fast-repeat-beacon-xx") * 2
+    bits = np.unpackbits(np.frombuffer(wire, dtype=np.uint8))
+    frames, matched = framings.deframe(bits, "kiss")
+    assert matched == "kiss" and frames == [b"fast-repeat-beacon-xx"] * 2

@@ -26,7 +26,10 @@ import numpy as np
 # frames (which would even win the engine race and gate off gr-satellites). The module
 # (gfsk_ax25.argos) stays, fully tested, for when the real full-length sync is bench-confirmed;
 # until then an argos bird plans as record-only.
-_LOCAL = ("ax25", "endurosat", "ccsds_tm", "kiss", "slip")
+# ``slip`` is NOT here either: with no checksum AND no type byte, strict gating still passes
+# ~30 garbage frames per noise drain — unusable on a demodulated bitstream. The codec
+# (gfsk_ax25.kiss.slip_*) remains for its real use, byte-exact TNC/serial pipes (uplink/relay).
+_LOCAL = ("ax25", "endurosat", "ccsds_tm", "kiss")
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
 
 # The gr-satellites framing vocabulary (SatYAML ``framing:`` strings) reused via synthetic
@@ -81,8 +84,8 @@ def normalize_framing(label) -> str | None:
         return "endurosat"
     if "kiss" in s:
         return "kiss"
-    if "slip" in s:
-        return "slip"
+    # "slip": byte-pipe codec only — ungateable on a demodulated bitstream (no checksum, no
+    # type byte); a SLIP label plans as record-only.
     # NOTE: the explicit local token "ccsds_tm" is handled by the _LOCAL early-return above.
     # A bare/coded "CCSDS" LABEL never maps locally: spec CCSDS uses dual-basis RS/concatenated
     # coding our local TM chain does not implement — those decode upstream (gr-satellites).
@@ -100,12 +103,16 @@ def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     some noise acceptance is irreducible (quantified in gfsk_ax25.kiss and the regression test).
     """
     out: list[bytes] = []
-    seen: set[bytes] = set()
+    seen_prior_phases: set[bytes] = set()
     for off in range(8):
-        for f in decode(bytes(np.packbits(arr[off:])), strict=True):
-            if f not in seen:
-                seen.add(f)
+        phase_frames = decode(bytes(np.packbits(arr[off:])), strict=True)
+        for f in phase_frames:
+            # Dedup ACROSS phases only: a real frame decodes at exactly ONE alignment, so a
+            # cross-phase duplicate is chance garbage — but two identical frames at the SAME
+            # phase are a genuine fast repeat beacon and must BOTH be kept.
+            if f not in seen_prior_phases:
                 out.append(f)
+        seen_prior_phases.update(phase_frames)
     return out
 
 
@@ -140,8 +147,6 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
             frames = ccsds.deframe_tm(arr)
         elif name == "kiss":   # byte-oriented TNC framing — all 8 bit phases tried
             frames = _bits_to_bytes_any_phase(arr, kiss.kiss_decode)
-        elif name == "slip":
-            frames = _bits_to_bytes_any_phase(arr, kiss.slip_decode)
         else:
             continue
         if frames:

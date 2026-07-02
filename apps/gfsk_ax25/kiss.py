@@ -26,11 +26,14 @@ def _escape(frame: bytes) -> bytes:
     return bytes(out)
 
 
-def _unescape(payload: bytes, *, strict: bool = False) -> bytes | None:
-    """Undo FESC escaping. In ``strict`` mode an INVALID escape (FESC followed by anything but
-    TFEND/TFESC, or a trailing FESC) is a protocol violation → returns None (reject the chunk);
-    this is a real structural constraint that rejects most noise chunks containing 0xDB."""
+def _unescape(payload: bytes, *, strict: bool = False) -> tuple[bytes | None, int]:
+    """Undo FESC escaping; returns ``(payload, valid_escape_count)``. In ``strict`` mode an
+    INVALID escape (FESC followed by anything but TFEND/TFESC, or a trailing FESC) is a
+    protocol violation → ``(None, 0)`` (reject the chunk) — a real structural constraint that
+    rejects most noise chunks containing 0xDB. The escape count lets callers treat a chunk with
+    ≥1 VALID escape pair as deliberate framing (strongest structural evidence available)."""
     out = bytearray()
+    escapes = 0
     i = 0
     while i < len(payload):
         b = payload[i]
@@ -38,10 +41,12 @@ def _unescape(payload: bytes, *, strict: bool = False) -> bytes | None:
             nxt = payload[i + 1] if i + 1 < len(payload) else None
             if nxt == TFEND:
                 out.append(FEND)
+                escapes += 1
             elif nxt == TFESC:
                 out.append(FESC)
+                escapes += 1
             elif strict:
-                return None  # invalid escape — not a KISS/SLIP frame
+                return None, 0  # invalid escape — not a KISS/SLIP frame
             elif nxt is not None:
                 out.append(nxt)
             else:
@@ -50,7 +55,7 @@ def _unescape(payload: bytes, *, strict: bool = False) -> bytes | None:
         else:
             out.append(b)
             i += 1
-    return bytes(out)
+    return bytes(out), escapes
 
 
 def kiss_encode(frame: bytes, *, command: int = 0, port: int = 0) -> bytes:
@@ -59,7 +64,8 @@ def kiss_encode(frame: bytes, *, command: int = 0, port: int = 0) -> bytes:
     return bytes([FEND, type_byte]) + _escape(bytes(frame)) + bytes([FEND])
 
 
-_STRICT_MIN_PAYLOAD = 8  # noise chunks between chance FENDs are mostly short garbage
+_STRICT_MIN_PAYLOAD = 8   # KISS: noise chunks between chance FENDs are mostly short garbage
+_SLIP_STRICT_MIN_PAYLOAD = 16  # SLIP has no type byte to gate on — compensate with length
 
 
 def kiss_decode(stream: bytes, *, strict: bool = False) -> list[bytes]:
@@ -80,11 +86,14 @@ def kiss_decode(stream: bytes, *, strict: bool = False) -> list[bytes]:
             continue
         if strict and (chunk[0] & 0x0F) != 0:
             continue  # only type-0 (data) frames survive strict mode
-        payload = _unescape(chunk[1:], strict=strict)  # drop the command/port byte
+        payload, escapes = _unescape(chunk[1:], strict=strict)  # drop the command/port byte
         if payload is None:  # invalid escape sequence — protocol violation
             continue
-        if strict and (len(payload) < _STRICT_MIN_PAYLOAD or len(set(payload)) < 2):
-            continue  # too short, or constant idle fill (0x00 runs between frames) — not data
+        if strict and len(payload) < _STRICT_MIN_PAYLOAD:
+            continue
+        if strict and escapes == 0 and len(set(payload)) < 2:
+            continue  # constant idle fill (0x00 runs between frames) — but a payload built
+            # from VALID escape pairs (e.g. all-FEND) is deliberate framing, keep it
         if payload:
             out.append(payload)
     return out
@@ -105,11 +114,13 @@ def slip_decode(stream: bytes, *, strict: bool = False) -> list[bytes]:
     for chunk in chunks:
         if not chunk:
             continue
-        payload = _unescape(chunk, strict=strict)
+        payload, escapes = _unescape(chunk, strict=strict)
         if payload is None:  # invalid escape sequence — protocol violation
             continue
-        if strict and (len(payload) < _STRICT_MIN_PAYLOAD or len(set(payload)) < 2):
-            continue  # too short, or constant idle fill — not data
+        if strict and len(payload) < _SLIP_STRICT_MIN_PAYLOAD:
+            continue  # SLIP has no type byte — the longer floor is its main noise gate
+        if strict and escapes == 0 and len(set(payload)) < 2:
+            continue  # constant idle fill — but valid-escape payloads are deliberate framing
         if payload:
             out.append(payload)
     return out

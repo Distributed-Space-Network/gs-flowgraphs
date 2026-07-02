@@ -52,9 +52,11 @@ def test_framing_kiss_roundtrip():
     assert matched == "kiss" and frames == [_PAYLOAD]
 
 
-def test_framing_slip_roundtrip():
-    frames, matched = framings.deframe(_bits(kiss.slip_encode(_PAYLOAD)), "slip")
-    assert matched == "slip" and frames == [_PAYLOAD]
+def test_framing_slip_roundtrip_module_level():
+    # SLIP is a byte-pipe codec (uplink/relay TNC), NOT a demodulated-bitstream framing —
+    # with no checksum and no type byte it is ungateable on noise, so the registry does not
+    # wire it (docs/10 §10). Round-trip at the module level, its real interface.
+    assert kiss.slip_decode(kiss.slip_encode(_PAYLOAD)) == [_PAYLOAD]
 
 
 def test_framing_argos_roundtrip_module_level():
@@ -68,9 +70,9 @@ def test_framing_argos_roundtrip_module_level():
     assert frames and int.from_bytes(frames[0][:3], "big") == msg
 
 
-# argos round-trips at MODULE level (with an explicit sync) but is not registry-wired
-# until its real frame sync is bench-confirmed (docs/10 recheck).
-_ROUNDTRIPPED_FRAMINGS = {"ax25", "endurosat", "ccsds_tm", "kiss", "slip"}
+# argos round-trips at MODULE level (explicit sync; not registry-wired until benched);
+# slip round-trips at MODULE level (byte-pipe codec; ungateable on demodulated bitstreams).
+_ROUNDTRIPPED_FRAMINGS = {"ax25", "endurosat", "ccsds_tm", "kiss"}
 
 
 def test_every_local_framing_is_round_trip_validated():

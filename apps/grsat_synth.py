@@ -30,8 +30,11 @@ _DEFAULT_MOD_INDEX = 0.5  # most cubesat GFSK / 2-FSK ~ h = 0.5
 # (deliberately non-exhaustive) framings.grsatellites_framings() list. "ax.25" (with the dot)
 # matches SatYAML labels but NOT the local token "ax25" — local-only tokens are not
 # synthesizable (gr-satellites doesn't know them; our own engine deframes those).
+# NOTE: no "ccsds" needle — CCSDS labels are matched ONLY against the exact advertised list
+# (gr-satellites has strictly qualified CCSDS labels; "CCSDS TM"/"ccsds aos"/bare "CCSDS" would
+# all fail its constructor, so the plan must not claim them synthesizable).
 _GRSAT_NEEDLES = (
-    "ax.25", "ax100", "usp", "mobitex", "geoscan", "ao-40", "ccsds", "ngham", "u482c",
+    "ax.25", "ax100", "usp", "mobitex", "geoscan", "ao-40", "ngham", "u482c",
     "fx.25", "snet", "openlst", "smog", "reaktor", "tt-64", "sanosat", "grizu", "aalto",
     "lucky", "eseo", "fossasat", "qubik", "hades", "nusat",
 )
@@ -48,10 +51,6 @@ def _grsat_framing(framing) -> bool:
         return False
     if s in {f.lower() for f in framings.grsatellites_framings()}:
         return True
-    if s == "ccsds":
-        return False  # gr-satellites has only QUALIFIED CCSDS labels (Reed-Solomon/
-        # Concatenated/Uncoded/...) — a bare "CCSDS" would fail its constructor, so the
-        # plan must not claim it synthesizable (the bird is record-only).
     return any(n in s for n in _GRSAT_NEEDLES)
 
 
