@@ -127,8 +127,13 @@ def normalize_framing(label) -> str | None:
 # other local tokens are decoded ONLY in-process (``endurosat``/AirMAC is not gr-satellites
 # vocabulary; ``ccsds_tm`` needs per-bird qualified coding gr-satellites can't infer; ``kiss`` is
 # a TNC byte framing, not a SatYAML framing) → they must NOT be handed to gr-satellites.
+# Bare ``ccsds`` is here too — NOT because it's local (it isn't; :func:`normalize_framing` returns
+# None for it) but because it's UNBUILDABLE: gr-satellites has only QUALIFIED CCSDS framings
+# ("CCSDS Concatenated"/"Reed-Solomon"/"Uncoded"); a bare "CCSDS" carries no FEC to pick one, so
+# its synthetic constructor would throw. It plans + records as record-only, never synthesizable.
+# The qualified labels have a distinct lowercase key ("ccsds concatenated" …) and pass verbatim.
 _GRSAT_LABEL = {"ax25": "AX.25"}
-_NO_GRSAT = frozenset({"endurosat", "airmac", "ccsds_tm", "kiss"})
+_NO_GRSAT = frozenset({"endurosat", "airmac", "ccsds_tm", "ccsds", "kiss"})
 
 
 def to_grsatellites_framing(label) -> str | None:

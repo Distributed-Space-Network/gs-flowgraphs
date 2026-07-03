@@ -35,7 +35,9 @@ def can_synthesize(modulation, baud, framing) -> bool:
     constructor is the authoritative validator and attempts are cheap + guarded."""
     import framings  # noqa: PLC0415 — outbound framing normalization (single point)
     kind = str(modulation or "").strip().lower()
-    return bool(_GRSAT_MOD.get(kind) and baud and framings.to_grsatellites_framing(framing) is not None)
+    return bool(
+        _GRSAT_MOD.get(kind) and baud
+        and framings.to_grsatellites_framing(framing) is not None)
 
 
 def synthetic_satyaml(norad, modulation, baud, framing, frequency_hz, *, name=None):

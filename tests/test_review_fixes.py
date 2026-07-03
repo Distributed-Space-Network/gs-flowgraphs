@@ -62,8 +62,10 @@ def test_can_synthesize_accepts_satyaml_vocabulary_and_rejects_local_tokens():
     assert grsat_synth.can_synthesize("gfsk", 9600, "AX.25 G3RUH")
     assert grsat_synth.can_synthesize("fsk", 4800, "USP")
     assert grsat_synth.can_synthesize("bpsk", 1200, "AX100 Reed Solomon")  # needle family
-    # local-only tokens / garbage are NOT gr-satellites vocabulary
-    assert not grsat_synth.can_synthesize("gfsk", 9600, "ax25")
+    # ``ax25`` is the ONE local token that also maps to a buildable gr-satellites label (AX.25),
+    # so it synthesizes and RACES the local numpy AX.25 deframer (P0-2 outbound normalization).
+    assert grsat_synth.can_synthesize("gfsk", 9600, "ax25")
+    # local-ONLY / unbuildable tokens are NOT synthesizable gr-satellites vocabulary
     assert not grsat_synth.can_synthesize("gfsk", 9600, "endurosat")
     assert not grsat_synth.can_synthesize("gfsk", 9600, "airmac")
     assert not grsat_synth.can_synthesize("gfsk", 9600, None)

@@ -127,71 +127,67 @@ class _RxContext:
 def connect_gfsk_demod(
     tb, src, sample_rate: float, profile: endurosat.LinkProfile, *,
     decimate: bool, sdr_rate: float, dc_block: bool = True, channel_bw_hz: float | None = None,
-) -> _BitSink:
-    """Connect a 2-GFSK/FSK/GMSK demod chain onto ``src`` and return the bit sink
-    (``drain()`` → hard bits). Mirrors gr-satellites' ``fsk_demodulator`` (GPLv3) so our
-    own-engine fallback matches a real receiver for birds gr-satellites can't decode:
+) -> tuple[_BitSink, object]:
+    """Connect a 2-GFSK/FSK/GMSK/MSK demod chain onto ``src`` and return ``(bit_sink, soft_tap)``:
+    the hard-bit sink (``drain()`` → bits, fed to our numpy deframers) and the FLOAT soft-symbol
+    tap (post clock-recovery, PRE-slicer) that gr-satellites deframer components consume.
 
-        [Carson LPF] → quad demod → square-pulse matched filter (+decim) → DC blocker
-        → AGC → Gardner symbol sync → binary slicer.
+    Stock-GNU-Radio port of SatNOGS' proven ``satnogs_fsk.py`` (GPL-3.0) demod tail — NEVER the
+    AGPL gr-satnogs hier-blocks, and never the monolithic ``gr_satellites_flowgraph`` (which fed
+    raw IQ, did demod+deframe+resample internally, and buffer-deadlocked while starving the
+    recorder — docs/12). Chain:
 
-    The DC blocker is the key addition: a carrier/Doppler frequency offset rides the
-    discriminator output as a DC bias, which a bare slicer mis-slices — removing it makes
-    the demod immune to the ~kHz catalog/oscillator/Doppler offsets the old chain failed on.
-    Shared by the cubesat GFSK engine and the gr-satellites engine's generic fallback."""
+        [SDR→channel decimator] → FLL band-edge → LPF(0.625·baud, decimate to ~2 sps)
+        → quad demod(1.2) → [dc_blocker_ff(1024)] → M&M clock recovery(2 sps) ──soft──►
+        → binary slicer → _BitSink.
+
+    Doppler is applied UPSTREAM at the source (the LO-offset rotator, gs-orbitd), NOT here. The
+    bit sink is a terminal queue and the deframers on the soft tap emit messages, so nothing here
+    can backpressure the recorder that taps the same channel stream. ``channel_bw_hz`` is accepted
+    for call-compat but IGNORED — SatNOGS sizes the pre-discriminator LPF from the baud, never a
+    provisioned width. ``dc_block`` gates the (SatNOGS-default-on) discriminator dc_blocker_ff."""
+    _ = channel_bw_hz  # accepted for call-compat; SatNOGS sizes the LPF from baud, not bandwidth
     baud = float(profile.symbol_rate_hz)
-    deviation = profile.mod_index * baud / 2.0
-    sps = sample_rate / baud
-    # Keep symbol processing near ~10 sps: decimate the demodulated stream when the channel
-    # gives many samples/symbol (e.g. 1k2 in a 48 kHz channel = 40 sps).
-    int_decim = max(1, math.ceil(sps / 10.0)) if sps > 10.0 else 1
-    sps_post = sps / int_decim
+    sps_in = sample_rate / baud                        # samples/symbol at the channel rate
+    # Decimate the demod stream to ~2 sps in the LPF, exactly like SatNOGS' fir_filter_ccf with
+    # decimation = (baud·decim)//2. FLOOR (not round): flooring the decimation guarantees
+    # out_sps = sps_in/floor(sps_in/2) ≥ 2.0 for every baud, so M&M never runs sub-Nyquist. (For
+    # the common 48 kHz bauds — 40/20/10/5 sps — floor and round agree; they diverge only for odd
+    # sps_in, where round-half-even could pick a decim that drops out_sps below 2.) Clamp ≥1.
+    lpf_decim = max(1, int(sps_in / 2.0))
+    out_sps = sps_in / lpf_decim                        # ≥ 2.0
 
-    chain: list = []
-    if decimate:  # SDR capture-rate → channel-rate first
-        chain.append(make_decimator(sdr_rate, float(sample_rate)))
-    # 0) COMPLEX DC blocker — kill the SDR's DC/LO spike BEFORE the discriminator. An on-center
-    #    capture can leave a huge residual spike the hardware corrector misses (bench-measured
-    #    ~+46 dB at 0 Hz); left in, it dominates the complex amplitude and the FSK phase swing is
-    #    buried in the quad-demod. Narrow notch (~50 Hz) so it never touches the FSK tones (≥ a
-    #    few hundred Hz off DC). Gated by dc_block (skipped for the short-burst cubesat path).
+    # Construct EVERY block first, connect LAST — a constructor raise leaves the graph untouched.
+    blocks_list: list = []
+    if decimate:                                        # SDR capture-rate → channel-rate first
+        blocks_list.append(make_decimator(sdr_rate, float(sample_rate)))
+    # 1) FLL band-edge: coarse carrier-frequency lock (SatNOGS: sps, rolloff 0.5, size 2·sps+1,
+    #    bw = 2π/sps/100). Residual offset after the upstream Doppler/LO rotator is small.
+    fll_size = int(sps_in * 2.0 + 1.0) | 1             # odd
+    blocks_list.append(digital.fll_band_edge_cc(
+        sps_in, 0.5, fll_size, 2.0 * math.pi / sps_in / 100.0))
+    # 2) Pre-discriminator LPF sized from the BAUD (0.625·baud cutoff, baud/8 transition),
+    #    DECIMATING to ~2 sps. firdes default window = Hamming (== SatNOGS' WIN_HAMMING); omit the
+    #    window arg so the taps match without depending on the 3.8-vs-3.10 window-enum module path.
+    blocks_list.append(gr_filter.fir_filter_ccf(
+        lpf_decim, gr_filter.firdes.low_pass(1.0, sample_rate, 0.625 * baud, baud / 8.0)))
+    # 3) Quadrature (frequency) discriminator — SatNOGS' fixed empirical gain 1.2.
+    blocks_list.append(analog.quadrature_demod_cf(1.2))
+    # 4) DC blocker on the discriminator output — removes the residual carrier bias a bare slicer
+    #    mis-slices. SatNOGS uses a fixed 1024-tap long-form blocker; skipped (dc_block=False) for
+    #    short cubesat bursts where its settle would eat the frame start.
     if dc_block:
-        chain.append(gr_filter.dc_blocker_cc(max(64, int(round(sample_rate / 50.0))), True))
-    # 1) Pre-discriminator LPF. Default = Carson's rule from the (possibly ASSUMED h=0.5)
-    #    deviation; but when the operator provisioned a WIDER channel bandwidth, honor it — a bird
-    #    whose true deviation exceeds the assumption has its tones outside a Carson filter sized
-    #    from ~600 Hz, and clamping to Carson would filter the signal away. Never below Carson.
-    carson = abs(deviation) + baud / 2.0
-    cutoff = carson
-    if channel_bw_hz and channel_bw_hz / 2.0 > carson:
-        cutoff = min(channel_bw_hz / 2.0, 0.9 * sample_rate / 2.0)
-    if cutoff < sample_rate / 2.0:
-        chain.append(gr_filter.fir_filter_ccf(
-            1, gr_filter.firdes.low_pass(1.0, sample_rate, cutoff, 0.1 * cutoff)))
-    # 2) Quadrature demod: instantaneous frequency scaled so ±deviation → ~±1.
-    chain.append(analog.quadrature_demod_cf(sample_rate / (2.0 * math.pi * deviation)))
-    # 3) Square-pulse matched filter (+ the internal decimation to ~10 sps).
-    sqlen = max(1, int(round(sample_rate / baud)))
-    chain.append(gr_filter.fir_filter_fff(int_decim, [1.0 / sqlen] * sqlen))
-    # 4) DC blocker — removes the carrier/Doppler offset bias (the fix for off-center birds).
-    #    Has a ~32-symbol settling delay, so it is skipped (``dc_block=False``) for the
-    #    short-burst cubesat path where it would eat the start of a frame.
-    if dc_block:
-        chain.append(gr_filter.dc_blocker_ff(int(math.ceil(sps_post * 32)), True))
-    # 5) RMS AGC — normalize amplitude so the Gardner TED gain stays consistent (gr-satellites
-    #    scales the time constant to ~50 symbols via 2e-2/sps).
-    chain.append(_RmsAgc(2e-2 / sps_post, 1.0, cplx=False))
-    # 6) Gardner symbol timing recovery at the post-decimation symbol rate (gr-satellites'
-    #    loop bandwidth 0.06 and timing limit 0.004*sps).
-    chain.append(digital.symbol_sync_ff(
-        digital.TED_GARDNER, sps_post, 0.06, 1.0, 1.47, 0.004 * sps_post, 1,
-        digital.constellation_bpsk().base(), digital.IR_PFB_NO_MF))
-    # 7) Slice to hard bits.
-    chain.append(digital.binary_slicer_fb())
+        blocks_list.append(gr_filter.dc_blocker_ff(1024, True))
+    # 5) Mueller & Müller symbol timing recovery at ~2 sps — SatNOGS' EXACT constants
+    #    (satnogs_fsk.py: clock_recovery_mm_ff(2, 2π/100, 0.5, 0.5/8, 0.01)). This float output is
+    #    the SOFT-SYMBOL TAP the gr-satellites deframers consume (fanned out by the caller).
+    soft = digital.clock_recovery_mm_ff(
+        out_sps, 2.0 * math.pi / 100.0, 0.5, 0.5 / 8.0, 0.01)
+    # 6) Slice to hard bits (one 0/1 per byte) for our numpy deframers.
+    slicer = digital.binary_slicer_fb()
     sink = _BitSink()
-    chain.append(sink)
-    tb.connect(src, *chain)
-    return sink
+    tb.connect(src, *blocks_list, soft, slicer, sink)  # single connect; a raise above leaves clean
+    return sink, soft
 
 
 def connect_psk_demod(
@@ -275,10 +271,11 @@ def connect_afsk_demod(
     mark_hz: float = 1200.0, space_hz: float = 2200.0,
 ) -> _BitSink:
     """Connect a Bell-202 AFSK demod (mark/space audio tones FM-carried) onto ``src`` and
-    return the bit sink. Mirrors gr-satellites' ``afsk_demodulator`` (GPLv3): FM-demod the
-    IQ to audio, frequency-shift the audio tone-centre to baseband, then run the upgraded
-    FSK demod on it — so AFSK inherits the DC blocker / matched filter / AGC for free. NRZI/
-    HDLC is handled downstream by the deframer. Bench-pending — AFSK is rare on 401 MHz UHF."""
+    return the bit sink. FM-demod the IQ to audio, frequency-shift the audio tone-centre to
+    baseband, then run the SatNOGS FSK demod on it — so AFSK inherits the FLL / baud-LPF /
+    dc-blocker / M&M chain for free. NRZI/HDLC is handled downstream by the deframer. The
+    float soft-symbol tap is discarded here (AFSK gr-satellites deframers are bench-pending —
+    AFSK is rare on 401 MHz UHF)."""
     af_carrier = (mark_hz + space_hz) / 2.0      # tone centre (Bell-202: 1700 Hz)
     af_dev = abs(space_hz - mark_hz) / 2.0       # tone half-spacing (500 Hz)
     # 1) FM-demod the IQ to real audio (scaling handled by the xlating + FSK demod).
@@ -287,15 +284,15 @@ def connect_afsk_demod(
     xlate = gr_filter.freq_xlating_fir_filter_fcf(
         1, gr_filter.firdes.low_pass(1.0, sample_rate, 2.0 * af_dev, 0.1 * af_dev),
         af_carrier, sample_rate)
-    # 3) Reuse the upgraded FSK demod on the complex baseband (its DC blocker absorbs any
-    #    residual tone-centre error; deviation = the tone half-spacing).
+    # 3) Reuse the SatNOGS FSK demod on the complex baseband (its dc_blocker_ff absorbs any
+    #    residual tone-centre error; the LPF is sized from the baud, so mod_index is unused here).
     profile = endurosat.LinkProfile(symbol_rate_hz=baud, mod_index=2.0 * af_dev / baud)
     # Construct + wire the FSK chain BEFORE connecting anything to ``src`` (null_sink rule,
     # docs/10 A4/A5 class): if an FSK-chain constructor raises (absurd baud → sps < 1), the
     # caller catches it — but an already-connected src→audio→xlate tap would leave xlate's
     # output dangling, abort tb.start(), and cost the IQ RECORDING. connect_gfsk_demod itself
     # builds every block first and connects last, so a raise leaves the graph untouched.
-    sink = connect_gfsk_demod(
+    sink, _soft = connect_gfsk_demod(
         tb, xlate, sample_rate, profile, decimate=False, sdr_rate=sample_rate)
     tb.connect(src, audio, xlate)
     return sink
@@ -322,9 +319,10 @@ def build_rx_top_block(
     if decimate:
         chan = make_decimator(sdr_rate, float(sample_rate))
         tb.connect(src, chan)
-    # dc_block=False: EnduroSat frames are short bursts; the DC blocker's ~32-symbol settling
-    # would eat the start of a frame. (The generic satellites fallback keeps it on by default.)
-    sink = connect_gfsk_demod(
+    # dc_block=False: EnduroSat frames are short bursts; the DC blocker's settling would eat the
+    # start of a frame. (The generic satellites fallback keeps it on by default.) The soft tap is
+    # discarded — the EnduroSat path deframes AirMAC via our numpy codec off the hard-bit sink.
+    sink, _soft = connect_gfsk_demod(
         tb, chan, float(sample_rate), profile,
         decimate=False, sdr_rate=float(sample_rate), dc_block=False,
     )

@@ -157,9 +157,12 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
             else endurosat.LinkProfile().mod_index
         profile = endurosat.LinkProfile(
             symbol_rate_hz=symbol_rate or 9600.0, mod_index=mod_index)
-        return connect_gfsk_demod(
+        # Phase 2 returns just the hard-bit sink; Phase 3 threads the soft tap up for the
+        # gr-satellites deframer fan-out (docs/12 §L.7).
+        sink, _soft = connect_gfsk_demod(
             tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate,
             channel_bw_hz=channel_bw_hz)
+        return sink
     if spec.family == "psk":
         # RX differential precedence: the backend's per-bird rfLink flag (``differential`` param)
         # when supplied wins; otherwise the robust default True — most cubesat PSK downlinks are

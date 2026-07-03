@@ -375,7 +375,8 @@ def build_satellites_rx(
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
-    tune_source(src, float(args.center_freq_hz), lo)  # lo=0 ⇒ on-center (default); DC removal handles the spike
+    # lo=0 ⇒ on-center (default); DC removal handles the spike
+    tune_source(src, float(args.center_freq_hz), lo)
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
     # Front-end plan — the ONE line that says what the RX actually did this pass (so a
@@ -438,7 +439,8 @@ def build_satellites_rx(
                   compose.plan_decode(params, catalogued=fg is not None).describe())
     except Exception as e:  # noqa: BLE001 — planning must never block decoding
         _log.debug("decode-plan compose failed (non-fatal): %s", e)
-    if fg is None and mode and grsat_live:  # not catalogued → synthesize a SatYAML (gated: see above)
+    # not catalogued → synthesize a SatYAML (gated: see above)
+    if fg is None and mode and grsat_live:
         synth = _synthetic_satyaml_path(satellite, params, float(args.center_freq_hz))
         if synth is not None:
             try:
