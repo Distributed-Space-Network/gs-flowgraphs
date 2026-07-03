@@ -373,9 +373,18 @@ def build_satellites_rx(
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
-    tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
+    tune_source(src, float(args.center_freq_hz), lo)  # lo=0 ⇒ on-center (default); DC removal handles the spike
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
+    # Front-end plan — the ONE line that says what the RX actually did this pass (so a
+    # mis-deployed offset / mis-sized channel is never silent again). If lo != 0 here on an
+    # XTRX, the signal is being thrown off-band (the driver BB CORDIC no-ops the back-shift).
+    _log.info(
+        "front-end: center=%.0f Hz lo_offset=%.0f Hz (%s) | capture=%.0f Hz channel=%.0f Hz "
+        "decimate=%s | dc_removal=%s",
+        float(args.center_freq_hz), lo, "ON-CENTER" if not lo else "OFFSET",
+        sdr_rate, channel_rate, decimate, env["dc_removal"],
+    )
 
     chan = src
     if decimate:

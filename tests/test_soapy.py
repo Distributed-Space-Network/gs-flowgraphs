@@ -20,16 +20,16 @@ from _soapy import (
 )
 
 
-def test_auto_lo_offset_dodges_dc_spike_by_default() -> None:
+def test_auto_lo_offset_on_center_by_default() -> None:
     sdr = 2_048_000.0
-    # No configured offset → auto-dodge: spike one channel-width below the bird (min 100 k),
-    # comfortably outside the channel and inside the captured band.
-    assert auto_lo_offset(sdr, 48_000.0, 0.0) == 100_000.0  # min floor for a narrow channel
-    assert auto_lo_offset(sdr, 200_000.0, 0.0) == 200_000.0  # one channel-width for a wide one
-    # An explicit GS_SDR_LO_OFFSET wins.
+    # Unset/0 → tune ON-CENTER (no offset). We no longer auto-force a dodge (the driver
+    # BB CORDIC leg is unreliable, e.g. the XTRX no-ops it); DC removal handles the spike.
+    assert auto_lo_offset(sdr, 48_000.0, 0.0) == 0.0
+    assert auto_lo_offset(sdr, 200_000.0, 0.0) == 0.0
+    # An explicit GS_SDR_LO_OFFSET is honored as-is when it fits the captured band.
     assert auto_lo_offset(sdr, 48_000.0, 250_000.0) == 250_000.0
-    # No room to dodge in the captured band (very wide channel) → 0 (DC removal handles it).
-    assert auto_lo_offset(sdr, 1_000_000.0, 0.0) == 0.0
+    # An explicit offset that doesn't fit (would push the signal out of band) → 0 (on-center).
+    assert auto_lo_offset(sdr, 48_000.0, 2_000_000.0) == 0.0
 
 
 class FakeSoapy:
