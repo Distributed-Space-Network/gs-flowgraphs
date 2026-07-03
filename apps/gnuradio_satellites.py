@@ -41,16 +41,18 @@ from _fallback_select import (  # pure, testable, no GNU Radio
 )
 from _recorder import PassRecorder
 from _soapy import (
+    DEFAULT_LO_OFFSET_HZ,
     apply_corrections,
     auto_lo_offset,
     capture_plan,
     configure_soapy_source,
+    lo_phase_inc,
     make_decimator,
+    make_lo_rotator,
     make_source,
     merge_sdr_params,
-    retune_source,
     sdr_env,
-    tune_source,
+    tune_below,
 )
 from gnuradio import gr
 
@@ -98,6 +100,8 @@ class _SatContext:
         recorder=None,
         lo_offset_hz: float = 0.0,
         *,
+        rotator=None,
+        sdr_rate_hz: float = 0.0,
         fallbacks=None,
         valve_ours=None,
         valve_grsat=None,
@@ -107,6 +111,8 @@ class _SatContext:
         self._sink = sink
         self._center = center_hz
         self._lo_offset = lo_offset_hz
+        self._rotator = rotator        # software LO+Doppler NCO (Phase 1); None ⇒ no retune
+        self._sdr_rate = sdr_rate_hz
         self._recorder = recorder
         # Frames come from gr-satellites (``sink``) and/or our own demod (``fallbacks``, one
         # demod for the bird's known mode). With demod params present AND the bird catalogued
@@ -179,7 +185,12 @@ class _SatContext:
         _log.info("%s won; gated off %s for the rest of the pass", self._winner, name)
 
     def set_doppler(self, offset_hz: float) -> None:
-        retune_source(self.src, self._center, self._lo_offset, offset_hz)
+        # Software NCO retune (gs-orbitd ephemeris → rotator), NOT a hardware LO retune: the
+        # rotator shifts the +lo_offset+doppler carrier to DC. No PLL settle glitch, and it
+        # composes with the fixed lo_offset. No rotator (shouldn't happen) ⇒ no-op.
+        if self._rotator is not None and self._sdr_rate:
+            self._rotator.set_phase_inc(
+                lo_phase_inc(self._sdr_rate, self._lo_offset, offset_hz))
 
 
 class _FallbackDemod:
@@ -369,30 +380,35 @@ def build_satellites_rx(
     channel_rate = channel_rate_for(float(sample_rate), sym, sdr_rate)
     decimate = channel_rate < sdr_rate
     # AUTO LO offset: dodge the DC/LO spike off the bird (no per-pass config — we know the
-    # frequency). tune_source keeps the signal at DC and the spike at +offset, which the
-    # decimator filters out. Honors an explicit GS_SDR_LO_OFFSET.
-    lo = auto_lo_offset(sdr_rate, channel_rate, env["lo_offset_hz"])
+    # frequency). tune_below puts the carrier at +lo_offset at baseband; the software rotator
+    # (make_lo_rotator) shifts it to DC and the decimator's LPF rejects the spike left at
+    # -lo_offset. Honors an explicit GS_SDR_LO_OFFSET, else a 100 kHz default (docs/12 Phase 1).
+    lo = auto_lo_offset(sdr_rate, channel_rate, env["lo_offset_hz"],
+                        default_offset_hz=DEFAULT_LO_OFFSET_HZ)
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
-    # lo=0 ⇒ on-center (default); DC removal handles the spike
-    tune_source(src, float(args.center_freq_hz), lo)
+    tune_below(src, float(args.center_freq_hz), lo)  # LO to center-lo_offset (plain; no BB CORDIC)
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
     # Front-end plan — the ONE line that says what the RX actually did this pass (so a
-    # mis-deployed offset / mis-sized channel is never silent again). If lo != 0 here on an
-    # XTRX, the signal is being thrown off-band (the driver BB CORDIC no-ops the back-shift).
+    # mis-deployed offset / mis-sized channel is never silent again). lo != 0 now means the
+    # SOFTWARE rotator dodges the spike (works on the XTRX, unlike the old hardware BB offset).
     _log.info(
-        "front-end: center=%.0f Hz lo_offset=%.0f Hz (%s) | capture=%.0f Hz channel=%.0f Hz "
-        "decimate=%s | dc_removal=%s",
+        "front-end: center=%.0f Hz lo_offset=%.0f Hz (%s, sw-rotator) | capture=%.0f Hz "
+        "channel=%.0f Hz decimate=%s | dc_removal=%s",
         float(args.center_freq_hz), lo, "ON-CENTER" if not lo else "OFFSET",
         sdr_rate, channel_rate, decimate, env["dc_removal"],
     )
 
-    chan = src
+    # Software LO+Doppler rotator right after the source (at the capture rate): brings the
+    # +lo_offset carrier to DC and is the mid-pass Doppler NCO (set_doppler → set_phase_inc).
+    rotator = make_lo_rotator(sdr_rate, lo, 0.0)
+    tb.connect(src, rotator)
+    chan = rotator
     if decimate:
         chan = make_decimator(sdr_rate, channel_rate)
-        tb.connect(src, chan)
+        tb.connect(rotator, chan)
 
     # Pre-demod IQ capture FIRST (the priority): it taps the channel independently of the
     # decoder, so a decoder problem never costs us the recording. At the CHANNEL rate.
@@ -499,6 +515,8 @@ def build_satellites_rx(
         float(args.center_freq_hz),
         recorder,
         lo_offset_hz=lo,
+        rotator=rotator,
+        sdr_rate_hz=sdr_rate,
         fallbacks=fallbacks,
         valve_ours=valve_ours,
         valve_grsat=valve_grsat,

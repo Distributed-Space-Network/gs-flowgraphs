@@ -26,17 +26,19 @@ import queue
 import numpy as np
 from _recorder import PassRecorder
 from _soapy import (
+    DEFAULT_LO_OFFSET_HZ,
     apply_corrections,
     auto_lo_offset,
     capture_plan,
     configure_soapy_source,
+    lo_phase_inc,
     make_decimator,
+    make_lo_rotator,
     make_sink,
     make_source,
     merge_sdr_params,
-    retune_source,
     sdr_env,
-    tune_source,
+    tune_below,
 )
 from gnuradio import analog, blocks, digital, gr
 from gnuradio import filter as gr_filter
@@ -97,12 +99,17 @@ class _RxContext:
         center_hz: float,
         recorder=None,
         lo_offset_hz: float = 0.0,
+        *,
+        rotator=None,
+        sdr_rate_hz: float = 0.0,
     ) -> None:
         self.tb = tb
         self.src = src
         self._sink = sink
         self._center = center_hz
         self._lo_offset = lo_offset_hz
+        self._rotator = rotator        # software LO+Doppler NCO (Phase 1); None ⇒ no retune
+        self._sdr_rate = sdr_rate_hz
         self._recorder = recorder
 
     def start(self) -> None:
@@ -121,7 +128,11 @@ class _RxContext:
         return self._sink.drain()
 
     def set_doppler(self, offset_hz: float) -> None:
-        retune_source(self.src, self._center, self._lo_offset, offset_hz)
+        # Software NCO retune (gs-orbitd ephemeris → rotator), NOT a hardware LO retune (docs/12
+        # Phase 1): shifts the +lo_offset+doppler carrier to DC, no PLL settle glitch.
+        if self._rotator is not None and self._sdr_rate:
+            self._rotator.set_phase_inc(
+                lo_phase_inc(self._sdr_rate, self._lo_offset, offset_hz))
 
 
 def connect_gfsk_demod(
@@ -305,20 +316,24 @@ def build_rx_top_block(
     # Capture at the SDR's supported rate (XTRX floor ~2.1 Msps) and decimate to the
     # channel rate; the demod chain runs at ``sample_rate``.
     sdr_rate, decimate = capture_plan(env["capture_rate_hz"], float(sample_rate))
-    # AUTO LO offset → DC spike dodged off the bird (no per-pass config); see _soapy.
-    lo = auto_lo_offset(sdr_rate, float(sample_rate), env["lo_offset_hz"])
+    # AUTO LO offset → DC spike dodged off the bird in SOFTWARE (rotator); see _soapy Phase 1.
+    lo = auto_lo_offset(sdr_rate, float(sample_rate), env["lo_offset_hz"],
+                        default_offset_hz=DEFAULT_LO_OFFSET_HZ)
     tb = gr.top_block("cubesat_gfsk_ax25_rx_gr")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
-    tune_source(src, float(args.center_freq_hz), lo)  # LO offset → DC spike off-signal
+    tune_below(src, float(args.center_freq_hz), lo)  # LO to center-lo_offset (plain; no BB CORDIC)
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
-    # Decimate to the channel rate ONCE; the demod chain and the recorder both tap it, so
-    # the capture is the narrow channel (~MB/min), not the multi-GB wideband SDR stream.
-    chan = src
+    # Software LO+Doppler rotator right after the source (brings the +lo_offset carrier to DC and
+    # is the mid-pass Doppler NCO). Then decimate to the channel rate ONCE; the demod chain and
+    # the recorder both tap it, so the capture is the narrow channel (~MB/min), not the wideband.
+    rotator = make_lo_rotator(sdr_rate, lo, 0.0)
+    tb.connect(src, rotator)
+    chan = rotator
     if decimate:
         chan = make_decimator(sdr_rate, float(sample_rate))
-        tb.connect(src, chan)
+        tb.connect(rotator, chan)
     # dc_block=False: EnduroSat frames are short bursts; the DC blocker's settling would eat the
     # start of a frame. (The generic satellites fallback keeps it on by default.) The soft tap is
     # discarded — the EnduroSat path deframes AirMAC via our numpy codec off the hard-bit sink.
@@ -327,7 +342,9 @@ def build_rx_top_block(
         decimate=False, sdr_rate=float(sample_rate), dc_block=False,
     )
     recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=float(sample_rate))
-    return _RxContext(tb, src, sink, float(args.center_freq_hz), recorder, lo_offset_hz=lo)
+    return _RxContext(
+        tb, src, sink, float(args.center_freq_hz), recorder,
+        lo_offset_hz=lo, rotator=rotator, sdr_rate_hz=sdr_rate)
 
 
 def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile) -> None:

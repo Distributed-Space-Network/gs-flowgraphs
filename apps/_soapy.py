@@ -209,24 +209,33 @@ def capture_plan(env_capture_rate_hz: float, channel_rate_hz: float) -> tuple[fl
     return float(channel_rate_hz), False
 
 
-def auto_lo_offset(
-    sdr_rate_hz: float, channel_rate_hz: float, configured_offset_hz: float
-) -> float:
-    """Resolve the LO offset, honoring ``GS_SDR_LO_OFFSET`` LITERALLY: unset/0 ⇒ tune
-    **ON-CENTER** (no offset) and let ``GS_SDR_DC_REMOVAL`` notch the DC/LO spike — the
-    standard narrowband approach, and now the default.
+DEFAULT_LO_OFFSET_HZ = 100_000.0  # SatNOGS lo-offset default; the software rotator dodges the spike
 
-    We no longer AUTO-force an offset. The spike-dodge only works if the −offset back-shift
-    is done where we control it (a software rotator, the SatNOGS way); ``tune_source`` does
-    it via the driver's hardware **BB CORDIC**, which the **XTRX silently no-ops** — so a
-    forced offset shoved the signal off-band. An explicit offset is still honored (for a
-    driver that does the RF/BB split), but clamped to what the captured band can hold, else
-    it too would push the signal out (→ 0 = on-center)."""
-    if not configured_offset_hz:
-        return 0.0
-    off = float(configured_offset_hz)
+
+def auto_lo_offset(
+    sdr_rate_hz: float, channel_rate_hz: float, configured_offset_hz: float,
+    *, default_offset_hz: float = 0.0,
+) -> float:
+    """Resolve the LO offset. ``GS_SDR_LO_OFFSET`` (``configured_offset_hz``) wins when set;
+    otherwise ``default_offset_hz`` is used. Returns 0 (on-center) when there is no wideband
+    headroom (``offset + channel/2`` must fit in ``sdr/2``); clamps to the largest offset the
+    captured band can hold otherwise.
+
+    ``default_offset_hz`` is the key knob: the software-rotator RX engines
+    (satellite/gfsk) pass :data:`DEFAULT_LO_OFFSET_HZ` (100 kHz) so the carrier is captured
+    off-center and a downstream rotator (:func:`tune_below` + :func:`make_lo_rotator`) shifts it to
+    DC while the decimator's LPF rejects the DC/LO spike — this works on ANY driver because the
+    shift is in software, unlike the driver BB CORDIC the **XTRX silently no-ops**. Callers that
+    still drive the hardware RF/BB split (:func:`tune_source`, e.g. the amateur-FM engine) OMIT it,
+    so an unset offset stays ON-CENTER (0) and ``GS_SDR_DC_REMOVAL`` notches the spike — giving
+    them a forced offset would push the signal off-band on the XTRX."""
     room = float(sdr_rate_hz) / 2.0 - float(channel_rate_hz) / 2.0
-    return off if off <= room else 0.0
+    if room <= 0.0:
+        return 0.0
+    off = float(configured_offset_hz) if configured_offset_hz else float(default_offset_hz)
+    if off <= 0.0:
+        return 0.0
+    return min(off, room)  # clamp to the largest offset the captured band can hold
 
 
 def resample_ratio(capture_rate_hz: float, channel_rate_hz: float) -> tuple[int, int]:
@@ -247,6 +256,29 @@ def make_decimator(capture_rate_hz: float, channel_rate_hz: float) -> Any:
     return gr_filter.rational_resampler_ccf(interpolation=interp, decimation=decim)
 
 
+def lo_phase_inc(sdr_rate_hz: float, lo_offset_hz: float, doppler_hz: float = 0.0) -> float:
+    """Rotator phase increment (rad/sample) that shifts a carrier sitting at ``+lo_offset``
+    (``+doppler``) at baseband DOWN to DC: ``-2π(lo_offset + doppler)/sdr_rate``. Pure — so the
+    LO/Doppler math is unit-testable without GNU Radio. Feed to ``blocks.rotator_cc`` /
+    ``rotator.set_phase_inc`` (see :func:`make_lo_rotator` and each engine's ``set_doppler``)."""
+    import math  # noqa: PLC0415
+
+    return -2.0 * math.pi * (float(lo_offset_hz) + float(doppler_hz)) / float(sdr_rate_hz)
+
+
+def make_lo_rotator(sdr_rate_hz: float, lo_offset_hz: float, doppler_hz: float = 0.0) -> Any:
+    """A ``blocks.rotator_cc`` (at the capture rate) that brings the ``+lo_offset`` (``+doppler``)
+    carrier to DC — the software replacement for BOTH the XTRX-broken hardware BB offset AND
+    hardware Doppler retuning. Update Doppler mid-pass with
+    ``rotator.set_phase_inc(lo_phase_inc(sdr_rate, lo_offset, doppler))`` — a pure NCO retune with
+    no PLL settle glitch, mirroring SatNOGS' ``doppler_compensation`` rotator. Sits right after the
+    source and before :func:`make_decimator`, so the decimator's LPF rejects the spike (now at
+    ``-lo_offset``, far outside the channel)."""
+    from gnuradio import blocks  # noqa: PLC0415 — bench-only
+
+    return blocks.rotator_cc(lo_phase_inc(sdr_rate_hz, lo_offset_hz, doppler_hz))
+
+
 def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
     """Per-pass ``params`` with station ``GS_SDR_*`` antenna/gain/agc filled in as
     defaults (per-pass values win). Feed the result to :func:`configure_soapy_source`."""
@@ -263,12 +295,28 @@ def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
+def tune_below(src: Any, center_hz: float, lo_offset_hz: float, *, channel: int = 0) -> None:
+    """Tune a gr-soapy source PLAINLY to ``center - lo_offset`` so the carrier lands at
+    ``+lo_offset`` at baseband, off the DC/LO spike — the SatNOGS "capture off-center, correct in
+    software" model. A downstream software rotator (:func:`make_lo_rotator`) shifts the carrier to
+    DC and the decimator's LPF rejects the spike left at ``-lo_offset``. Unlike :func:`tune_source`
+    this uses NO driver RF/BB CORDIC split (the XTRX no-ops the BB half, throwing a hardware offset
+    off-band), so the offset actually takes effect. ``lo_offset`` 0 → a plain on-center tune. This
+    is the tuning half of the Phase-1 LO-rotator path (docs/12); ``tune_source`` remains for the
+    amateur-FM engine, which still drives the driver RF/BB split directly."""
+    src.set_frequency(channel, float(center_hz) - float(lo_offset_hz))
+
+
 def tune_source(src: Any, center_hz: float, lo_offset_hz: float, *, channel: int = 0) -> None:
     """Tune a gr-soapy source/sink to ``center_hz`` using an LO offset: the analog LO
     goes to ``center+offset`` (RF) and the baseband CORDIC to ``-offset`` (BB), so the
     SDR's DC spike lands at ``+offset`` instead of on the signal. ``lo_offset_hz`` 0 →
     a plain tune. Falls back to a direct tune if the driver lacks named RF/BB
-    components (then there is simply no offset benefit)."""
+    components (then there is simply no offset benefit).
+
+    NOTE: the driver BB CORDIC is a no-op on the XTRX, so this offset does NOT take effect there —
+    the satellite/gfsk RX path uses :func:`tune_below` + :func:`make_lo_rotator` instead (docs/12
+    Phase 1). This remains for the amateur-FM engine (wideband, less spike-sensitive)."""
     if lo_offset_hz:
         try:
             src.set_frequency(channel, "RF", float(center_hz) + float(lo_offset_hz))
@@ -312,15 +360,20 @@ def apply_corrections(
 
 
 __all__ = [
+    "DEFAULT_LO_OFFSET_HZ",
     "apply_corrections",
+    "auto_lo_offset",
     "capture_plan",
     "configure_soapy_source",
+    "lo_phase_inc",
     "make_decimator",
+    "make_lo_rotator",
     "make_sink",
     "make_source",
     "merge_sdr_params",
     "resample_ratio",
     "retune_source",
     "sdr_env",
+    "tune_below",
     "tune_source",
 ]

@@ -7,29 +7,70 @@ one piece of the GNU-Radio engines we CAN test without GNU Radio.
 
 from __future__ import annotations
 
+import math
+
 from _soapy import (
+    DEFAULT_LO_OFFSET_HZ,
     apply_corrections,
     auto_lo_offset,
     capture_plan,
     configure_soapy_source,
+    lo_phase_inc,
     merge_sdr_params,
     resample_ratio,
     retune_source,
     sdr_env,
+    tune_below,
     tune_source,
 )
 
 
-def test_auto_lo_offset_on_center_by_default() -> None:
+def test_auto_lo_offset_uses_default_only_when_requested() -> None:
     sdr = 2_048_000.0
-    # Unset/0 → tune ON-CENTER (no offset). We no longer auto-force a dodge (the driver
-    # BB CORDIC leg is unreliable, e.g. the XTRX no-ops it); DC removal handles the spike.
+    d = DEFAULT_LO_OFFSET_HZ  # 100 kHz
+    # The rotator RX engines pass default_offset_hz → unset/0 AUTO-USES the 100 kHz default when
+    # the wideband capture has room to hold the offset carrier (dodges the DC/LO spike in software).
+    assert auto_lo_offset(sdr, 48_000.0, 0.0, default_offset_hz=d) == 100_000.0
+    assert auto_lo_offset(sdr, 200_000.0, 0.0, default_offset_hz=d) == 100_000.0
+    # WITHOUT default_offset_hz (the amateur-FM engine, still on the hardware BB split) an unset
+    # offset stays ON-CENTER (0) — a forced offset would push FM off-band on the XTRX no-op BB.
     assert auto_lo_offset(sdr, 48_000.0, 0.0) == 0.0
     assert auto_lo_offset(sdr, 200_000.0, 0.0) == 0.0
-    # An explicit GS_SDR_LO_OFFSET is honored as-is when it fits the captured band.
+    # An explicit GS_SDR_LO_OFFSET wins over the default and is honored as-is when it fits the band.
+    assert auto_lo_offset(sdr, 48_000.0, 250_000.0, default_offset_hz=d) == 250_000.0
     assert auto_lo_offset(sdr, 48_000.0, 250_000.0) == 250_000.0
-    # An explicit offset that doesn't fit (would push the signal out of band) → 0 (on-center).
-    assert auto_lo_offset(sdr, 48_000.0, 2_000_000.0) == 0.0
+    # An explicit offset larger than the band can hold is CLAMPED to the band edge (not 0):
+    # room = sdr/2 - channel/2 = 1_024_000 - 24_000 = 1_000_000.
+    assert auto_lo_offset(sdr, 48_000.0, 2_000_000.0, default_offset_hz=d) == 1_000_000.0
+
+
+def test_auto_lo_offset_on_center_when_no_headroom() -> None:
+    # Capturing directly at the channel rate (RTL-class, no decimation) → no room for an offset,
+    # so ON-CENTER (0) even for a rotator engine; GS_SDR_DC_REMOVAL notches the spike.
+    assert auto_lo_offset(48_000.0, 48_000.0, 0.0, default_offset_hz=DEFAULT_LO_OFFSET_HZ) == 0.0
+    assert auto_lo_offset(48_000.0, 48_000.0, 100_000.0) == 0.0
+
+
+def test_tune_below_tunes_lo_below_carrier() -> None:
+    # tune_below = a PLAIN tune to (center - lo_offset) (no RF/BB split), so the carrier lands at
+    # +lo_offset at baseband for the rotator to bring to DC.
+    src = FakeSoapy()
+    tune_below(src, 401_000_000.0, 100_000.0)
+    assert src.frequencies == [(0, 400_900_000.0)]
+    src2 = FakeSoapy()
+    tune_below(src2, 401_000_000.0, 0.0)  # no offset → plain on-center tune
+    assert src2.frequencies == [(0, 401_000_000.0)]
+
+
+def test_lo_phase_inc_shifts_carrier_to_dc() -> None:
+    # phase_inc = -2π(lo_offset + doppler)/sdr_rate. A +100 kHz carrier at 2.048 Msps:
+    assert lo_phase_inc(2_048_000.0, 100_000.0, 0.0) == \
+        -2.0 * math.pi * 100_000.0 / 2_048_000.0
+    # Doppler adds to the offset (positive doppler = carrier higher = shift down more):
+    assert lo_phase_inc(2_048_000.0, 100_000.0, 1_200.0) == \
+        -2.0 * math.pi * 101_200.0 / 2_048_000.0
+    # Zero offset + zero doppler → no rotation.
+    assert lo_phase_inc(2_048_000.0, 0.0, 0.0) == 0.0
 
 
 class FakeSoapy:
