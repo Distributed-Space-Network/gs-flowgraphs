@@ -252,15 +252,19 @@ class _FallbackDemod:
 def _build_fallbacks(
     tb, demod_src, sample_rate: float, modes=None, framing=None, differential=None,
     channel_bw_hz=None,
-) -> list[_FallbackDemod]:
-    """Build the demod(s) tapping ``demod_src`` (already at the channel rate). ``modes`` is a
-    list of ``(modulation, symbol_rate)`` tuples — normally the ONE the backend specified from
-    the transmitter record — deframed with the backend ``framing`` (verbatim label; the framing
-    registry normalizes). ``differential`` (bool | None) threads the backend's DxPSK flag to the
-    PSK demod. Modulation coverage comes from the modem registry (``modem.build_demod``)."""
+) -> tuple[list[_FallbackDemod], object]:
+    """Build the demod(s) tapping ``demod_src`` (already at the channel rate) and return
+    ``(fallbacks, soft_tap)``: the list of our numpy-deframer fallbacks, plus the FLOAT
+    soft-symbol tap of the FSK demod (or ``None``) that Phase 3 feeds to the decoupled
+    gr-satellites deframers. ``modes`` is a list of ``(modulation, symbol_rate)`` tuples —
+    normally the ONE the backend specified from the transmitter record — deframed with the backend
+    ``framing`` (verbatim label; the framing registry normalizes). ``differential`` (bool | None)
+    threads the backend's DxPSK flag to the PSK demod. Modulation coverage comes from the modem
+    registry (``modem.build_demod``)."""
     import modem  # noqa: PLC0415 — lazy: pulls in gnuradio_gfsk (GNU Radio) only at decode time
 
     out: list[_FallbackDemod] = []
+    soft_tap = None  # FSK float soft-symbol tap (last one built) for the gr-satellites deframers
     for kind, rate in modes or []:
         kind = str(kind or "").strip().lower()
         if not kind:
@@ -269,7 +273,7 @@ def _build_fallbacks(
         # so the rate exceeds ~sample_rate/2) must NOT crash the engine or cost us the IQ
         # recording — skip it and keep the others.
         try:
-            sink = modem.build_demod(
+            sink, soft = modem.build_demod(
                 kind, tb, demod_src, sample_rate, float(rate or 0.0),
                 differential=differential, channel_bw_hz=channel_bw_hz)
         except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
@@ -279,7 +283,9 @@ def _build_fallbacks(
             _log.warning("fallback demod %s@%s not implemented; skipping", kind, rate)
             continue
         out.append(_FallbackDemod(f"{kind}{int(rate or 0)}", sink, framing))
-    return out
+        if soft is not None:
+            soft_tap = soft
+    return out, soft_tap
 
 
 def _backend_mode(params: dict | None) -> tuple[str, float] | None:
@@ -313,6 +319,58 @@ def _build_grsatellites(selector, channel_rate: float, satellite):
     except Exception as e:  # noqa: BLE001 — not catalogued / API drift
         _log.info("gr-satellites: no decoder for %s (%s)", satellite, e)
         return None
+
+
+def make_grsat_deframers(framing) -> list:
+    """Map a framing label → a LIST of gr-satellites DEFRAMER hier-blocks
+    (``satellites.components.deframers.*``) that consume the FLOAT soft-symbol tap of OUR demod and
+    emit frame PDUs on their ``out`` message port. This is the SatNOGS-robust decouple (docs/12
+    Phase 3): we demodulate ONCE (connect_gfsk_demod) and reuse gr-satellites' proven deframers on
+    the soft tap — NOT the monolithic ``gr_satellites_flowgraph`` that did its own demod+resample on
+    raw IQ and buffer-deadlocked, starving the recorder.
+
+    GUARDED at every step: if gr-satellites isn't importable, or a deframer ctor drifts / rejects
+    its args, that entry is skipped (logged) and the rest still build — a decoder problem must never
+    crash the engine or cost the IQ recording. Returns ``[]`` for a framing with no gr-satellites
+    deframer (decoded by our numpy deframers, or record-only). AX.25 races both G3RUH scramblings
+    (mirrors ``framings.deframe``). Do NOT NRZI/descramble upstream — each deframer does its own."""
+    f = str(framing or "").strip().lower()
+    if not f:
+        return []
+    try:
+        from satellites.components.deframers import (  # noqa: PLC0415 — bench-only (gr-satellites)
+            ax25_deframer,
+            ax100_deframer,
+            endurosat_deframer,
+            usp_deframer,
+        )
+    except Exception as e:  # noqa: BLE001 — no gr-satellites here → numpy deframers only
+        _log.info("gr-satellites deframers unavailable (%s); our numpy deframers only", e)
+        return []
+
+    def _try(make):
+        try:
+            return make()
+        except Exception as e:  # noqa: BLE001 — API drift / bad ctor args → skip this deframer
+            _log.warning("gr-satellites deframer for %r failed to build (%s); skipping", f, e)
+            return None
+
+    if "g3ruh" in f:
+        out = [_try(lambda: ax25_deframer(True, options=None))]
+    elif f in ("ax25", "ax.25", "aprs"):  # try both scramblings (mirrors framings.deframe)
+        out = [_try(lambda: ax25_deframer(False, options=None)),
+               _try(lambda: ax25_deframer(True, options=None))]
+    elif "ax100" in f and ("5" in f or "asm" in f or "golay" in f):
+        out = [_try(lambda: ax100_deframer(5, options=None))]
+    elif "ax100" in f and ("6" in f or "rs" in f or "reed" in f):
+        out = [_try(lambda: ax100_deframer(6, options=None))]
+    elif f == "usp":
+        out = [_try(lambda: usp_deframer(options=None))]
+    elif f == "endurosat":
+        out = [_try(lambda: endurosat_deframer(options=None))]
+    else:
+        out = []
+    return [d for d in out if d is not None]
 
 
 def _gr_satellites_selector(satellite) -> dict | None:
@@ -414,58 +472,38 @@ def build_satellites_rx(
     # decoder, so a decoder problem never costs us the recording. At the CHANNEL rate.
     recorder = PassRecorder.maybe_start(args, tb, chan, sample_rate_hz=channel_rate)
 
-    # Engine selection (per backend params). Both tap the SAME channel stream (one SDR open,
-    # fanned out — no hardware conflict; the dynamic SDR control, Doppler, is ephemeris-driven
-    # on the shared source, identical for both). CPU is the only shared cost, and two chains is
-    # cheap (the 12-demod bank is what overran the RX DMA, not two):
-    #   * demod params present AND a gr-satellites decoder exists → BOTH, each behind a valve;
-    #     the first to produce a CRC-valid frame wins and the loser's valve is gated off.
-    #   * demod params present, no gr-satellites decoder → OUR engine only.
-    #   * only a NORAD / a demod param missing → gr-satellites only.
-    # The gr-satellites decoder is the catalogued SatYAML when the bird is known; otherwise, if
-    # the backend gave (modulation, framing, baud), a SYNTHETIC SatYAML so we still get its full
-    # ~50-deframer library for a non-catalogued bird (docs/08 Ph1).
+    # Engine selection (per backend params). Everything taps the SAME channel stream (one SDR
+    # open, fanned out — no hardware conflict). Phase 3 (docs/12) DECOUPLES gr-satellites from the
+    # recording the SatNOGS-robust way: we demodulate ONCE (our connect_gfsk_demod) and feed
+    #   * the hard-bit sink → our numpy deframers, and
+    #   * the FLOAT soft-symbol tap → gr-satellites' own DEFRAMER components (make_grsat_deframers),
+    # so BOTH decode libraries run off one demod. The frames are collected + deduped in
+    # _SatContext.drain_frames (both are cheap → no valve gating needed; a CRC-less KISS hit is a
+    # product but never suppresses the others). The monolithic gr_satellites_flowgraph — which did
+    # its OWN demod+resample on raw IQ and buffer-DEADLOCKED, starving the recorder (cmd_70) —
+    # survives ONLY for the no-demod-params catalogued case, and stays GATED (GS_GRSAT_LIVE). The
+    # decoupled deframers are gated too for now, pending bench proof they can't backpressure the
+    # recorder; default stays our-numpy-only + a bulletproof recording.
     from gnuradio import blocks  # noqa: PLC0415 — bench-only
 
     sink = _FrameSink()
     fallbacks: list[_FallbackDemod] = []
-    valve_ours = valve_grsat = None
+    grsat_deframers: list = []
     selector = _gr_satellites_selector(satellite)
     framing = (params or {}).get("framing")
     differential = (params or {}).get("differential")
     if not isinstance(differential, bool):
         differential = None  # absent/garbage → PSK demod keeps its robust default
     mode = _backend_mode(params)  # (modulation, symbol_rate) when both present
-    # gr-satellites' gr_satellites_flowgraph, wired LIVE into this shared graph, DEADLOCKS on the
-    # RZ/V2H bench: a message/buffer deadlock backpressures the SDR source and STARVES THE RECORDER
-    # (observed on cmd_70 — 84 KB then frozen the whole pass). The recording is the priority and
-    # must never be wedged by a decoder, so the live gr-satellites path is OFF until it is decoupled
-    # from recording the SatNOGS-robust way (record live, deframe where it can't backpressure).
-    # Our own engine + local deframers still run. Opt-in via GS_GRSAT_LIVE=1 for isolated testing.
     grsat_live = os.environ.get("GS_GRSAT_LIVE", "").strip().lower() in ("1", "true", "yes", "on")
-    fg = _build_grsatellites(selector, channel_rate, satellite) if grsat_live else None
     if not grsat_live:
-        _log.info("gr-satellites LIVE decode disabled (deadlocks on this hw → starves the "
-                  "recorder); our engine only. Set GS_GRSAT_LIVE=1 to force.")
-    # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
-    # the backend rfLink implies. The construction below still drives the graph; the plan is the
-    # single explanation of the choice (and the seam a future satellite_rx composition builds on).
-    try:
-        _log.info("decode plan: %s",
-                  compose.plan_decode(params, catalogued=fg is not None).describe())
-    except Exception as e:  # noqa: BLE001 — planning must never block decoding
-        _log.debug("decode-plan compose failed (non-fatal): %s", e)
-    # not catalogued → synthesize a SatYAML (gated: see above)
-    if fg is None and mode and grsat_live:
-        synth = _synthetic_satyaml_path(satellite, params, float(args.center_freq_hz))
-        if synth is not None:
-            try:
-                fg = _build_grsatellites({"file": synth}, channel_rate, satellite)
-            finally:
-                with contextlib.suppress(OSError):
-                    os.remove(synth)  # gr-satellites parsed it in __init__; safe to remove
-            if fg is not None:
-                _log.info("gr-satellites via synthetic SatYAML for %s (not catalogued)", satellite)
+        _log.info("gr-satellites decode gated off (GS_GRSAT_LIVE unset → the recorder can never be "
+                  "starved); our numpy engine only. Set GS_GRSAT_LIVE=1 to also run gr-satellites.")
+    # The monolithic flowgraph (own demod on raw IQ, deadlock-prone) is ONLY for the no-mode
+    # catalogued case — with demod params we use the decoupled deframers below instead.
+    fg = None
+    if grsat_live and not mode:
+        fg = _build_grsatellites(selector, channel_rate, satellite)
     # Spectral inversion (rfLink ``invert``): conjugate the DECODE tap only — the recorder keeps
     # the raw channel so the .cf32 is always what was actually received.
     demod_tap = chan
@@ -473,41 +511,74 @@ def build_satellites_rx(
         demod_tap = blocks.conjugate_cc()
         tb.connect(chan, demod_tap)
         _log.info("spectral inversion: conjugating the decode tap (recorder stays raw)")
-    if mode and fg is not None:  # race both
-        valve_ours = blocks.copy(gr.sizeof_gr_complex)
-        valve_grsat = blocks.copy(gr.sizeof_gr_complex)
-        tb.connect(demod_tap, valve_ours)
-        tb.connect(demod_tap, valve_grsat, fg)
-        tb.msg_connect(fg, "out", sink, "in")
-        fallbacks = _build_fallbacks(
-            tb, valve_ours, channel_rate, modes=[mode], framing=framing, differential=differential,
-            channel_bw_hz=float(args.bandwidth_hz or 0) or None)
-        if not fallbacks:  # demod failed to build → valve_ours must not dangle (start() aborts)
-            tb.connect(valve_ours, blocks.null_sink(gr.sizeof_gr_complex))
-        _log.info("racing: our engine %s@%.0f + gr-satellites %r (first frame wins)",
-                  mode[0], mode[1], selector)
-    elif mode:  # our engine only (no gr-satellites decoder — not catalogued, un-synthesizable)
-        fallbacks = _build_fallbacks(
+    if mode:
+        # Our demod ONCE → (numpy-deframer fallbacks, FSK float soft tap).
+        fallbacks, soft = _build_fallbacks(
             tb, demod_tap, channel_rate, modes=[mode], framing=framing, differential=differential,
             channel_bw_hz=float(args.bandwidth_hz or 0) or None)
-        _log.info("our engine: %s@%.0f on %.0f Hz channel (framing=%s)",
-                  mode[0], mode[1], channel_rate, framing or "auto")
-    elif fg is not None:  # gr-satellites only (no demod params)
+        # Decoupled gr-satellites deframers on the soft tap (FLOAT valve, message out → the SAME
+        # sink), racing our numpy deframers off one demod. Gated; empty for a framing they don't
+        # cover (our numpy engine / record-only carries it).
+        if grsat_live and soft is not None:
+            grsat_deframers = make_grsat_deframers(framing)
+            for d in grsat_deframers:
+                tb.connect(soft, blocks.copy(gr.sizeof_float), d)
+                tb.msg_connect(d, "out", sink, "in")
+        # No decoupled deframer covers this framing → fall back to the (gated, deadlock-prone)
+        # monolithic gr_satellites_flowgraph: catalogued SatYAML, else a SYNTHETIC one from the
+        # backend (modulation, baud, framing) so the FULL ~50-deframer library still applies
+        # (docs/08 Ph1). The common framings (AX.25/AX100/USP/EnduroSat) never reach here — they
+        # are covered above, so the target birds never touch the deadlock path.
+        if grsat_live and not grsat_deframers:
+            fg = _build_grsatellites(selector, channel_rate, satellite)
+            if fg is None:
+                synth = _synthetic_satyaml_path(satellite, params, float(args.center_freq_hz))
+                if synth is not None:
+                    try:
+                        fg = _build_grsatellites({"file": synth}, channel_rate, satellite)
+                    finally:
+                        with contextlib.suppress(OSError):
+                            os.remove(synth)  # gr-satellites parsed it in __init__; safe to remove
+            if fg is not None:
+                tb.connect(demod_tap, fg)
+                tb.msg_connect(fg, "out", sink, "in")
+                _log.info("gr-satellites monolithic (gated) for %s framing=%s (no decoupled "
+                          "deframer)", satellite, framing or "?")
+        if not fallbacks and not grsat_deframers and fg is None:
+            # Nothing consumes demod_tap (demod failed to build) → terminate so start() can't abort
+            # the graph (and cost the recording). connect_gfsk_demod itself connects-last, so a
+            # partial chain never dangles; this covers the "build returned None" case.
+            tb.connect(demod_tap, blocks.null_sink(gr.sizeof_gr_complex))
+        _log.info("our demod %s@%.0f on %.0f Hz channel (framing=%s)%s",
+                  mode[0], mode[1], channel_rate, framing or "auto",
+                  f" + {len(grsat_deframers)} gr-satellites deframer(s)" if grsat_deframers else "")
+    elif fg is not None:  # no demod params → catalogued monolithic gr-satellites only (gated)
         tb.connect(demod_tap, fg)
         tb.msg_connect(fg, "out", sink, "in")
-        _log.info("gr-satellites only for %s (no demod params)", satellite)
+        _log.info("gr-satellites monolithic only for %s (no demod params)", satellite)
     else:
         _log.warning("no decode: no demod params and no gr-satellites decoder for %r", satellite)
+    # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
+    # the backend rfLink implies. Construction above drives the graph; the plan is the explanation.
+    try:
+        catalogued = fg is not None or bool(grsat_deframers)
+        _log.info("decode plan: %s",
+                  compose.plan_decode(params, catalogued=catalogued).describe())
+    except Exception as e:  # noqa: BLE001 — planning must never block decoding
+        _log.debug("decode-plan compose failed (non-fatal): %s", e)
     # GNU Radio validates ALL stream ports at start(); a consumer-less tap would abort the whole
     # graph and cost us the recording. Terminate any tap that ended up without a consumer:
-    #   * demod_tap: no decoder built (no-decode branch, or every fallback failed to build) — and
-    #     when demod_tap is the conjugate block it ALWAYS needs a consumer (it's fed from chan);
+    #   * demod_tap: no decoder built (no-decode branch) — and when demod_tap is the conjugate block
+    #     it ALWAYS needs a consumer (it's fed from chan);
     #   * chan: nothing at all downstream (decoders on a dead branch AND recording disabled).
-    decode_consumers = bool(fallbacks) or fg is not None or valve_ours is not None
+    decode_consumers = bool(fallbacks) or fg is not None or bool(grsat_deframers)
     if not decode_consumers and demod_tap is not chan:
         tb.connect(demod_tap, blocks.null_sink(gr.sizeof_gr_complex))
     elif not decode_consumers and recorder is None:
         tb.connect(chan, blocks.null_sink(gr.sizeof_gr_complex))
+    # Decoupled model: both decode libraries run off our one demod, so there are no valves to gate
+    # (valve_ours/valve_grsat stay None → drain_frames just collects + dedups; the race_winner
+    # gating it still carries is dormant unless a future path re-introduces valves).
     return _SatContext(
         tb,
         src,
@@ -518,8 +589,6 @@ def build_satellites_rx(
         rotator=rotator,
         sdr_rate_hz=sdr_rate,
         fallbacks=fallbacks,
-        valve_ours=valve_ours,
-        valve_grsat=valve_grsat,
     )
 
 

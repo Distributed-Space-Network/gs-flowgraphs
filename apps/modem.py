@@ -124,12 +124,14 @@ def mod_families() -> set[str]:
 def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
                 *, differential: bool | None = None, channel_bw_hz: float | None = None):
     """Build the GNU Radio demod chain for ``kind`` tapping ``src`` (already at the channel rate)
-    and return its bit sink (``drain()`` → hard bits), or ``None`` if unsupported / build-pending.
+    and return ``(bit_sink, soft_tap)``: the hard-bit sink (``drain()`` → hard bits) and — for the
+    FSK family only — the FLOAT soft-symbol tap that gr-satellites deframer components consume
+    (``None`` for non-FSK). ``(None, None)`` when the modulation is unsupported / build-pending.
 
-    FSK → tuned quadrature-demod chain; PSK (2/4/8) → FLL+Costas chain (order from the spec);
-    AFSK → FM-demod + tone xlate → FSK chain. Tier 2 (QAM/APSK/OFDM/DVB-S2) routes to the
-    ``gnuradio_hirate`` bench constructors. M-FSK and offset/8-PSK are classified but their
-    dedicated slicer/loop is bench build-pending (return ``None`` with a log, never crash).
+    FSK → tuned quadrature-demod chain (exposes the soft tap); PSK (2/4/8) → FLL+Costas chain
+    (order from the spec); AFSK → FM-demod + tone xlate → FSK chain. Tier 2 (QAM/APSK/OFDM/DVB-S2)
+    routes to the ``gnuradio_hirate`` bench constructors. M-FSK and offset/8-PSK are classified but
+    their dedicated slicer/loop is bench build-pending (return ``(None, None)``, never crash).
 
     ``differential`` is the backend's per-bird DxPSK flag (rfLink → params ``differential``):
     True/False is honoured by the PSK chain; ``None`` (backend didn't say) keeps the robust
@@ -138,11 +140,11 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
 
     spec = modulation_spec(kind)
     if spec is None:
-        return None  # unrecognized — return BEFORE importing GNU Radio (import-safe)
+        return None, None  # unrecognized — return BEFORE importing GNU Radio (import-safe)
     if spec.tier == 2:
-        return _build_tier2_demod(spec, tb, src, sample_rate, symbol_rate)
+        return _build_tier2_demod(spec, tb, src, sample_rate, symbol_rate), None
     if spec.tier == 3:
-        return _build_tier3_demod(spec, tb, src, sample_rate)
+        return _build_tier3_demod(spec, tb, src, sample_rate), None
 
     from gnuradio_gfsk import (  # noqa: PLC0415 — GNU Radio only; keeps this module import-safe
         connect_afsk_demod,
@@ -157,26 +159,26 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
             else endurosat.LinkProfile().mod_index
         profile = endurosat.LinkProfile(
             symbol_rate_hz=symbol_rate or 9600.0, mod_index=mod_index)
-        # Phase 2 returns just the hard-bit sink; Phase 3 threads the soft tap up for the
-        # gr-satellites deframer fan-out (docs/12 §L.7).
-        sink, _soft = connect_gfsk_demod(
+        # (bit_sink, soft_tap): the caller feeds bits to our numpy deframers and the soft tap to
+        # the gr-satellites deframers (docs/12 §L.7 Phase 3).
+        return connect_gfsk_demod(
             tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate,
             channel_bw_hz=channel_bw_hz)
-        return sink
     if spec.family == "psk":
         # RX differential precedence: the backend's per-bird rfLink flag (``differential`` param)
         # when supplied wins; otherwise the robust default True — most cubesat PSK downlinks are
         # differentially encoded, a bare "bpsk" name doesn't say, and a "dbpsk" name agrees with
-        # the default anyway. order/offset route 8-PSK/OQPSK (bench-pending loop tuning).
+        # the default anyway. order/offset route 8-PSK/OQPSK (bench-pending loop tuning). No float
+        # soft tap — PSK deframers take complex symbols, not the FSK float tap.
         rx_diff = differential if differential is not None else True
         return connect_psk_demod(
             tb, src, sample_rate, symbol_rate or 1200.0,
-            order=spec.order, differential=rx_diff, offset=spec.offset)
+            order=spec.order, differential=rx_diff, offset=spec.offset), None
     if spec.family == "afsk":
-        return connect_afsk_demod(tb, src, sample_rate, baud=symbol_rate or 1200.0)
+        return connect_afsk_demod(tb, src, sample_rate, baud=symbol_rate or 1200.0), None
     # mfsk — dedicated M-level slicer not built yet on the bench.
     logging.getLogger("modem").info("modem: %s (%s) build-pending; skipping", kind, spec.family)
-    return None
+    return None, None
 
 
 def _build_tier2_demod(spec, tb, src, sample_rate: float, symbol_rate: float):
