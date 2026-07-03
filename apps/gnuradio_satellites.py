@@ -419,7 +419,17 @@ def build_satellites_rx(
     if not isinstance(differential, bool):
         differential = None  # absent/garbage → PSK demod keeps its robust default
     mode = _backend_mode(params)  # (modulation, symbol_rate) when both present
-    fg = _build_grsatellites(selector, channel_rate, satellite)  # None if not catalogued
+    # gr-satellites' gr_satellites_flowgraph, wired LIVE into this shared graph, DEADLOCKS on the
+    # RZ/V2H bench: a message/buffer deadlock backpressures the SDR source and STARVES THE RECORDER
+    # (observed on cmd_70 — 84 KB then frozen the whole pass). The recording is the priority and
+    # must never be wedged by a decoder, so the live gr-satellites path is OFF until it is decoupled
+    # from recording the SatNOGS-robust way (record live, deframe where it can't backpressure).
+    # Our own engine + local deframers still run. Opt-in via GS_GRSAT_LIVE=1 for isolated testing.
+    grsat_live = os.environ.get("GS_GRSAT_LIVE", "").strip().lower() in ("1", "true", "yes", "on")
+    fg = _build_grsatellites(selector, channel_rate, satellite) if grsat_live else None
+    if not grsat_live:
+        _log.info("gr-satellites LIVE decode disabled (deadlocks on this hw → starves the "
+                  "recorder); our engine only. Set GS_GRSAT_LIVE=1 to force.")
     # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
     # the backend rfLink implies. The construction below still drives the graph; the plan is the
     # single explanation of the choice (and the seam a future satellite_rx composition builds on).
@@ -428,7 +438,7 @@ def build_satellites_rx(
                   compose.plan_decode(params, catalogued=fg is not None).describe())
     except Exception as e:  # noqa: BLE001 — planning must never block decoding
         _log.debug("decode-plan compose failed (non-fatal): %s", e)
-    if fg is None and mode:  # not catalogued → synthesize a SatYAML from the backend rfLink
+    if fg is None and mode and grsat_live:  # not catalogued → synthesize a SatYAML (gated: see above)
         synth = _synthetic_satyaml_path(satellite, params, float(args.center_freq_hz))
         if synth is not None:
             try:
