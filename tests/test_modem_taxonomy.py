@@ -68,4 +68,12 @@ def test_normalization_is_case_space_underscore_insensitive():
 def test_unknown_modulation_is_none():
     assert modem.modulation_spec("") is None
     assert modem.modulation_spec("smoke-signals") is None
+
+
+def test_build_demod_unrecognized_returns_none_tuple():
+    # build_demod returns a 2-tuple (bit_sink, soft_tap) on EVERY path (docs/12 Phase 3). An
+    # unrecognized modulation short-circuits BEFORE importing GNU Radio, so this pins the tuple
+    # contract off-bench — a regression to a bare `return None` would break `sink, soft = ...`.
+    assert modem.build_demod("smoke-signals", None, None, 48_000.0, 1_200.0) == (None, None)
+    assert modem.build_demod("", None, None, 48_000.0, 1_200.0) == (None, None)
     assert modem.modulation_spec(None) is None

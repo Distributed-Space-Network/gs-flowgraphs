@@ -39,9 +39,11 @@ def test_auto_lo_offset_uses_default_only_when_requested() -> None:
     # An explicit GS_SDR_LO_OFFSET wins over the default and is honored as-is when it fits the band.
     assert auto_lo_offset(sdr, 48_000.0, 250_000.0, default_offset_hz=d) == 250_000.0
     assert auto_lo_offset(sdr, 48_000.0, 250_000.0) == 250_000.0
-    # An explicit offset larger than the band can hold is CLAMPED to the band edge (not 0):
-    # room = sdr/2 - channel/2 = 1_024_000 - 24_000 = 1_000_000.
-    assert auto_lo_offset(sdr, 48_000.0, 2_000_000.0, default_offset_hz=d) == 1_000_000.0
+    # An explicit offset larger than the band can hold falls back to ON-CENTER (0), NOT the band
+    # edge — the historical safe behavior (a hardware-split FM caller can't dodge an off-band offset
+    # on the XTRX; a min(off,room) clamp regressed it). room = 1_024_000 - 24_000 = 1_000_000.
+    assert auto_lo_offset(sdr, 48_000.0, 2_000_000.0, default_offset_hz=d) == 0.0
+    assert auto_lo_offset(sdr, 48_000.0, 2_000_000.0) == 0.0  # FM (no-default) caller: also 0
 
 
 def test_auto_lo_offset_on_center_when_no_headroom() -> None:

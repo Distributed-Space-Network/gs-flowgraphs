@@ -217,9 +217,8 @@ def auto_lo_offset(
     *, default_offset_hz: float = 0.0,
 ) -> float:
     """Resolve the LO offset. ``GS_SDR_LO_OFFSET`` (``configured_offset_hz``) wins when set;
-    otherwise ``default_offset_hz`` is used. Returns 0 (on-center) when there is no wideband
-    headroom (``offset + channel/2`` must fit in ``sdr/2``); clamps to the largest offset the
-    captured band can hold otherwise.
+    otherwise ``default_offset_hz`` is used. Returns 0 (ON-CENTER) when there is no wideband
+    headroom OR when the offset can't fit the captured band (``offset + channel/2 > sdr/2``).
 
     ``default_offset_hz`` is the key knob: the software-rotator RX engines
     (satellite/gfsk) pass :data:`DEFAULT_LO_OFFSET_HZ` (100 kHz) so the carrier is captured
@@ -228,14 +227,21 @@ def auto_lo_offset(
     shift is in software, unlike the driver BB CORDIC the **XTRX silently no-ops**. Callers that
     still drive the hardware RF/BB split (:func:`tune_source`, e.g. the amateur-FM engine) OMIT it,
     so an unset offset stays ON-CENTER (0) and ``GS_SDR_DC_REMOVAL`` notches the spike — giving
-    them a forced offset would push the signal off-band on the XTRX."""
+    them a forced offset would push the signal off-band on the XTRX.
+
+    An offset that OVERFLOWS the band (``off > room``) falls back to ON-CENTER, NOT the band edge:
+    the 100 kHz default is well below ``room`` for any realistic capture/channel, so only a mis-set
+    explicit ``GS_SDR_LO_OFFSET`` (or an unphysical near-full-band channel) reaches here, and a
+    hardware-split (FM) caller can't dodge an off-band offset at all — on-center is the only safe
+    result. (Restores the pre-rotator semantics; a ``min(off, room)`` clamp regressed FM-on-XTRX to
+    off-band tuning.)"""
     room = float(sdr_rate_hz) / 2.0 - float(channel_rate_hz) / 2.0
     if room <= 0.0:
         return 0.0
     off = float(configured_offset_hz) if configured_offset_hz else float(default_offset_hz)
-    if off <= 0.0:
-        return 0.0
-    return min(off, room)  # clamp to the largest offset the captured band can hold
+    if off <= 0.0 or off > room:
+        return 0.0  # on-center: unset, or the offset can't fit the captured band
+    return off
 
 
 def resample_ratio(capture_rate_hz: float, channel_rate_hz: float) -> tuple[int, int]:
