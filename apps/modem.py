@@ -122,7 +122,7 @@ def mod_families() -> set[str]:
 
 # ── Chain construction (GNU Radio, lazy) ─────────────────────────────────────────────────────
 def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
-                *, differential: bool | None = None):
+                *, differential: bool | None = None, channel_bw_hz: float | None = None):
     """Build the GNU Radio demod chain for ``kind`` tapping ``src`` (already at the channel rate)
     and return its bit sink (``drain()`` → hard bits), or ``None`` if unsupported / build-pending.
 
@@ -158,7 +158,8 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
         profile = endurosat.LinkProfile(
             symbol_rate_hz=symbol_rate or 9600.0, mod_index=mod_index)
         return connect_gfsk_demod(
-            tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate)
+            tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate,
+            channel_bw_hz=channel_bw_hz)
     if spec.family == "psk":
         # RX differential precedence: the backend's per-bird rfLink flag (``differential`` param)
         # when supplied wins; otherwise the robust default True — most cubesat PSK downlinks are

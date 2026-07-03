@@ -126,7 +126,7 @@ class _RxContext:
 
 def connect_gfsk_demod(
     tb, src, sample_rate: float, profile: endurosat.LinkProfile, *,
-    decimate: bool, sdr_rate: float, dc_block: bool = True,
+    decimate: bool, sdr_rate: float, dc_block: bool = True, channel_bw_hz: float | None = None,
 ) -> _BitSink:
     """Connect a 2-GFSK/FSK/GMSK demod chain onto ``src`` and return the bit sink
     (``drain()`` → hard bits). Mirrors gr-satellites' ``fsk_demodulator`` (GPLv3) so our
@@ -150,12 +150,24 @@ def connect_gfsk_demod(
     chain: list = []
     if decimate:  # SDR capture-rate → channel-rate first
         chain.append(make_decimator(sdr_rate, float(sample_rate)))
-    # 1) Carson's-rule LPF before the discriminator — cut out-of-band noise. Skip when the
-    #    channel is already narrower than Carson's bandwidth.
+    # 0) COMPLEX DC blocker — kill the SDR's DC/LO spike BEFORE the discriminator. An on-center
+    #    capture can leave a huge residual spike the hardware corrector misses (bench-measured
+    #    ~+46 dB at 0 Hz); left in, it dominates the complex amplitude and the FSK phase swing is
+    #    buried in the quad-demod. Narrow notch (~50 Hz) so it never touches the FSK tones (≥ a
+    #    few hundred Hz off DC). Gated by dc_block (skipped for the short-burst cubesat path).
+    if dc_block:
+        chain.append(gr_filter.dc_blocker_cc(max(64, int(round(sample_rate / 50.0))), True))
+    # 1) Pre-discriminator LPF. Default = Carson's rule from the (possibly ASSUMED h=0.5)
+    #    deviation; but when the operator provisioned a WIDER channel bandwidth, honor it — a bird
+    #    whose true deviation exceeds the assumption has its tones outside a Carson filter sized
+    #    from ~600 Hz, and clamping to Carson would filter the signal away. Never below Carson.
     carson = abs(deviation) + baud / 2.0
-    if carson < sample_rate / 2.0:
+    cutoff = carson
+    if channel_bw_hz and channel_bw_hz / 2.0 > carson:
+        cutoff = min(channel_bw_hz / 2.0, 0.9 * sample_rate / 2.0)
+    if cutoff < sample_rate / 2.0:
         chain.append(gr_filter.fir_filter_ccf(
-            1, gr_filter.firdes.low_pass(1.0, sample_rate, carson, 0.1 * carson)))
+            1, gr_filter.firdes.low_pass(1.0, sample_rate, cutoff, 0.1 * cutoff)))
     # 2) Quadrature demod: instantaneous frequency scaled so ±deviation → ~±1.
     chain.append(analog.quadrature_demod_cf(sample_rate / (2.0 * math.pi * deviation)))
     # 3) Square-pulse matched filter (+ the internal decimation to ~10 sps).

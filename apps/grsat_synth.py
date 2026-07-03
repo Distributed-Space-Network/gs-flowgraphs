@@ -26,34 +26,6 @@ _MOD_INDEX = {"gmsk": 0.5, "msk": 0.5}
 _DEFAULT_MOD_INDEX = 0.5  # most cubesat GFSK / 2-FSK ~ h = 0.5
 
 
-# Needles for gr-satellites SatYAML framing families, for labels not in the advertised
-# (deliberately non-exhaustive) framings.grsatellites_framings() list. "ax.25" (with the dot)
-# matches SatYAML labels but NOT the local token "ax25" — local-only tokens are not
-# synthesizable (gr-satellites doesn't know them; our own engine deframes those).
-# NOTE: no "ccsds" needle — CCSDS labels are matched ONLY against the exact advertised list
-# (gr-satellites has strictly qualified CCSDS labels; "CCSDS TM"/"ccsds aos"/bare "CCSDS" would
-# all fail its constructor, so the plan must not claim them synthesizable).
-_GRSAT_NEEDLES = (
-    "ax.25", "ax100", "usp", "mobitex", "geoscan", "ao-40", "ngham", "u482c",
-    "fx.25", "snet", "openlst", "smog", "reaktor", "tt-64", "sanosat", "grizu", "aalto",
-    "lucky", "eseo", "fossasat", "qubik", "hades", "nusat",
-)
-
-
-def _grsat_framing(framing) -> bool:
-    """True when ``framing`` looks like gr-satellites SatYAML vocabulary: an exact
-    (case-insensitive) advertised label, or a label of a known family. Rejects local-only
-    tokens (``ax25``/``endurosat``/``kiss``/…) and garbage."""
-    import framings  # noqa: PLC0415 — sibling registry, import-safe
-
-    s = str(framing or "").strip().lower()
-    if not s:
-        return False
-    if s in {f.lower() for f in framings.grsatellites_framings()}:
-        return True
-    return any(n in s for n in _GRSAT_NEEDLES)
-
-
 def can_synthesize(modulation, baud, framing) -> bool:
     """True when the gr-satellites synthetic-SatYAML path applies: gr-satellites can demodulate
     the modulation (FSK/BPSK/AFSK family), ``baud`` is present, and ``framing`` is gr-satellites
@@ -61,8 +33,9 @@ def can_synthesize(modulation, baud, framing) -> bool:
     composer report the path without writing a file. NOTE: the runtime write path stays
     slightly more permissive (any truthy framing) because ``gr_satellites_flowgraph``'s own
     constructor is the authoritative validator and attempts are cheap + guarded."""
+    import framings  # noqa: PLC0415 — outbound framing normalization (single point)
     kind = str(modulation or "").strip().lower()
-    return bool(_GRSAT_MOD.get(kind) and baud and _grsat_framing(framing))
+    return bool(_GRSAT_MOD.get(kind) and baud and framings.to_grsatellites_framing(framing) is not None)
 
 
 def synthetic_satyaml(norad, modulation, baud, framing, frequency_hz, *, name=None):
@@ -71,15 +44,19 @@ def synthetic_satyaml(norad, modulation, baud, framing, frequency_hz, *, name=No
     ``framing``/``baud`` is missing. The ``framing`` string must be gr-satellites' vocabulary
     (e.g. ``"AX.25 G3RUH"``, ``"USP"``, ``"AX100 ASM+Golay"``, ``"CCSDS Concatenated"``) — which
     is exactly what the backend surfaces (it is scraped from gr-satellites' own SatYAML)."""
+    import framings  # noqa: PLC0415 — sibling registry; the single (outbound) normalization point
     kind = str(modulation or "").strip().lower()
     mod = _GRSAT_MOD.get(kind)
-    if not mod or not framing or not baud:
+    # Translate to gr-satellites vocabulary (local 'ax25' -> 'AX.25'); None ⇒ local-only framing
+    # (endurosat/ccsds_tm/kiss) that gr-satellites can't build → not synthesizable, decode locally.
+    gr_framing = framings.to_grsatellites_framing(framing)
+    if not mod or gr_framing is None or not baud:
         return None
     tx: dict = {
         "frequency": float(frequency_hz or 0.0),
         "modulation": mod,
         "baudrate": int(baud),
-        "framing": str(framing),
+        "framing": gr_framing,
     }
     if mod == "FSK":
         tx["deviation"] = int(round(_MOD_INDEX.get(kind, _DEFAULT_MOD_INDEX) * baud / 2.0))

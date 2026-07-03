@@ -239,7 +239,8 @@ class _FallbackDemod:
 
 
 def _build_fallbacks(
-    tb, demod_src, sample_rate: float, modes=None, framing=None, differential=None
+    tb, demod_src, sample_rate: float, modes=None, framing=None, differential=None,
+    channel_bw_hz=None,
 ) -> list[_FallbackDemod]:
     """Build the demod(s) tapping ``demod_src`` (already at the channel rate). ``modes`` is a
     list of ``(modulation, symbol_rate)`` tuples — normally the ONE the backend specified from
@@ -258,7 +259,8 @@ def _build_fallbacks(
         # recording — skip it and keep the others.
         try:
             sink = modem.build_demod(
-                kind, tb, demod_src, sample_rate, float(rate or 0.0), differential=differential)
+                kind, tb, demod_src, sample_rate, float(rate or 0.0),
+                differential=differential, channel_bw_hz=channel_bw_hz)
         except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
             _log.warning("fallback demod %s@%s failed to build (%s); skipping", kind, rate, e)
             continue
@@ -450,14 +452,16 @@ def build_satellites_rx(
         tb.connect(demod_tap, valve_grsat, fg)
         tb.msg_connect(fg, "out", sink, "in")
         fallbacks = _build_fallbacks(
-            tb, valve_ours, channel_rate, modes=[mode], framing=framing, differential=differential)
+            tb, valve_ours, channel_rate, modes=[mode], framing=framing, differential=differential,
+            channel_bw_hz=float(args.bandwidth_hz or 0) or None)
         if not fallbacks:  # demod failed to build → valve_ours must not dangle (start() aborts)
             tb.connect(valve_ours, blocks.null_sink(gr.sizeof_gr_complex))
         _log.info("racing: our engine %s@%.0f + gr-satellites %r (first frame wins)",
                   mode[0], mode[1], selector)
     elif mode:  # our engine only (no gr-satellites decoder — not catalogued, un-synthesizable)
         fallbacks = _build_fallbacks(
-            tb, demod_tap, channel_rate, modes=[mode], framing=framing, differential=differential)
+            tb, demod_tap, channel_rate, modes=[mode], framing=framing, differential=differential,
+            channel_bw_hz=float(args.bandwidth_hz or 0) or None)
         _log.info("our engine: %s@%.0f on %.0f Hz channel (framing=%s)",
                   mode[0], mode[1], channel_rate, framing or "auto")
     elif fg is not None:  # gr-satellites only (no demod params)

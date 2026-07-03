@@ -122,6 +122,35 @@ def normalize_framing(label) -> str | None:
     return None
 
 
+# OUTBOUND normalization (the reverse of :func:`normalize_framing`): a LOCAL token that
+# gr-satellites can ALSO build → its SatYAML ``framing:`` label. Only ``ax25`` qualifies; the
+# other local tokens are decoded ONLY in-process (``endurosat``/AirMAC is not gr-satellites
+# vocabulary; ``ccsds_tm`` needs per-bird qualified coding gr-satellites can't infer; ``kiss`` is
+# a TNC byte framing, not a SatYAML framing) → they must NOT be handed to gr-satellites.
+_GRSAT_LABEL = {"ax25": "AX.25"}
+_NO_GRSAT = frozenset({"endurosat", "airmac", "ccsds_tm", "kiss"})
+
+
+def to_grsatellites_framing(label) -> str | None:
+    """Map ANY framing label to a gr-satellites SatYAML ``framing:`` string for the synthetic
+    SatYAML path, or ``None`` when gr-satellites has no synthetic deframer for it (a local-only
+    token → decode in-process / record-only).
+
+    This is the OUTBOUND half of the single normalization point (docs/10 P0-2). A recognized
+    local token is translated (``ax25`` → ``AX.25``); a local-only token returns ``None``; every
+    OTHER label passes through VERBATIM — the ``gr_satellites_flowgraph`` constructor is the
+    authoritative validator and :data:`GRSATELLITES_FRAMINGS` is deliberately non-exhaustive, so
+    real gr-satellites labels (``AX.25 G3RUH``, ``USP``, ``AX100 Mode 5``, …) must not be
+    collapsed or dropped here."""
+    s = str(label or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low in _NO_GRSAT:
+        return None
+    return _GRSAT_LABEL.get(low, s)
+
+
 def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     """Byte-oriented framings (KISS/SLIP) after a bit-level demod have an arbitrary bit phase —
     recover by decoding ALL 8 alignments in strict mode and returning the deduped UNION. Picking

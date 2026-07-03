@@ -4,12 +4,24 @@ from __future__ import annotations
 import compose
 
 
-def test_local_token_framing_is_our_engine_only():
-    # The LOCAL token "ax25" is not gr-satellites SatYAML vocabulary → our engine, no synthetic.
+def test_local_token_ax25_races_grsatellites():
+    # The local token "ax25" translates OUTBOUND to the gr-satellites label "AX.25"
+    # (framings.to_grsatellites_framing), so BOTH engines decode it — our AX.25 deframer AND
+    # gr-satellites' AX.25 via synthetic SatYAML — and race (first valid frame wins). Restores the
+    # gr-satellites redundancy the verbatim-token bug had killed for the whole ax25-default class.
     plan = compose.plan_decode(
         {"modulation": "gfsk", "symbol_rate_hz": 9600, "framing": "ax25"}, catalogued=False)
     assert plan.our_modem and plan.our_framing and plan.our_engine
     assert not plan.grsat_catalogued
+    assert plan.grsat_synthesizable and plan.race
+
+
+def test_local_only_framing_is_our_engine_only():
+    # A genuinely local-only framing (endurosat/AirMAC) has NO gr-satellites equivalent
+    # (to_grsatellites_framing → None) → our engine only, no synthetic racer.
+    plan = compose.plan_decode(
+        {"modulation": "gfsk", "symbol_rate_hz": 9600, "framing": "endurosat"}, catalogued=False)
+    assert plan.our_modem and plan.our_framing and plan.our_engine
     assert not plan.grsat_synthesizable and not plan.race
 
 
