@@ -28,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+from _doppler import NullDopplerSource, make_doppler_source, run_doppler_poll
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
@@ -90,6 +91,22 @@ async def amain(args) -> int:
     started = asyncio.Event()
     stop_requested = asyncio.Event()
     doppler = {"hz": 0.0}
+    # Doppler v2 (docs/12): the flowgraph OWNS Doppler by POLLING a source (gs-orbitd ``ephem_at``,
+    # or a Hamlib rigctld fallback) at --doppler-poll-hz and driving the rotator itself — instead of
+    # depending on the orchestrator to push set_doppler over the control socket (a path coupled to
+    # orchestrator liveness that broke repeatedly). When no source resolves (NullDopplerSource) we
+    # fall back to the legacy control-socket push (the 2 s apply in the engine loop below).
+    doppler_source = make_doppler_source(
+        source=getattr(args, "doppler_source", "auto"),
+        center_freq_hz=float(args.center_freq_hz or 0.0),
+        orbitd_host=getattr(args, "orbitd_host", "127.0.0.1"),
+        orbitd_port=int(getattr(args, "orbitd_port", 45400) or 45400),
+        orbitd_handle=getattr(args, "orbitd_handle", "") or "",
+        rigctl_host=getattr(args, "rigctl_host", "") or "",
+        rigctl_port=int(getattr(args, "rigctl_port", 4532) or 4532),
+    )
+    doppler_poll = not isinstance(doppler_source, NullDopplerSource)
+    poll_period_s = 1.0 / max(1.0, float(getattr(args, "doppler_poll_hz", 25.0) or 25.0))
 
     await send_event(
         sockets.status_writer,
@@ -156,10 +173,25 @@ async def amain(args) -> int:
             stop_requested.set()
             return
         last_doppler = 0.0
+        # Flowgraph OWNS Doppler: poll the source and drive ctx.set_doppler at the poll rate,
+        # decoupled from the control socket. Runs until stop_requested; a source outage just keeps
+        # the last offset (run_doppler_poll never raises). When no source resolved, this is skipped
+        # and the legacy control-socket push (below) applies instead.
+        doppler_task = None
+        if doppler_poll:
+            doppler_task = asyncio.create_task(
+                run_doppler_poll(doppler_source, ctx.set_doppler, stop_requested,
+                                 period_s=poll_period_s),
+                name="doppler-poll",
+            )
+            log.info("doppler: flowgraph-owned poll @ %.0f Hz", 1.0 / poll_period_s)
         try:
             while not stop_requested.is_set():
                 await asyncio.sleep(_DECODE_PERIOD_S)
-                if doppler["hz"] != last_doppler:
+                # Legacy control-socket push — ONLY when no poll source resolved (else the poll owns
+                # Doppler and this would fight it). Retained so a station without gs-orbitd/rigctld
+                # still gets orchestrator-pushed Doppler (backward compatible).
+                if not doppler_poll and doppler["hz"] != last_doppler:
                     last_doppler = doppler["hz"]
                     ctx.set_doppler(last_doppler)
                 # Decode is LIVE: gr-satellites and/or our one demod (the bird's backend mode),
@@ -170,6 +202,10 @@ async def amain(args) -> int:
                         sockets, frame, satellite, decoder=source, output_dir=out_dir
                     )
         finally:
+            if doppler_task is not None:
+                doppler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await doppler_task
             ctx.stop()
             ctx.wait()
 

@@ -60,6 +60,18 @@ def build_argparser(*, prog: str, description: str) -> argparse.ArgumentParser:
     # stream before demod and writes capture artifacts into --output-dir.
     p.add_argument("--record-iq", action="store_true")
     p.add_argument("--record-formats", default="")  # comma list: sdf,csv,png
+    # Doppler v2 (docs/12): the flowgraph OWNS Doppler by POLLING a source at a fixed cadence
+    # (SatNOGS-style), not the orchestrator pushing set_doppler. All optional with safe defaults —
+    # an old orchestrator that passes none of these leaves the source unresolved (record-only /
+    # legacy control-socket push). --orbitd-handle is the gs-orbitd plan handle the orchestrator
+    # materialized for this pass; --rigctl-host selects the Hamlib fallback for a station w/o gs-orbitd.
+    p.add_argument("--doppler-source", default="auto")  # auto | orbitd | rigctld | none
+    p.add_argument("--orbitd-host", default="127.0.0.1")
+    p.add_argument("--orbitd-port", type=int, default=45400)
+    p.add_argument("--orbitd-handle", default="")
+    p.add_argument("--rigctl-host", default="")
+    p.add_argument("--rigctl-port", type=int, default=4532)
+    p.add_argument("--doppler-poll-hz", type=float, default=25.0)
     return p
 
 
