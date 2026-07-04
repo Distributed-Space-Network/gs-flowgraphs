@@ -24,6 +24,7 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -94,8 +95,10 @@ async def amain(args) -> int:
     # Doppler v2 (docs/12): the flowgraph OWNS Doppler by POLLING a source (gs-orbitd ``ephem_at``,
     # or a Hamlib rigctld fallback) at --doppler-poll-hz and driving the rotator itself — instead of
     # depending on the orchestrator to push set_doppler over the control socket (a path coupled to
-    # orchestrator liveness that broke repeatedly). When no source resolves (NullDopplerSource) we
-    # fall back to the legacy control-socket push (the 2 s apply in the engine loop below).
+    # orchestrator liveness that broke repeatedly). When NO source resolves (NullDopplerSource) the
+    # legacy control-socket push in the engine loop drives Doppler instead. When a source resolves
+    # but then DIES mid-pass, run_doppler_poll's fallback_offset takes over the pushed value (still
+    # streamed into ``doppler["hz"]`` below) so Doppler doesn't freeze at a stale offset.
     doppler_source = make_doppler_source(
         source=getattr(args, "doppler_source", "auto"),
         center_freq_hz=float(args.center_freq_hz or 0.0),
@@ -138,7 +141,9 @@ async def amain(args) -> int:
 
     async def _on_set_doppler(cmd: dict[str, object]) -> None:
         off = cmd.get("offset_hz", 0)
-        if isinstance(off, (int, float)):
+        # Reject bool (isinstance(True, int)) and non-finite NaN/inf (json.loads accepts them) — a
+        # bad pushed value must not become the fallback offset that drives the rotator (docs/12).
+        if isinstance(off, (int, float)) and not isinstance(off, bool) and math.isfinite(off):
             doppler["hz"] = float(off)
 
     async def _engine() -> None:  # pragma: no cover (bench)
@@ -176,12 +181,15 @@ async def amain(args) -> int:
         # Flowgraph OWNS Doppler: poll the source and drive ctx.set_doppler at the poll rate,
         # decoupled from the control socket. Runs until stop_requested; a source outage just keeps
         # the last offset (run_doppler_poll never raises). When no source resolved, this is skipped
-        # and the legacy control-socket push (below) applies instead.
+        # and the legacy control-socket push (below) applies instead. fallback_offset hands the
+        # pushed offset (``doppler["hz"]``, kept fresh by _on_set_doppler) to the poll loop if the
+        # source dies mid-pass, so a gs-orbitd outage/handle-eviction can't freeze Doppler.
         doppler_task = None
         if doppler_poll:
             doppler_task = asyncio.create_task(
                 run_doppler_poll(doppler_source, ctx.set_doppler, stop_requested,
-                                 period_s=poll_period_s),
+                                 period_s=poll_period_s,
+                                 fallback_offset=lambda: doppler["hz"]),
                 name="doppler-poll",
             )
             log.info("doppler: flowgraph-owned poll @ %.0f Hz", 1.0 / poll_period_s)

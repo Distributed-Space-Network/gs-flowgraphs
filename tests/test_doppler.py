@@ -281,3 +281,95 @@ def test_poll_loop_survives_a_raising_apply() -> None:
 
     seen = asyncio.run(run())
     assert 50.0 in seen and 500.0 in seen  # the raise on the first didn't kill the loop
+
+
+class _SteadySource:
+    """Always delivers the same offset (never None) — a poll source that stays healthy."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+        self.closed = False
+
+    async def read_offset_hz(self) -> float | None:
+        return self.value
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_fallback_ignored_while_source_healthy() -> None:
+    # A live source owns Doppler; the fallback (pushed offset) is NEVER applied while reads succeed.
+    async def run() -> list[float]:
+        applied: list[float] = []
+        stop = asyncio.Event()
+        src = _SteadySource(100.0)
+        task = asyncio.create_task(
+            run_doppler_poll(src, applied.append, stop, period_s=0.001, resend_threshold_hz=10.0,
+                             fallback_offset=lambda: 9999.0, fallback_grace_s=0.005))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+        return applied
+
+    applied = asyncio.run(run())
+    assert applied == [100.0]  # only the source value; the 9999 fallback never fires
+    assert 9999.0 not in applied
+
+
+def test_fallback_takes_over_when_source_dies_midpass() -> None:
+    # Source resolves (100), then dies (None forever). After the grace, the orchestrator's pushed
+    # offset takes over instead of freezing at 100 — the mid-pass-death fix.
+    async def run() -> list[float]:
+        applied: list[float] = []
+        stop = asyncio.Event()
+        pushed = {"hz": 2500.0}  # the orchestrator has been pushing since ARM (kept fresh offline)
+        src = _FakeSource([100.0])  # one good read, then None forever
+        # grace = 2 ticks; generous sleep so the loop actually runs enough ticks despite the
+        # coarse (~15 ms) OS timer that stretches a nominal 1 ms period on some platforms.
+        task = asyncio.create_task(
+            run_doppler_poll(src, applied.append, stop, period_s=0.001, resend_threshold_hz=10.0,
+                             fallback_offset=lambda: pushed["hz"], fallback_grace_s=0.002))
+        await asyncio.sleep(0.2)
+        stop.set()
+        await task
+        return applied
+
+    applied = asyncio.run(run())
+    assert applied[0] == 100.0  # the live source value applied first
+    assert 2500.0 in applied  # after the source died past the grace, the pushed offset took over
+
+
+def test_no_fallback_freezes_last_offset_when_source_dies() -> None:
+    # Without a fallback (default), a dead source keeps the last offset — the pre-fix behavior,
+    # preserved for the no-orchestrator-push case (e.g. a rigctld-only station with no ephemeris).
+    async def run() -> list[float]:
+        applied: list[float] = []
+        stop = asyncio.Event()
+        src = _FakeSource([100.0])  # one read, then None forever; no fallback provided
+        task = asyncio.create_task(
+            run_doppler_poll(src, applied.append, stop, period_s=0.001, resend_threshold_hz=10.0))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+        return applied
+
+    applied = asyncio.run(run())
+    assert applied == [100.0]  # frozen at the last offset; nothing else applied
+
+
+def test_poll_loop_skips_nonfinite_offset() -> None:
+    # A NaN/inf offset (decayed-TLE range-rate, or a bad pushed value) must NOT reach the rotator —
+    # even on the first apply, where the resend-threshold guard short-circuits on last is None.
+    async def run() -> list[float]:
+        applied: list[float] = []
+        stop = asyncio.Event()
+        src = _FakeSource([float("nan"), float("inf"), 300.0])
+        task = asyncio.create_task(
+            run_doppler_poll(src, applied.append, stop, period_s=0.001, resend_threshold_hz=10.0))
+        await asyncio.sleep(0.15)
+        stop.set()
+        await task
+        return applied
+
+    applied = asyncio.run(run())
+    assert applied == [300.0]  # nan and inf skipped; only the finite value applied

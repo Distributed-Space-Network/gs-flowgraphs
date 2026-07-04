@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -40,6 +41,7 @@ DEFAULT_ORBITD_PORT = 45400
 DEFAULT_RIGCTLD_PORT = 4532
 DEFAULT_POLL_PERIOD_S = 0.04  # 25 Hz — smooth near TCA; tune per box (OS scheduler tick)
 DEFAULT_RESEND_THRESHOLD_HZ = 10.0  # only retune the rotator once the offset moves this far
+DEFAULT_FALLBACK_GRACE_S = 1.0  # source dead this long → the pushed offset takes over
 
 
 def doppler_shift_hz(center_freq_hz: float, range_rate_mps: float) -> float:
@@ -227,12 +229,27 @@ async def run_doppler_poll(
     source: DopplerSource, apply_offset: Callable[[float], None], stop: asyncio.Event,
     *, period_s: float = DEFAULT_POLL_PERIOD_S,
     resend_threshold_hz: float = DEFAULT_RESEND_THRESHOLD_HZ,
+    fallback_offset: Callable[[], float | None] | None = None,
+    fallback_grace_s: float = DEFAULT_FALLBACK_GRACE_S,
 ) -> None:
     """Poll ``source`` every ``period_s`` and call ``apply_offset(hz)`` (→ the rotator) whenever
     the offset moves past ``resend_threshold_hz``. Runs until ``stop`` is set. NEVER propagates a
-    source error — a None read just skips the tick and keeps the last offset, so a Doppler-source
-    outage can never wedge the recorder. The flowgraph OWNS this loop (SatNOGS-style)."""
+    source error — a None read just skips the tick, so a Doppler-source outage can never wedge the
+    recorder. The flowgraph OWNS this loop (SatNOGS-style).
+
+    ``fallback_offset`` guards the failure mode where the source RESOLVES at spawn (so the caller
+    latched into poll mode and gated off its own legacy push) then DIES mid-pass: instead of
+    freezing at a stale offset for the rest of the window, once the source has gone
+    ``fallback_grace_s`` of WALL-CLOCK time without a live read we apply ``fallback_offset()`` — the
+    orchestrator's control-socket push, computed offline from the ARM-materialized ephemeris and
+    valid even if gs-orbitd is gone. The grace is a monotonic-clock deadline, NOT a poll count, so a
+    slow/hung read (which can block up to the source's connect/rpc timeout) can't stretch the
+    hand-off. A single reader applies here, so poll and fallback never fight; a good source read
+    resets the grace and reclaims ownership. ``None`` ⇒ no fallback (freeze, as before). Non-finite
+    offsets (a NaN/inf from a decayed-TLE range-rate or a bad pushed value) are never applied."""
     last: float | None = None
+    loop = asyncio.get_running_loop()
+    last_ok = loop.time()  # monotonic time of the last live read — the wall-clock grace anchor
     try:
         while not stop.is_set():
             try:
@@ -241,7 +258,17 @@ async def run_doppler_poll(
                 # in a source must not kill the poll task and freeze Doppler for the whole pass.
                 _log.exception("doppler: read_offset_hz raised; keeping last offset")
                 offset = None
-            if offset is not None and (last is None or abs(offset - last) >= resend_threshold_hz):
+            if offset is not None:
+                last_ok = loop.time()  # a live source read reclaims Doppler ownership
+            elif fallback_offset is not None and loop.time() - last_ok >= fallback_grace_s:
+                # source dead past the (wall-clock) grace → the pushed offset takes over.
+                try:
+                    offset = fallback_offset()
+                except Exception:  # noqa: BLE001 — a bad fallback must not kill the poll/recorder
+                    _log.exception("doppler: fallback_offset() raised")
+                    offset = None
+            if (offset is not None and math.isfinite(offset)
+                    and (last is None or abs(offset - last) >= resend_threshold_hz)):
                 try:
                     apply_offset(offset)
                     last = offset
