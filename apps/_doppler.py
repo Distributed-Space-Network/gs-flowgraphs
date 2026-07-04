@@ -29,7 +29,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -91,7 +90,10 @@ class _LineClient:
                 timeout=self._connect_timeout_s,
             )
             return True
-        except (OSError, TimeoutError) as e:
+        except (OSError, asyncio.TimeoutError) as e:  # noqa: UP041 — asyncio.TimeoutError is a
+            # DISTINCT class from builtin TimeoutError on Python 3.10 (our declared floor); they
+            # were unified only in 3.11. asyncio.wait_for raises the asyncio class, so we MUST name
+            # it here or a connect timeout escapes uncaught on 3.10.
             _log.debug("doppler: connect %s:%s failed (%s)", self._host, self._port, e)
             await self._reset()
             return False
@@ -110,7 +112,11 @@ class _LineClient:
                 await self._reset()
                 return None
             return raw.decode("utf-8", errors="replace").rstrip("\n")
-        except (OSError, TimeoutError, asyncio.IncompleteReadError) as e:
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,  # noqa: UP041 (3.10)
+                asyncio.LimitOverrunError, ValueError) as e:
+            # asyncio.TimeoutError: distinct from builtin TimeoutError on 3.10 (see _ensure).
+            # LimitOverrunError/ValueError: a too-long or undecodable reply line must reconnect,
+            # not propagate — _LineClient must NEVER raise to the poll loop.
             _log.debug("doppler: rpc to %s:%s failed (%s); reconnecting", self._host, self._port, e)
             await self._reset()
             return None
@@ -128,12 +134,18 @@ class _LineClient:
 
 
 class OrbitdDopplerSource:
-    """Poll gs-orbitd ``ephem_at{handle, now}`` → ``range_rate_mps`` → Doppler Hz. The plan
-    ``handle`` is the one gs-client materialized at ARM (valid until LOS+margin)."""
+    """Poll gs-orbitd ``ephem_at{handle}`` → ``range_rate_mps`` → Doppler Hz. The plan ``handle``
+    is the one gs-client materialized at ARM (valid until LOS+margin).
+
+    We OMIT ``t_unix_s`` so gs-orbitd interpolates at ITS OWN GPS-disciplined clock — the plan and
+    the query instant then share one time frame by construction. Indexing with the flowgraph's raw
+    host clock (a possibly-skewed ``time.time()``) would query Doppler in the wrong frame; near TCA
+    a second of skew is hundreds of Hz. ``now_fn`` stays as an OPTIONAL override for tests/replay
+    (when set, its value is sent as ``t_unix_s``); production leaves it ``None`` (omit)."""
 
     def __init__(
         self, host: str, port: int, handle: str, center_freq_hz: float,
-        *, now_fn: Callable[[], float] = time.time,
+        *, now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._client = _LineClient(host, port)
         self._handle = handle
@@ -141,8 +153,10 @@ class OrbitdDopplerSource:
         self._now_fn = now_fn
 
     async def read_offset_hz(self) -> float | None:
-        req = json.dumps({"op": "ephem_at", "handle": self._handle, "t_unix_s": self._now_fn()})
-        reply = await self._client.request_line(req)
+        req: dict[str, Any] = {"op": "ephem_at", "handle": self._handle}
+        if self._now_fn is not None:  # test/replay override; production omits t -> daemon's clock
+            req["t_unix_s"] = self._now_fn()
+        reply = await self._client.request_line(json.dumps(req))
         if reply is None:
             return None
         try:
@@ -187,7 +201,7 @@ def make_doppler_source(
     *, source: str, center_freq_hz: float,
     orbitd_host: str = "127.0.0.1", orbitd_port: int = DEFAULT_ORBITD_PORT, orbitd_handle: str = "",
     rigctl_host: str = "", rigctl_port: int = DEFAULT_RIGCTLD_PORT,
-    now_fn: Callable[[], float] = time.time,
+    now_fn: Callable[[], float] | None = None,
 ) -> DopplerSource:
     """Pick the Doppler source (pure — no I/O; a source that can't actually connect just returns
     None each poll). ``source``: ``auto`` prefers orbitd (needs a handle) then rigctld (needs a
@@ -221,14 +235,21 @@ async def run_doppler_poll(
     last: float | None = None
     try:
         while not stop.is_set():
-            offset = await source.read_offset_hz()
+            try:
+                offset = await source.read_offset_hz()
+            except Exception:  # noqa: BLE001 — contract: NEVER propagate a source error; a bug/edge
+                # in a source must not kill the poll task and freeze Doppler for the whole pass.
+                _log.exception("doppler: read_offset_hz raised; keeping last offset")
+                offset = None
             if offset is not None and (last is None or abs(offset - last) >= resend_threshold_hz):
                 try:
                     apply_offset(offset)
                     last = offset
                 except Exception:  # noqa: BLE001 — a rotator glitch must not kill the poll/recorder
                     _log.exception("doppler: apply_offset(%.1f) raised", offset)
-            with contextlib.suppress(TimeoutError):
+            # asyncio.TimeoutError (NOT builtin TimeoutError) is what wait_for raises on 3.10 — this
+            # fires EVERY tick on the normal path, so getting the class wrong killed the whole poll.
+            with contextlib.suppress(asyncio.TimeoutError):  # noqa: UP041 — 3.10 distinct class
                 await asyncio.wait_for(stop.wait(), timeout=period_s)
     finally:
         await source.aclose()

@@ -79,7 +79,7 @@ def _orbitd_handler(range_rate_mps: float):
             reply = {
                 "handle": req["handle"],
                 "sample": {
-                    "t_unix_s": req["t_unix_s"], "az_deg": 0.0, "el_deg": 0.0,
+                    "t_unix_s": req.get("t_unix_s", 0.0), "az_deg": 0.0, "el_deg": 0.0,
                     "az_rate_dps": 0.0, "el_rate_dps": 0.0, "range_m": 0.0,
                     "range_rate_mps": range_rate_mps,
                 },
@@ -105,6 +105,35 @@ def test_orbitd_source_polls_and_converts() -> None:
 
     off = asyncio.run(run())
     assert off == pytest.approx(-401_000_000.0 * 2000.0 / _C)
+
+
+def test_orbitd_source_omits_t_unix_s_by_default() -> None:
+    # Production omits t_unix_s so gs-orbitd interpolates at ITS OWN GPS-disciplined clock — the
+    # query instant and the plan then share one time frame (no flowgraph host-clock skew).
+    async def run() -> dict:
+        seen: dict = {}
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            line = await reader.readline()
+            seen["req"] = json.loads(line)
+            reply = {"handle": "p-1", "sample": {
+                "t_unix_s": 0.0, "az_deg": 0.0, "el_deg": 0.0, "az_rate_dps": 0.0,
+                "el_rate_dps": 0.0, "range_m": 0.0, "range_rate_mps": 100.0}, "clamped": False}
+            writer.write((json.dumps(reply) + "\n").encode())
+            await writer.drain()
+
+        server, port = await _serve(handle)
+        try:
+            src = OrbitdDopplerSource("127.0.0.1", port, "p-1", 4e8)  # NO now_fn -> omit t
+            await src.read_offset_hz()
+            await src.aclose()
+            return seen["req"]
+        finally:
+            await _shutdown(server)
+
+    req = asyncio.run(run())
+    assert req["op"] == "ephem_at" and req["handle"] == "p-1"
+    assert "t_unix_s" not in req  # omitted -> daemon uses its disciplined clock
 
 
 def test_orbitd_source_returns_none_when_unreachable() -> None:
