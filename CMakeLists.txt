@@ -56,6 +56,7 @@ install(
   FILES
     apps/_spawn_contract.py
     apps/_soapy.py                   # SoapySDR gain/antenna config, shared by the GR engines
+    apps/_doppler.py                 # flowgraph-owned Doppler poll (docs/12), imported by satellite_rx
     apps/_recorder.py                # pre-demod IQ capture (cf32/CSV/PNG), imported by the RX engines
     apps/_fallback_select.py         # fallback demod selection (imported by gnuradio_satellites)
     apps/modem.py                    # modem registry: modulation -> demod chain (docs/08)
