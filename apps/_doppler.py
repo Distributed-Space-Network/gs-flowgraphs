@@ -235,6 +235,7 @@ async def run_doppler_poll(
     offsets (a NaN/inf from a decayed-TLE range-rate or a bad pushed value) are never applied."""
     last: float | None = None
     on_fallback = False  # so the poll→push handoff is logged once (visible in the INFO journal)
+    last_log = 0.0  # throttle the "applying" INFO so the journal SHOWS the Doppler curve
     loop = asyncio.get_running_loop()
     last_ok = loop.time()  # monotonic time of the last live read — the wall-clock grace anchor
     try:
@@ -267,6 +268,10 @@ async def run_doppler_poll(
                 try:
                     apply_offset(offset)
                     last = offset
+                    now = loop.time()  # log the applied offset ~every 5 s: a visible tracking curve
+                    if now - last_log >= 5.0:
+                        last_log = now
+                        _log.info("doppler: applying %.0f Hz to the rotator", offset)
                 except Exception:  # noqa: BLE001 — a rotator glitch must not kill the poll/recorder
                     _log.exception("doppler: apply_offset(%.1f) raised", offset)
             # asyncio.TimeoutError (NOT builtin TimeoutError) is what wait_for raises on 3.10 — this
