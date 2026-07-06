@@ -148,9 +148,21 @@ class OrbitdDopplerSource:
         *, now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._client = _LineClient(host, port)
+        self._host = host
+        self._port = int(port)
         self._handle = handle
         self._f0 = float(center_freq_hz)
         self._now_fn = now_fn
+        self._failed = False  # so a persistent failure is logged LOUD once, not silently at DEBUG
+
+    def _note_failure(self, msg: str) -> None:
+        # First failure → WARNING (visible in the INFO journal, so a dead Doppler source is never
+        # invisible again); repeats → DEBUG to avoid spamming 25×/s.
+        if self._failed:
+            _log.debug("doppler: %s", msg)
+        else:
+            self._failed = True
+            _log.warning("doppler: %s", msg)
 
     async def read_offset_hz(self) -> float | None:
         req: dict[str, Any] = {"op": "ephem_at", "handle": self._handle}
@@ -158,13 +170,23 @@ class OrbitdDopplerSource:
             req["t_unix_s"] = self._now_fn()
         reply = await self._client.request_line(json.dumps(req))
         if reply is None:
+            self._note_failure(
+                f"no reply from gs-orbitd at {self._host}:{self._port} (op=ephem_at "
+                f"handle={self._handle}) — is the daemon running? Doppler is NOT being applied.")
             return None
         try:
             obj: Any = json.loads(reply)
             rr = float(obj["sample"]["range_rate_mps"])
         except (ValueError, KeyError, TypeError):
-            _log.debug("doppler: bad ephem_at reply %r", reply[:120])
+            self._note_failure(
+                f"gs-orbitd ephem_at returned no usable sample (reply={reply[:200]!r}). A "
+                f"gs-orbitd older than the ephem_at op (Doppler v2) answers this with an error "
+                f"— REDEPLOY gs-orbitd. Doppler is NOT being applied.")
             return None
+        if self._failed:  # recovered after a warning — say so
+            self._failed = False
+            _log.info("doppler: ephem_at recovered @ %s:%s — Doppler applying again",
+                      self._host, self._port)
         return doppler_shift_hz(self._f0, rr)
 
     async def aclose(self) -> None:
@@ -212,6 +234,7 @@ async def run_doppler_poll(
     resets the grace and reclaims ownership. ``None`` ⇒ no fallback (freeze, as before). Non-finite
     offsets (a NaN/inf from a decayed-TLE range-rate or a bad pushed value) are never applied."""
     last: float | None = None
+    on_fallback = False  # so the poll→push handoff is logged once (visible in the INFO journal)
     loop = asyncio.get_running_loop()
     last_ok = loop.time()  # monotonic time of the last live read — the wall-clock grace anchor
     try:
@@ -224,8 +247,16 @@ async def run_doppler_poll(
                 offset = None
             if offset is not None:
                 last_ok = loop.time()  # a live source read reclaims Doppler ownership
+                if on_fallback:
+                    on_fallback = False
+                    _log.info("doppler: poll source recovered — poll owns Doppler again")
             elif fallback_offset is not None and loop.time() - last_ok >= fallback_grace_s:
                 # source dead past the (wall-clock) grace → the pushed offset takes over.
+                if not on_fallback:
+                    on_fallback = True
+                    _log.warning(
+                        "doppler: poll source silent for >%.1fs — driving Doppler from the "
+                        "orchestrator push instead (check gs-orbitd ephem_at)", fallback_grace_s)
                 try:
                     offset = fallback_offset()
                 except Exception:  # noqa: BLE001 — a bad fallback must not kill the poll/recorder
