@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from _fallback_select import symbol_rate_hz_of
 from _soapy import apply_corrections, configure_soapy_source, merge_sdr_params, sdr_env
 from _spawn_contract import (
     build_argparser,
@@ -81,7 +82,7 @@ def _build_frame_iq(args, params: dict[str, object], profile) -> np.ndarray:
         # Uplink payload is the already-built (encrypted AirMAC) frame; wrap it in
         # the EnduroSat chip packet (preamble + sync + len + CRC-16) at 9600 sym/s
         # (endurosat_link defaults), honouring params overrides if present.
-        sym_hz = float(params.get("symbol_rate_hz", endurosat_link.DEFAULT_SYMBOL_RATE_HZ))
+        sym_hz = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
         return endurosat_link.transmit(
             payload[: endurosat_link.MAX_PAYLOAD],
             sample_rate,

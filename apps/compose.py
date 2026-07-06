@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import framings
 import grsat_synth
 import modem
+from _fallback_select import symbol_rate_hz_of
 
 
 @dataclass(frozen=True)
@@ -87,10 +88,7 @@ def plan_decode(params: dict | None, *, catalogued: bool = False) -> DecodePlan:
     modulation = str(p.get("modulation") or "").strip().lower() or None
     framing = str(p.get("framing")).strip() if p.get("framing") not in (None, "") else None
     fec = str(p.get("fec")).strip() if p.get("fec") not in (None, "") else None
-    try:
-        baud = float(p.get("symbol_rate_hz") or 0.0)
-    except (TypeError, ValueError):
-        baud = 0.0
+    baud = symbol_rate_hz_of(p)  # baud/baudrate/symbol_rate_hz — interchangeable
     spec = modem.modulation_spec(modulation) if modulation else None
     # A framing is "ours" when the registry normalizes it to a LOCAL deframer — this accepts
     # backend/SatYAML labels verbatim ("AX.25 G3RUH" → ax25), not just local tokens.

@@ -6,7 +6,7 @@ The fallback-demod bank (``fallback_modes`` / ``GS_FALLBACK_DEMODS``) was remove
 """
 from __future__ import annotations
 
-from _fallback_select import CHANNEL_OVERSAMPLE, channel_rate_for
+from _fallback_select import CHANNEL_OVERSAMPLE, channel_rate_for, symbol_rate_hz_of
 
 
 def test_channel_rate_keeps_requested_rate_for_low_baud():
@@ -51,3 +51,42 @@ def test_bank_api_is_gone():
 
     assert not hasattr(_fallback_select, "fallback_modes")
     assert not hasattr(_fallback_select, "DEFAULT_FALLBACK_DEMODS")
+
+
+# ── symbol_rate_hz_of: baud / symbol_rate_hz are the SAME quantity, interchangeable ───────────
+def test_symbol_rate_canonical_key():
+    assert symbol_rate_hz_of({"symbol_rate_hz": 2400.0}) == 2400.0
+
+
+def test_symbol_rate_accepts_baud_alias():
+    # The demod must not go dark when the rate arrives as `baud` (SatNOGS field name) instead
+    # of `symbol_rate_hz` — they are the same quantity.
+    assert symbol_rate_hz_of({"baud": 9600}) == 9600.0
+
+
+def test_symbol_rate_accepts_baudrate_and_underscore_and_symbol_rate_aliases():
+    assert symbol_rate_hz_of({"baudrate": 1200}) == 1200.0
+    assert symbol_rate_hz_of({"baud_rate": 4800}) == 4800.0
+    assert symbol_rate_hz_of({"symbol_rate": 19200}) == 19200.0
+
+
+def test_symbol_rate_canonical_wins_over_baud_when_both_present():
+    # symbol_rate_hz is first in priority order; a stray/conflicting baud never overrides it.
+    assert symbol_rate_hz_of({"symbol_rate_hz": 2400, "baud": 9600}) == 2400.0
+
+
+def test_symbol_rate_falls_through_invalid_or_nonpositive_to_next_alias():
+    # 0 baud is not a rate; a garbage string is not a rate — keep looking, then use the default.
+    assert symbol_rate_hz_of({"baud": 0, "baudrate": 9600}) == 9600.0
+    assert symbol_rate_hz_of({"baud": "fast", "symbol_rate": 1200}) == 1200.0
+
+
+def test_symbol_rate_missing_returns_default():
+    assert symbol_rate_hz_of({}) == 0.0
+    assert symbol_rate_hz_of(None) == 0.0
+    assert symbol_rate_hz_of({"framing": "ax25"}, default=9600.0) == 9600.0
+
+
+def test_symbol_rate_string_number_is_accepted():
+    # params.json values are sometimes strings (MessageToDict of a Struct) — coerce.
+    assert symbol_rate_hz_of({"baud": "2400"}) == 2400.0

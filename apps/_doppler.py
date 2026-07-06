@@ -236,6 +236,7 @@ async def run_doppler_poll(
     last: float | None = None
     on_fallback = False  # so the poll→push handoff is logged once (visible in the INFO journal)
     last_log = 0.0  # throttle the "applying" INFO so the journal SHOWS the Doppler curve
+    applied_since_log = 0  # rotator retunes since the last INFO — reveals the REAL update rate
     loop = asyncio.get_running_loop()
     last_ok = loop.time()  # monotonic time of the last live read — the wall-clock grace anchor
     try:
@@ -268,10 +269,16 @@ async def run_doppler_poll(
                 try:
                     apply_offset(offset)
                     last = offset
-                    now = loop.time()  # log the applied offset ~every 5 s: a visible tracking curve
+                    applied_since_log += 1
+                    # Throttled log carries the retune COUNT too, so the real ~25 Hz update rate is
+                    # visible in the journal — the 5 s cadence is the log, NOT the correction.
+                    now = loop.time()
                     if now - last_log >= 5.0:
+                        _log.info(
+                            "doppler: applying %.0f Hz to the rotator (%d retunes in %.1fs)",
+                            offset, applied_since_log, now - last_log)
                         last_log = now
-                        _log.info("doppler: applying %.0f Hz to the rotator", offset)
+                        applied_since_log = 0
                 except Exception:  # noqa: BLE001 — a rotator glitch must not kill the poll/recorder
                     _log.exception("doppler: apply_offset(%.1f) raised", offset)
             # asyncio.TimeoutError (NOT builtin TimeoutError) is what wait_for raises on 3.10 — this

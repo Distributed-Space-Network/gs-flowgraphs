@@ -4,6 +4,18 @@ from __future__ import annotations
 import compose
 
 
+def test_baud_alias_is_interchangeable_with_symbol_rate_hz():
+    # baud == symbol rate: a plan built from `baud` must be identical to one from `symbol_rate_hz`,
+    # so the demod never goes dark because the rate arrived under the SatNOGS `baud` key name.
+    from_symrate = compose.plan_decode(
+        {"modulation": "gmsk", "symbol_rate_hz": 2400, "framing": "ax25"}, catalogued=False)
+    from_baud = compose.plan_decode(
+        {"modulation": "gmsk", "baud": 2400, "framing": "ax25"}, catalogued=False)
+    assert from_baud.symbol_rate == from_symrate.symbol_rate == 2400.0
+    assert from_baud.grsat_synthesizable == from_symrate.grsat_synthesizable
+    assert from_baud.our_engine == from_symrate.our_engine
+
+
 def test_local_token_ax25_races_grsatellites():
     # The local token "ax25" translates OUTBOUND to the gr-satellites label "AX.25"
     # (framings.to_grsatellites_framing), so BOTH engines decode it — our AX.25 deframer AND

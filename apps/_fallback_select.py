@@ -11,9 +11,38 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+from typing import Any
+
 # Samples/symbol the channel must give the demods. symbol_sync needs sps>1; ~4 is a
 # comfortable margin for GFSK/PSK timing recovery.
 CHANNEL_OVERSAMPLE = 4.0
+
+# The symbol rate reaches a flowgraph under different key names depending on the source:
+# gs-client's codec renames the SatNOGS ``baud`` field to ``symbol_rate_hz``, but a raw rfLink, a
+# hand-written params.json, or a future/other backend may carry ``baud``/``baudrate`` verbatim.
+# Baud and symbol rate are the SAME physical quantity (symbols per second), so the demod MUST treat
+# them as interchangeable — a rate under a different key is NOT a missing rate, and the demod chain
+# must not go dark because of the key name. This tuple is that single source of truth, in priority
+# order (the canonical ``symbol_rate_hz`` first). Keep it in sync wherever a rate is read.
+SYMBOL_RATE_KEYS = ("symbol_rate_hz", "baud", "baudrate", "baud_rate", "symbol_rate")
+
+
+def symbol_rate_hz_of(params: dict[str, Any] | None, default: float = 0.0) -> float:
+    """The symbol rate (== baud) from ``params`` under ANY of its alias keys
+    (:data:`SYMBOL_RATE_KEYS`), or ``default`` when none is present/usable. Baud and
+    ``symbol_rate_hz`` are interchangeable, so the demod never fails just because the rate arrived
+    under a different key. A present-but-invalid or non-positive value is skipped (0 baud is not a
+    rate) so a later alias — or ``default`` — still applies. Pure: no GNU Radio, unit-testable."""
+    p = params or {}
+    for key in SYMBOL_RATE_KEYS:
+        if key in p:
+            try:
+                v = float(p[key])
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+    return float(default)
 
 
 def channel_rate_for(sample_rate: float, symbol_rate_hz: float, sdr_rate: float) -> float:

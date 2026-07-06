@@ -38,6 +38,7 @@ import sys
 import time
 
 import numpy as np
+from _fallback_select import symbol_rate_hz_of
 from _recorder import StreamRecorder
 from _soapy import capture_plan, merge_sdr_params, resample_ratio, sdr_env
 from _spawn_contract import (
@@ -128,7 +129,8 @@ def _profile_from_params(params: dict[str, object]) -> endurosat.LinkProfile:
         nrzi=bool(params.get("nrzi", True)),
         mod_index=float(params.get("mod_index", endurosat.MOD_INDEX)),  # type: ignore[arg-type]
         bt=float(params.get("bt", endurosat.BT)),  # type: ignore[arg-type]
-        symbol_rate_hz=float(params.get("symbol_rate_hz", endurosat.SYMBOL_RATE_HZ)),  # type: ignore[arg-type]
+        # baud/baudrate/symbol_rate_hz are interchangeable (all the symbol rate).
+        symbol_rate_hz=symbol_rate_hz_of(params, default=endurosat.SYMBOL_RATE_HZ),
     )
 
 
@@ -390,7 +392,7 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
     if framing == "endurosat":
         # The EnduroSat chip link is 9600 sym/s (endurosat_link defaults), not the
         # 12480 the AX.25 LinkProfile assumes; honour params overrides if present.
-        sym_hz = float(params.get("symbol_rate_hz", endurosat_link.DEFAULT_SYMBOL_RATE_HZ))
+        sym_hz = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
         decoder: object = endurosat_link.StreamDecoder(
             sample_rate,
             symbol_rate_hz=sym_hz,

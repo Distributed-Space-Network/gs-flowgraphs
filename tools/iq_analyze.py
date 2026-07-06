@@ -32,6 +32,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps"))
+import framings  # noqa: E402 — numpy deframe registry (ax25 FCS-checked, etc.)
+
 from gfsk_ax25 import gfsk  # noqa: E402
 
 DEFAULT_SYMBOL_RATE = 9600.0
@@ -39,6 +41,11 @@ DEFAULT_MOD_INDEX = 0.5  # dev +-2400 Hz at 9600 sym/s (per the lab capture)
 DEFAULT_BT = 0.5
 PREAMBLE_BITS = (1, 0)  # 0xAA = 1010..., MSB-first
 SYNC_FLAG = (0, 1, 1, 1, 1, 1, 1, 0)  # 0x7E
+# Standard amateur symbol rates the AX.25 sweep tries when the pass didn't decode at the labelled
+# rate (baud == symbol rate; a wrong-rate demod yields no FCS-valid frame, so the sweep is safe).
+DEFAULT_SWEEP_BAUDS = (1200.0, 2400.0, 4800.0, 9600.0)
+# A spectral line this many dB over the noise floor counts as a real carrier (vs a spur/noise bin).
+CARRIER_SNR_DB = 6.0
 
 
 @dataclass
@@ -135,6 +142,48 @@ def gfsk_params(fs: float, symbol_rate: float = DEFAULT_SYMBOL_RATE) -> gfsk.Gfs
     )
 
 
+def spectrum_summary(iq: np.ndarray, fs: float, *, nfft: int = 8192) -> dict[str, float] | None:
+    """Averaged periodogram of the WHOLE capture → the strongest spectral line and how far it
+    stands above the noise floor (median). Unlike :func:`find_bursts` (a magnitude gate tuned for
+    strong EnduroSat bursts), this also catches a WEAK CONTINUOUS carrier. The recording is
+    post-Doppler-rotator, so a real downlink sits near 0 Hz; a peak far off DC is a spur/RFI, and a
+    flat spectrum (SNR below :data:`CARRIER_SNR_DB`) is a dead capture — nothing to decode."""
+    n = int(iq.size)
+    if n < 16:
+        return None
+    nfft = min(int(nfft), 1 << int(np.log2(n)))
+    win = np.hanning(nfft)
+    nseg = n // nfft
+    acc = np.zeros(nfft, dtype=np.float64)
+    for i in range(nseg):
+        seg = iq[i * nfft : (i + 1) * nfft] * win
+        acc += np.abs(np.fft.fft(seg)) ** 2
+    psd_db = 10.0 * np.log10(np.fft.fftshift(acc / max(nseg, 1)) + 1e-30)
+    freqs = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / fs))
+    floor = float(np.median(psd_db))
+    pk = int(np.argmax(psd_db))
+    return {"peak_hz": float(freqs[pk]), "snr_db": float(psd_db[pk] - floor), "nseg": float(nseg)}
+
+
+def ax25_sweep(
+    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS
+) -> list[tuple[float, int, list[bytes]]]:
+    """Run OUR real AX.25 deframer (``framings.deframe`` — G3RUH + plain, NRZI, FCS-checked) on the
+    capture at each candidate baud. Returns ``(baud, n_frames, frames)`` per rate. An FCS hit at
+    exactly one baud IS the true symbol rate; all-zero across the sweep on a present carrier means
+    the framing/modulation is not AX.25/GFSK (e.g. AFSK, or a non-AX.25 link)."""
+    out: list[tuple[float, int, list[bytes]]] = []
+    for baud in bauds:
+        # demodulate_capture (not raw demodulate): it derotates residual CFO and polyphase-resamples
+        # to an integer target_sps before slicing — raw demodulate's timing recovery DIVERGES at the
+        # channel's native sps (e.g. sps=40 for 1200 Bd over a 48 kHz channel).
+        bits = gfsk.demodulate_capture(
+            iq, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT)
+        frames, _ = framings.deframe(bits, "ax25")
+        out.append((float(baud), len(frames), frames))
+    return out
+
+
 def demodulate_burst(
     iq: np.ndarray, fs: float, *, symbol_rate: float = DEFAULT_SYMBOL_RATE, guard_ms: float = 3.0
 ) -> np.ndarray:
@@ -158,7 +207,8 @@ def frame_bytes(bits: np.ndarray, *, order: str = "big") -> bytes:
 
 
 def analyze_file(
-    path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0
+    path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0,
+    *, run_ax25: bool = False, sweep_window_s: float = 60.0,
 ) -> None:
     cap = load_capture(path, sample_rate_hz)
     dur = len(cap.iq) / cap.fs if cap.fs else 0.0
@@ -166,6 +216,21 @@ def analyze_file(
         f"{Path(path).name}: {len(cap.iq):,} samples | fs={cap.fs:.0f} Hz | "
         f"center={cap.center_hz/1e6:.4f} MHz | dur={dur:.3f} s"
     )
+    # Carrier check FIRST: is there ANY signal (weak/continuous too, not just bursts)? A NO CARRIER
+    # verdict makes the demod/framing/baud debate moot — the capture is empty (freq/antenna/off).
+    sp = spectrum_summary(cap.iq, cap.fs)
+    if sp is not None:
+        verdict = (f"CARRIER at {sp['peak_hz']:+.0f} Hz from DC"
+                   if sp["snr_db"] >= CARRIER_SNR_DB else "NO CARRIER — flat noise (dead capture)")
+        print(f"spectrum: strongest line {sp['peak_hz']:+.0f} Hz, {sp['snr_db']:.1f} dB over floor "
+              f"→ {verdict}")
+    if run_ax25:
+        win = cap.iq if sweep_window_s <= 0 else cap.iq[: int(cap.fs * sweep_window_s)]
+        span = len(win) / cap.fs if cap.fs else 0.0
+        print(f"ax25 sweep (our deframer, G3RUH+plain, FCS-checked; first {span:.0f}s):")
+        for baud, nframes, frames in ax25_sweep(win, cap.fs):
+            head = frames[0][:16].hex() if frames else "-"
+            print(f"  {int(baud):5d} Bd: {nframes} FCS frame(s)  first={head}")
     bursts = find_bursts(cap.iq, cap.fs)
     guard = int(cap.fs * 0.003)
     print(f"{len(bursts)} bursts:")
@@ -189,8 +254,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--sample-rate", type=float, default=0.0, help="cf32 sample rate if no sidecar (Hz)"
     )
+    p.add_argument("--ax25", action="store_true",
+                   help="run OUR AX.25 deframer (FCS-checked) sweeping standard bauds")
+    p.add_argument("--sweep-window-s", type=float, default=60.0,
+                   help="seconds of capture to run the --ax25 sweep on (0 = whole pass)")
     args = p.parse_args(argv)
-    analyze_file(args.capture, symbol_rate=args.symbol_rate, sample_rate_hz=args.sample_rate)
+    analyze_file(args.capture, symbol_rate=args.symbol_rate, sample_rate_hz=args.sample_rate,
+                 run_ax25=args.ax25, sweep_window_s=args.sweep_window_s)
     return 0
 
 

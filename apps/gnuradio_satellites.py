@@ -38,6 +38,7 @@ import pmt  # PMT is a standalone top-level module in GNU Radio 3.10 (NOT gr.pmt
 from _fallback_select import (  # pure, testable, no GNU Radio
     CHANNEL_OVERSAMPLE,
     channel_rate_for,
+    symbol_rate_hz_of,
 )
 from _recorder import PassRecorder
 from _soapy import (
@@ -290,15 +291,16 @@ def _build_fallbacks(
 
 def _backend_mode(params: dict | None) -> tuple[str, float] | None:
     """The single ``(modulation, symbol_rate)`` the backend specified from the transmitter
-    record's modulation + symbol_rate_hz. None when either is absent — caller then runs
+    record's modulation + symbol rate. None when either is absent — caller then runs
     gr-satellites only. A tuple (not a concatenated string) so digit-bearing modulation names
-    (``2fsk``, ``8psk``, ``qam16``) stay unambiguous."""
+    (``2fsk``, ``8psk``, ``qam16``) stay unambiguous.
+
+    The symbol rate is read via :func:`symbol_rate_hz_of`, so ``baud`` / ``baudrate`` are accepted
+    interchangeably with ``symbol_rate_hz`` — the demod builds whenever the rate is present under
+    ANY of its names (baud == symbol rate), never dark because of a key-name mismatch."""
     p = params or {}
     kind = str(p.get("modulation") or "").strip().lower()
-    try:
-        rate = float(p.get("symbol_rate_hz") or 0)
-    except (TypeError, ValueError):  # a non-numeric symbol rate must not crash the engine
-        return None
+    rate = symbol_rate_hz_of(p)  # accepts baud/baudrate/symbol_rate_hz (all the same quantity)
     if not kind or rate <= 0:
         return None
     return (kind, rate)
@@ -400,7 +402,7 @@ def _synthetic_satyaml_path(satellite, params: dict | None, frequency_hz: float)
     fd, path = tempfile.mkstemp(prefix="grsat_synth_", suffix=".yml")
     os.close(fd)
     out = grsat_synth.write_synthetic_satyaml(
-        path, norad, p.get("modulation"), p.get("symbol_rate_hz"),
+        path, norad, p.get("modulation"), symbol_rate_hz_of(p) or None,
         p.get("framing"), frequency_hz, name=(s or None),
     )
     if out is None:
@@ -432,7 +434,7 @@ def build_satellites_rx(
     # (≥ a few samples/symbol) — a 50 kBd bird needs more than the 48 kHz default, else
     # symbol_sync gets sps<1 — so size it from the backend's symbol_rate_hz, capped at the
     # capture rate. Low-baud birds stay at the requested --sample-rate (~MB/min recording).
-    sym = float((params or {}).get("symbol_rate_hz") or 0.0)
+    sym = symbol_rate_hz_of(params)  # baud/baudrate/symbol_rate_hz — interchangeable
     want_channel = max(float(sample_rate), CHANNEL_OVERSAMPLE * sym)
     sdr_rate, _ = capture_plan(env["capture_rate_hz"], want_channel)
     channel_rate = channel_rate_for(float(sample_rate), sym, sdr_rate)
