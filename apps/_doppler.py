@@ -1,21 +1,20 @@
 """Flowgraph-owned Doppler correction (docs/12 — Doppler v2).
 
-The RX flowgraph OWNS its Doppler by POLLING a frequency source at a fixed cadence and applying
-the shift to its own software rotator — mirroring how SatNOGS's flowgraph polls rigctld, instead
+The RX flowgraph OWNS its Doppler by POLLING gs-orbitd at a fixed cadence and applying the shift
+to its own software rotator — mirroring how SatNOGS's flowgraph polls a frequency source, instead
 of the orchestrator PUSHING ``set_doppler`` over the control socket. That push path coupled
 Doppler to orchestrator event-loop liveness + control-socket health and broke repeatedly; a
 stalled writer silently froze Doppler. Owning the poll makes the correction survive any
 orchestrator hiccup (a failed read just keeps the last offset).
 
-Two backends, selected by availability:
+Source:
 
-* ``orbitd``  — poll gs-orbitd ``ephem_at{handle,t}`` for ``range_rate_mps`` and convert
-                ``offset = -f0*v_r/c``. The primary (our SGP4 + GPS-time daemon). Localhost
-                NDJSON, so gs-orbitd stays an OPTIONAL, non-GPL dependency (socket IPC, not
-                linking — the flowgraph is GPLv3, gs-orbitd is not forced to be).
-* ``rigctld`` — poll Hamlib ``rigctld`` ``f`` (get_freq) and convert ``offset = f_rig - f0``,
-                the SatNOGS-style fallback for a station that runs rigctld instead of gs-orbitd.
-* ``none``    — no Doppler (record-only).
+* ``orbitd`` — poll gs-orbitd ``ephem_at{handle,t}`` for ``range_rate_mps`` and convert
+               ``offset = -f0*v_r/c``. gs-orbitd is our SGP4 + GPS-time daemon and the single
+               source of truth for orbit + time, so pointing and Doppler share one ephemeris and
+               cannot diverge. Localhost NDJSON, so gs-orbitd stays an OPTIONAL, non-GPL dependency
+               (socket IPC, not linking — the flowgraph is GPLv3, gs-orbitd is not forced to be).
+* ``none``   — no Doppler (record-only).
 
 Import-safe: stdlib ``asyncio``/``json`` only, NO GNU Radio, so the conversion + source selection
 + poll loop are unit-tested against fake servers. The one bench-only touch is the ``apply_offset``
@@ -38,7 +37,6 @@ _log = logging.getLogger("gs_flowgraphs._doppler")
 _C_MPS = 299_792_458.0  # speed of light
 
 DEFAULT_ORBITD_PORT = 45400
-DEFAULT_RIGCTLD_PORT = 4532
 DEFAULT_POLL_PERIOD_S = 0.04  # 25 Hz — smooth near TCA; tune per box (OS scheduler tick)
 DEFAULT_RESEND_THRESHOLD_HZ = 10.0  # only retune the rotator once the offset moves this far
 DEFAULT_FALLBACK_GRACE_S = 1.0  # source dead this long → the pushed offset takes over
@@ -173,55 +171,21 @@ class OrbitdDopplerSource:
         await self._client.aclose()
 
 
-class RigctldDopplerSource:
-    """Poll Hamlib ``rigctld`` ``f`` (get_freq) → ``offset = f_rig - f0`` (SatNOGS-style). A
-    separate tracker sets rigctld's frequency to the Doppler-shifted downlink; we read it and
-    shift the DSP to bring that carrier back to baseband centre, keeping the SDR fixed."""
-
-    def __init__(self, host: str, port: int, center_freq_hz: float) -> None:
-        self._client = _LineClient(host, port)
-        self._f0 = float(center_freq_hz)
-
-    async def read_offset_hz(self) -> float | None:
-        reply = await self._client.request_line("f")  # rigctld: get_freq → a bare Hz line
-        if reply is None:
-            return None
-        try:
-            f_rig = float(reply.strip())
-        except ValueError:
-            _log.debug("doppler: bad rigctld freq reply %r", reply[:120])
-            return None
-        if f_rig <= 0.0:  # rigctld returns 0 / RPRT error before it's been set
-            return None
-        return f_rig - self._f0
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-
 def make_doppler_source(
     *, source: str, center_freq_hz: float,
     orbitd_host: str = "127.0.0.1", orbitd_port: int = DEFAULT_ORBITD_PORT, orbitd_handle: str = "",
-    rigctl_host: str = "", rigctl_port: int = DEFAULT_RIGCTLD_PORT,
     now_fn: Callable[[], float] | None = None,
 ) -> DopplerSource:
     """Pick the Doppler source (pure — no I/O; a source that can't actually connect just returns
-    None each poll). ``source``: ``auto`` prefers orbitd (needs a handle) then rigctld (needs a
-    host); ``orbitd`` / ``rigctld`` force one; ``none`` → :class:`NullDopplerSource`."""
-    s = (source or "auto").strip().lower()
-    if s == "none":
-        return NullDopplerSource()
+    None each poll). ``orbitd`` (the default) polls gs-orbitd and needs a plan ``handle``; ``none``
+    — or ``orbitd`` with no handle — → :class:`NullDopplerSource` (record-only)."""
+    s = (source or "orbitd").strip().lower()
     if s in ("orbitd", "auto") and orbitd_handle:
         _log.info("doppler: source=orbitd handle=%s @ %s:%s f0=%.0f",
                   orbitd_handle, orbitd_host, orbitd_port, center_freq_hz)
         return OrbitdDopplerSource(orbitd_host, orbitd_port, orbitd_handle, center_freq_hz,
                                    now_fn=now_fn)
-    if s in ("rigctld", "rigctl", "auto") and rigctl_host:
-        _log.info("doppler: source=rigctld @ %s:%s f0=%.0f",
-                  rigctl_host, rigctl_port, center_freq_hz)
-        return RigctldDopplerSource(rigctl_host, rigctl_port, center_freq_hz)
-    _log.info("doppler: no source (source=%r, orbitd_handle=%r, rigctl_host=%r); record-only",
-              s, orbitd_handle, rigctl_host)
+    _log.info("doppler: no source (source=%r, orbitd_handle=%r); record-only", s, orbitd_handle)
     return NullDopplerSource()
 
 

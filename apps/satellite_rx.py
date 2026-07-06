@@ -92,21 +92,19 @@ async def amain(args) -> int:
     started = asyncio.Event()
     stop_requested = asyncio.Event()
     doppler = {"hz": 0.0}
-    # Doppler v2 (docs/12): the flowgraph OWNS Doppler by POLLING a source (gs-orbitd ``ephem_at``,
-    # or a Hamlib rigctld fallback) at --doppler-poll-hz and driving the rotator itself — instead of
-    # depending on the orchestrator to push set_doppler over the control socket (a path coupled to
-    # orchestrator liveness that broke repeatedly). When NO source resolves (NullDopplerSource) the
+    # Doppler v2 (docs/12): the flowgraph OWNS Doppler by POLLING gs-orbitd (``ephem_at``) at
+    # --doppler-poll-hz and driving the rotator itself — instead of depending on the orchestrator
+    # to push set_doppler over the control socket (a path coupled to orchestrator liveness that
+    # broke repeatedly). When NO source resolves (NullDopplerSource) the
     # legacy control-socket push in the engine loop drives Doppler instead. When a source resolves
     # but then DIES mid-pass, run_doppler_poll's fallback_offset takes over the pushed value (still
     # streamed into ``doppler["hz"]`` below) so Doppler doesn't freeze at a stale offset.
     doppler_source = make_doppler_source(
-        source=getattr(args, "doppler_source", "auto"),
+        source=getattr(args, "doppler_source", "orbitd"),
         center_freq_hz=float(args.center_freq_hz or 0.0),
         orbitd_host=getattr(args, "orbitd_host", "127.0.0.1"),
         orbitd_port=int(getattr(args, "orbitd_port", 45400) or 45400),
         orbitd_handle=getattr(args, "orbitd_handle", "") or "",
-        rigctl_host=getattr(args, "rigctl_host", "") or "",
-        rigctl_port=int(getattr(args, "rigctl_port", 4532) or 4532),
     )
     doppler_poll = not isinstance(doppler_source, NullDopplerSource)
     poll_period_s = 1.0 / max(1.0, float(getattr(args, "doppler_poll_hz", 25.0) or 25.0))
@@ -197,8 +195,8 @@ async def amain(args) -> int:
             while not stop_requested.is_set():
                 await asyncio.sleep(_DECODE_PERIOD_S)
                 # Legacy control-socket push — ONLY when no poll source resolved (else the poll owns
-                # Doppler and this would fight it). Retained so a station without gs-orbitd/rigctld
-                # still gets orchestrator-pushed Doppler (backward compatible).
+                # Doppler and this would fight it). Retained so a station without gs-orbitd (or a
+                # handle-less pass) still gets orchestrator-pushed Doppler (backward compatible).
                 if not doppler_poll and doppler["hz"] != last_doppler:
                     last_doppler = doppler["hz"]
                     ctx.set_doppler(last_doppler)

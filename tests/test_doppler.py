@@ -1,8 +1,8 @@
 """Unit tests for _doppler (flowgraph-owned Doppler, docs/12 v2).
 
-No GNU Radio: the module is stdlib-only, so the conversion, source selection, the NDJSON/rigctld
-poll (against fake asyncio servers), reconnect-on-drop, and the poll loop are all exercised here.
-Async bits run via ``asyncio.run`` so no pytest-asyncio config is needed.
+No GNU Radio: the module is stdlib-only, so the conversion, source selection, the gs-orbitd
+NDJSON poll (against fake asyncio servers), reconnect-on-drop, and the poll loop are all exercised
+here. Async bits run via ``asyncio.run`` so no pytest-asyncio config is needed.
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import pytest
 from _doppler import (
     NullDopplerSource,
     OrbitdDopplerSource,
-    RigctldDopplerSource,
     doppler_shift_hz,
     make_doppler_source,
     run_doppler_poll,
@@ -39,16 +38,11 @@ def test_doppler_shift_sign_and_magnitude() -> None:
 def test_make_source_selection() -> None:
     assert isinstance(make_doppler_source(source="none", center_freq_hz=4e8), NullDopplerSource)
     assert isinstance(
-        make_doppler_source(source="auto", center_freq_hz=4e8, orbitd_handle="p-1"),
+        make_doppler_source(source="orbitd", center_freq_hz=4e8, orbitd_handle="p-1"),
         OrbitdDopplerSource,
     )
-    # auto with NO handle but a rigctld host -> rigctld
-    assert isinstance(
-        make_doppler_source(source="auto", center_freq_hz=4e8, rigctl_host="127.0.0.1"),
-        RigctldDopplerSource,
-    )
-    # auto with nothing available -> Null (record-only)
-    assert isinstance(make_doppler_source(source="auto", center_freq_hz=4e8), NullDopplerSource)
+    # orbitd with nothing available -> Null (record-only)
+    assert isinstance(make_doppler_source(source="orbitd", center_freq_hz=4e8), NullDopplerSource)
     # explicit orbitd but no handle -> falls through to Null (can't build a query)
     assert isinstance(make_doppler_source(source="orbitd", center_freq_hz=4e8), NullDopplerSource)
 
@@ -177,52 +171,6 @@ def test_orbitd_source_reconnects_after_server_drops() -> None:
     assert third == pytest.approx(-4e8 * 500.0 / _C)  # recovered by reconnect
 
 
-def test_rigctld_source_reads_freq_and_shifts() -> None:
-    async def run() -> float | None:
-        f0 = 401_000_000.0
-        f_rig = 401_009_000.0  # tracker set it +9 kHz (approaching)
-
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                assert line.strip() == b"f"
-                writer.write(f"{f_rig:.0f}\n".encode())
-                await writer.drain()
-
-        server, port = await _serve(handle)
-        try:
-            src = RigctldDopplerSource("127.0.0.1", port, f0)
-            out = await src.read_offset_hz()
-            await src.aclose()
-            return out
-        finally:
-            await _shutdown(server)
-
-    assert asyncio.run(run()) == pytest.approx(9000.0)
-
-
-def test_rigctld_source_ignores_zero_freq() -> None:
-    async def run() -> float | None:
-        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            await reader.readline()
-            writer.write(b"0\n")  # rigctld before the tracker has set anything
-            await writer.drain()
-            writer.close()
-
-        server, port = await _serve(handle)
-        try:
-            src = RigctldDopplerSource("127.0.0.1", port, 4e8)
-            out = await src.read_offset_hz()
-            await src.aclose()
-            return out
-        finally:
-            await _shutdown(server)
-
-    assert asyncio.run(run()) is None
-
-
 # ── the poll loop ─────────────────────────────────────────────────────────────
 class _FakeSource:
     def __init__(self, values: list[float | None]) -> None:
@@ -341,7 +289,7 @@ def test_fallback_takes_over_when_source_dies_midpass() -> None:
 
 def test_no_fallback_freezes_last_offset_when_source_dies() -> None:
     # Without a fallback (default), a dead source keeps the last offset — the pre-fix behavior,
-    # preserved for the no-orchestrator-push case (e.g. a rigctld-only station with no ephemeris).
+    # preserved for callers that pass no fallback_offset (e.g. a record-only / no-push pass).
     async def run() -> list[float]:
         applied: list[float] = []
         stop = asyncio.Event()

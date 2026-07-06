@@ -75,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--periodic-audio-interval-s", type=float, default=0.0)
     # TOLERATE unknown spawn-contract flags: this stub hand-mirrors the A.7.2 flag list rather
     # than importing build_argparser, so a NEW orchestrator flag (e.g. Doppler v2's
-    # --doppler-source / --orbitd-* / --rigctl-*) would otherwise argparse-crash the stub (rc=2)
+    # --doppler-source / --orbitd-*) would otherwise argparse-crash the stub (rc=2)
     # and fail every e2e pass. A stub need not model every flag — accept and ignore the extras.
     ns, extra = p.parse_known_args(argv)
     if extra:
