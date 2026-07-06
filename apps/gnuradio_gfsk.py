@@ -37,6 +37,7 @@ from _soapy import (
     make_sink,
     make_source,
     merge_sdr_params,
+    open_analog_bandwidth,
     sdr_env,
     tune_below,
 )
@@ -322,6 +323,7 @@ def build_rx_top_block(
     tb = gr.top_block("cubesat_gfsk_ax25_rx_gr")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
+    open_analog_bandwidth(src, sdr_rate)  # widen analog BW so the +lo_offset carrier survives
     tune_below(src, float(args.center_freq_hz), lo)  # LO to center-lo_offset (plain; no BB CORDIC)
     configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
     apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])

@@ -313,6 +313,20 @@ def tune_below(src: Any, center_hz: float, lo_offset_hz: float, *, channel: int 
     src.set_frequency(channel, float(center_hz) - float(lo_offset_hz))
 
 
+def open_analog_bandwidth(src: Any, sdr_rate_hz: float, *, channel: int = 0) -> None:
+    """Widen the SDR ANALOG RX filter to ~the capture rate so an LO-offset carrier is NOT rolled
+    off before the ADC. :func:`tune_below` parks the carrier at ``+lo_offset`` at baseband (e.g.
+    +500 kHz for ``GS_SDR_LO_OFFSET=500000``); the XTRX analog filter floor is ~0.8 MHz, so at a
+    large offset that carrier sits past a narrow default passband edge and is attenuated toward the
+    ADC floor — a silent capture on a bird that WAS transmitting. Channel selectivity is done
+    DOWNSTREAM in DSP (the decimator + channel filter), so the analog filter must pass the WHOLE
+    capture band. The satellite/gfsk RX engines MUST call this (the amateur-FM engine already does);
+    an on-center tune (lo_offset 0) doesn't strictly need it but a wide analog BW never hurts.
+    Guarded — a driver without a settable analog BW (RTL-class) just ignores it."""
+    with contextlib.suppress(Exception):  # noqa: BLE001 — driver may lack a settable analog BW
+        src.set_bandwidth(int(channel), float(sdr_rate_hz))
+
+
 def tune_source(src: Any, center_hz: float, lo_offset_hz: float, *, channel: int = 0) -> None:
     """Tune a gr-soapy source/sink to ``center_hz`` using an LO offset: the analog LO
     goes to ``center+offset`` (RF) and the baseband CORDIC to ``-offset`` (BB), so the
@@ -377,6 +391,7 @@ __all__ = [
     "make_sink",
     "make_source",
     "merge_sdr_params",
+    "open_analog_bandwidth",
     "resample_ratio",
     "retune_source",
     "sdr_env",

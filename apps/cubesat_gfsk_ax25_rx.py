@@ -290,6 +290,11 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
 
     dev = SoapySDR.Device(args.sdr_args)
     dev.setSampleRate(SOAPY_SDR_RX, ch, sdr_rate)
+    # Widen the ANALOG RX filter to ~the capture rate so a large LO offset (the +lo carrier below)
+    # isn't rolled off before the ADC — the XTRX analog floor is ~0.8 MHz; channel selectivity is
+    # done in DSP. Guarded: a driver without a settable analog BW just ignores it.
+    with contextlib.suppress(Exception):  # noqa: BLE001 — driver may lack a settable analog BW
+        dev.setBandwidth(SOAPY_SDR_RX, ch, sdr_rate)
     # LO offset: tune the analog LO off-carrier (RF) + the baseband CORDIC back (BB)
     # so the DC spike sits at +lo, not on the signal. The dsp NCO handles Doppler at
     # baseband, so the LO is set once here.
