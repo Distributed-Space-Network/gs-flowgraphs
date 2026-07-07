@@ -166,21 +166,32 @@ def spectrum_summary(iq: np.ndarray, fs: float, *, nfft: int = 8192) -> dict[str
 
 
 def ax25_sweep(
-    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS
-) -> list[tuple[float, int, list[bytes]]]:
+    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS, *, carriers=None
+) -> list[tuple[float, float, int, list[bytes]]]:
     """Run OUR real AX.25 deframer (``framings.deframe`` — G3RUH + plain, NRZI, FCS-checked) on the
-    capture at each candidate baud. Returns ``(baud, n_frames, frames)`` per rate. An FCS hit at
-    exactly one baud IS the true symbol rate; all-zero across the sweep on a present carrier means
-    the framing/modulation is not AX.25/GFSK (e.g. AFSK, or a non-AX.25 link)."""
-    out: list[tuple[float, int, list[bytes]]] = []
+    capture at each candidate baud, with COARSE CARRIER RECOVERY. Doppler compensation leaves the
+    bird's fixed oscillator offset (tens of kHz), which parks the carrier outside the narrow demod
+    filter; we de-rotate a candidate carrier to DC first. Candidates default to DC (on-freq bird)
+    AND the spectral peak (offset bird); FCS-gating means a wrong (carrier, baud) yields nothing.
+    Returns ``(baud, carrier_hz, n_frames, frames)`` — the winning carrier per baud."""
+    if carriers is None:
+        sp = spectrum_summary(iq, fs)
+        peak = round(sp["peak_hz"]) if sp else 0.0
+        carriers = sorted({0.0, float(peak)})
+    out: list[tuple[float, float, int, list[bytes]]] = []
     for baud in bauds:
-        # demodulate_capture (not raw demodulate): it derotates residual CFO and polyphase-resamples
-        # to an integer target_sps before slicing — raw demodulate's timing recovery DIVERGES at the
-        # channel's native sps (e.g. sps=40 for 1200 Bd over a 48 kHz channel).
-        bits = gfsk.demodulate_capture(
-            iq, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT)
-        frames, _ = framings.deframe(bits, "ax25")
-        out.append((float(baud), len(frames), frames))
+        best: tuple[float, float, int, list[bytes]] = (float(baud), 0.0, 0, [])
+        for carrier in carriers:
+            # demodulate_capture (not raw demodulate): derotates the carrier + residual CFO and
+            # polyphase-resamples to an integer target_sps before slicing — raw demodulate's timing
+            # recovery DIVERGES at the channel's native sps (e.g. sps=40 for 1200 Bd over 48 kHz).
+            bits = gfsk.demodulate_capture(
+                iq, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT,
+                carrier_hz=carrier)
+            frames, _ = framings.deframe(bits, "ax25")
+            if len(frames) > best[2]:
+                best = (float(baud), float(carrier), len(frames), frames)
+        out.append(best)
     return out
 
 
@@ -227,10 +238,12 @@ def analyze_file(
     if run_ax25:
         win = cap.iq if sweep_window_s <= 0 else cap.iq[: int(cap.fs * sweep_window_s)]
         span = len(win) / cap.fs if cap.fs else 0.0
-        print(f"ax25 sweep (our deframer, G3RUH+plain, FCS-checked; first {span:.0f}s):")
-        for baud, nframes, frames in ax25_sweep(win, cap.fs):
+        print(f"ax25 sweep (our deframer, G3RUH+plain, FCS-checked, carrier-recovered; "
+              f"first {span:.0f}s):")
+        for baud, carrier, nframes, frames in ax25_sweep(win, cap.fs):
             head = frames[0][:16].hex() if frames else "-"
-            print(f"  {int(baud):5d} Bd: {nframes} FCS frame(s)  first={head}")
+            print(f"  {int(baud):5d} Bd @ carrier {carrier:+.0f} Hz: {nframes} FCS frame(s)  "
+                  f"first={head}")
     bursts = find_bursts(cap.iq, cap.fs)
     guard = int(cap.fs * 0.003)
     print(f"{len(bursts)} bursts:")

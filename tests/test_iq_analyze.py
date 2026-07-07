@@ -71,7 +71,31 @@ def test_ax25_sweep_decodes_synthetic_frame_at_its_baud() -> None:
     body = ax25.encode_ui(dest="CQ", src="DSN", info=b"HELLO DSN")
     bits = ax25_framing.encode(body, scramble=True, nrzi=True)  # G3RUH + NRZI, like a 9k6 bird
     iq = modulate(bits, GfskParams(sample_rate_hz=fs, symbol_rate_hz=baud))
-    results = {b: n for b, n, _ in ax25_sweep(iq, fs)}
+    results = {b: n for b, _c, n, _f in ax25_sweep(iq, fs)}
     assert results.get(1200.0, 0) >= 1  # decodes at the true baud
     # A wrong-baud demod of the same IQ must NOT forge an FCS-valid frame.
     assert results.get(9600.0, 0) == 0
+
+
+def test_ax25_sweep_recovers_an_off_dc_carrier() -> None:
+    # Doppler comp removes the sweep but NOT the bird's oscillator offset, so the carrier parks off
+    # DC (the cmd_101 / IPoS-TDsM bug: −17.9 kHz). The sweep must estimate it from the SPECTRUM and
+    # de-rotate to DC, else the narrow demod filter rejects it. The frame is a BURST surrounded by
+    # noise so mean-angle CFO (over the whole window) is noise-dominated and can't recover it — only
+    # the spectral-peak estimate can. Offset a +8 kHz.
+    fs, baud, offset = 48000.0, 1200.0, 8000.0
+    body = ax25.encode_ui(dest="CQ", src="DSN", info=b"OFFSET BIRD")
+    bits = ax25_framing.encode(body, scramble=True, nrzi=True)
+    sig = modulate(bits, GfskParams(sample_rate_hz=fs, symbol_rate_hz=baud))
+    n = np.arange(len(sig))
+    sig = (sig * np.exp(2j * np.pi * offset * n / fs)).astype(np.complex64)
+    rng = np.random.default_rng(7)
+
+    def _noise(k: int) -> np.ndarray:
+        return (rng.normal(0, 0.15, k) + 1j * rng.normal(0, 0.15, k)).astype(np.complex64)
+
+    gap = len(sig)
+    iq = np.concatenate([_noise(gap), sig + _noise(gap), _noise(gap)])  # burst in noise
+    res = {b: (c, nf) for b, c, nf, _f in ax25_sweep(iq, fs)}
+    assert res[1200.0][1] >= 1  # decoded despite the +8 kHz offset (via spectral carrier recovery)
+    assert abs(res[1200.0][0] - offset) < 800.0  # and recovered ~the true carrier offset

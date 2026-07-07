@@ -70,7 +70,8 @@ def derive_views(
     written: list[Path] = []
     if want_png:
         png = path.with_suffix(".png")
-        write_waterfall_png(png, iq)
+        write_waterfall_png(
+            png, iq, sample_rate_hz=sample_rate_hz, center_hz=center_hz, title=path.stem)
         written.append(png)
     if want_csv:
         n = max(1, int(sample_rate_hz * csv_seconds))

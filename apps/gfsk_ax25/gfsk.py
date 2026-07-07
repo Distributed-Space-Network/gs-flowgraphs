@@ -177,6 +177,7 @@ def demodulate_capture(
     target_sps: int = 16,
     correct_cfo: bool = True,
     recover_timing: bool = False,
+    carrier_hz: float = 0.0,
 ) -> np.ndarray:
     """Robust burst demod for real SDR/VSA captures -> hard bits.
 
@@ -195,6 +196,16 @@ def demodulate_capture(
     iq = np.asarray(iq, dtype=np.complex64)
     if len(iq) < 2:
         return np.empty(0, dtype=np.uint8)
+    if carrier_hz:
+        # Shift a KNOWN coarse carrier offset to DC BEFORE the narrow demod filter. Doppler
+        # compensation removes the pass Doppler but NOT the bird's fixed oscillator error (tens of
+        # kHz at 400 MHz); left at +carrier_hz the signal sits outside the 0.625*baud channel and
+        # the demod sees only noise. ``estimate_cfo_rad`` (mean-angle) can't recover this on a
+        # bursty capture — the caller estimates it from the spectrum and passes it here.
+        n = np.arange(len(iq), dtype=np.float64)
+        iq = (iq * np.exp((-2j * np.pi * float(carrier_hz) / float(sample_rate_hz)) * n)).astype(
+            np.complex64
+        )
     if correct_cfo:
         iq = derotate(iq, estimate_cfo_rad(iq))
     target_fs = symbol_rate_hz * target_sps

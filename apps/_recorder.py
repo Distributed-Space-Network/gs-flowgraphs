@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import json
+import logging
 import struct
 import zlib
 from pathlib import Path
@@ -145,9 +146,54 @@ def _encode_png_gray(img: np.ndarray) -> bytes:
     )
 
 
-def write_waterfall_png(path: Path, iq: np.ndarray, *, nfft: int = 1024) -> None:
-    """Write a grayscale waterfall (time on Y, frequency on X) from the IQ."""
+def _write_waterfall_matplotlib(
+    path: Path, spec: np.ndarray, *, sample_rate_hz: float, duration_s: float,
+    center_hz: float, title: str | None,
+) -> None:
+    """SatNOGS-style colored waterfall: viridis, a Power(dB) colorbar, Frequency(kHz) X + Time(s) Y.
+    Raises when matplotlib is unavailable so :func:`write_waterfall_png` falls back to grayscale."""
+    import matplotlib  # noqa: PLC0415 — optional; falls back to grayscale when absent
+
+    matplotlib.use("Agg")  # headless (no display on the bench)
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    half = (sample_rate_hz / 2.0) / 1e3 if sample_rate_hz > 0 else 0.5  # kHz, DC-centered
+    dur = duration_s if duration_s > 0 else float(spec.shape[0])
+    lo, hi = float(np.percentile(spec, 5.0)), float(np.percentile(spec, 99.5))
+    fig, ax = plt.subplots(figsize=(7, 11))
+    im = ax.imshow(
+        spec, aspect="auto", origin="lower", cmap="viridis",
+        extent=(-half, half, 0.0, dur), vmin=lo, vmax=(hi if hi > lo else lo + 1.0),
+        interpolation="nearest",
+    )
+    ax.set_xlabel("Frequency (kHz)")
+    ax.set_ylabel("Time (seconds)")
+    ax.set_title(title or (f"{center_hz/1e6:.4f} MHz" if center_hz else "waterfall"))
+    fig.colorbar(im, ax=ax, label="Power (dB)")
+    fig.tight_layout()
+    fig.savefig(str(path), dpi=100)
+    plt.close(fig)
+
+
+def write_waterfall_png(
+    path: Path, iq: np.ndarray, *, nfft: int = 1024,
+    sample_rate_hz: float = 0.0, center_hz: float = 0.0, title: str | None = None,
+) -> None:
+    """Write a whole-pass waterfall (time on Y, frequency on X) from the IQ. Colored SatNOGS-style
+    (viridis + Power/Frequency/Time axes) via matplotlib when available; otherwise a dependency-free
+    8-bit grayscale PNG (so the recorder never fails a pass just because matplotlib is missing).
+    ``sample_rate_hz`` scales the frequency axis to kHz; without it the frequency axis is unlabeled
+    (normalized)."""
     spec = _spectrogram_db(np.asarray(iq, dtype=np.complex64), nfft=nfft)
+    duration_s = (float(len(iq)) / sample_rate_hz) if sample_rate_hz > 0 else 0.0
+    try:
+        _write_waterfall_matplotlib(
+            path, spec, sample_rate_hz=sample_rate_hz, duration_s=duration_s,
+            center_hz=center_hz, title=title)
+        return
+    except Exception as e:  # noqa: BLE001 — matplotlib absent/broken → grayscale, never fail the pass
+        logging.getLogger("gs_flowgraphs._recorder").info(
+            "waterfall: matplotlib unavailable (%s); writing grayscale PNG", e)
     lo, hi = np.percentile(spec, 5.0), np.percentile(spec, 99.5)
     rng = hi - lo if hi > lo else 1.0
     img = np.clip((spec - lo) / rng * 255.0, 0, 255).astype(np.uint8)
@@ -180,7 +226,9 @@ def finalize_recording(
             started_utc=started_utc,
         )
     if need_png:
-        write_waterfall_png(sdf_path.with_suffix(".png"), iq)
+        write_waterfall_png(
+            sdf_path.with_suffix(".png"), iq,
+            sample_rate_hz=sample_rate_hz, center_hz=center_hz)
 
 
 # ------------------------------------------------- real-time hookup (bench-only)
