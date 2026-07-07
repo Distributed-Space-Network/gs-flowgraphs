@@ -86,8 +86,13 @@ def load_cf32(path: str | Path, sample_rate_hz: float = 0.0) -> Capture:
     """Load a raw complex64 (cf32) capture — the WHOLE pass the GR engines record. Rate
     and centre come from the ``<file>.cf32.json`` sidecar (PassRecorder writes it), or
     from ``sample_rate_hz`` when there's no sidecar."""
-    path = Path(path)
-    iq = np.fromfile(path, dtype=np.complex64)
+    path = Path(path).expanduser()
+    if not path.is_file():
+        # Clear error instead of a cryptic numpy one — shows the RESOLVED absolute path + cwd, so a
+        # relative-vs-absolute path mix-up (e.g. the leading '/' lost) is obvious immediately.
+        msg = f"capture not found: {path} (resolved {path.resolve()}; cwd {Path.cwd()})"
+        raise FileNotFoundError(msg)
+    iq = np.fromfile(str(path), dtype=np.complex64)  # str(): some numpy builds mishandle Path here
     fs, center, meta = sample_rate_hz, 0.0, {}
     sidecar = path.with_name(path.name + ".json")
     if sidecar.exists():
