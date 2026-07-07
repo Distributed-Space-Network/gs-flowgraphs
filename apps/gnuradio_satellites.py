@@ -337,8 +337,8 @@ def make_grsat_deframers(framing) -> list:
     crash the engine or cost the IQ recording. Returns ``[]`` for a framing with no gr-satellites
     deframer (decoded by our numpy deframers, or record-only). AX.25 races both G3RUH scramblings
     (mirrors ``framings.deframe``). Do NOT NRZI/descramble upstream — each deframer does its own."""
-    f = str(framing or "").strip().lower()
-    if not f:
+    plan = framings.grsat_deframer_plan(framing)
+    if not plan:
         return []
     try:
         from satellites.components.deframers import (  # noqa: PLC0415 — bench-only (gr-satellites)
@@ -351,28 +351,18 @@ def make_grsat_deframers(framing) -> list:
         _log.info("gr-satellites deframers unavailable (%s); our numpy deframers only", e)
         return []
 
-    def _try(make):
+    builders = {
+        "ax25": lambda scramble: ax25_deframer(scramble, options=None),
+        "ax100": lambda mode: ax100_deframer(mode, options=None),
+        "usp": lambda: usp_deframer(options=None),
+        "endurosat": lambda: endurosat_deframer(options=None),
+    }
+    out = []
+    for kind, *args in plan:
         try:
-            return make()
+            out.append(builders[kind](*args))
         except Exception as e:  # noqa: BLE001 — API drift / bad ctor args → skip this deframer
-            _log.warning("gr-satellites deframer for %r failed to build (%s); skipping", f, e)
-            return None
-
-    if "g3ruh" in f:
-        out = [_try(lambda: ax25_deframer(True, options=None))]
-    elif f in ("ax25", "ax.25", "aprs"):  # try both scramblings (mirrors framings.deframe)
-        out = [_try(lambda: ax25_deframer(False, options=None)),
-               _try(lambda: ax25_deframer(True, options=None))]
-    elif "ax100" in f and ("5" in f or "asm" in f or "golay" in f):
-        out = [_try(lambda: ax100_deframer(5, options=None))]
-    elif "ax100" in f and ("6" in f or "rs" in f or "reed" in f):
-        out = [_try(lambda: ax100_deframer(6, options=None))]
-    elif f == "usp":
-        out = [_try(lambda: usp_deframer(options=None))]
-    elif f == "endurosat":
-        out = [_try(lambda: endurosat_deframer(options=None))]
-    else:
-        out = []
+            _log.warning("gr-satellites deframer %s%r failed (%s); skipping", kind, args, e)
     return [d for d in out if d is not None]
 
 

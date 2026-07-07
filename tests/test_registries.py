@@ -70,6 +70,18 @@ def test_deframe_autodetects_ax25_when_framing_unknown():
     assert body in frames
 
 
+def test_grsat_deframer_plan_matches_dotted_ax100_spelling():
+    # BUG: the builder tested "ax100" in f but SatNOGS spells it "AX.100" (with a dot), so AX.100
+    # birds (BRO/D-Orbit/SITRO) built NO deframer even with GS_GRSAT_LIVE=1. Dots are now stripped.
+    assert framings.grsat_deframer_plan("AX.100 Mode 5") == [("ax100", 5)]
+    assert framings.grsat_deframer_plan("FSK AX.100 Mode 6") == [("ax100", 6)]
+    assert framings.grsat_deframer_plan("USP") == [("usp",)]
+    assert framings.grsat_deframer_plan("AX.25 G3RUH") == [("ax25", True)]
+    assert framings.grsat_deframer_plan("ax25") == [("ax25", False), ("ax25", True)]
+    assert framings.grsat_deframer_plan("endurosat") == [("endurosat",)]
+    assert framings.grsat_deframer_plan("") == []  # unknown → numpy/record-only carries it
+
+
 def test_ax25_address_check_rejects_crc16_false_positives():
     # AX.25's FCS is 16-bit → noise passes it ~1/65536; the address-field check rejects those, so a
     # decoded "frame" is trustworthy. Bytes are real bench data (cmd_101 IPoS pass).

@@ -186,6 +186,32 @@ def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     return out
 
 
+def grsat_deframer_plan(framing) -> list[tuple]:
+    """PURE: framing label → the gr-satellites deframers to build for it, as ``(kind, *args)``
+    tuples (``gnuradio_satellites.make_grsat_deframers`` builds the actual hier-blocks from this).
+
+    Dots AND underscores are stripped first so the SatNOGS spelling ``"AX.100 Mode 5"`` matches the
+    ``ax100`` checks — the builder used to test ``"ax100" in f`` and silently MISSED ``"ax.100"``,
+    so every AX.100 bird built NO deframer even with GS_GRSAT_LIVE=1. Returns ``[]`` for a framing
+    gr-satellites has no deframer for here (our numpy engine / record-only carries it)."""
+    f = str(framing or "").strip().lower().replace(".", "").replace("_", " ")
+    if not f:
+        return []
+    if "g3ruh" in f:  # AX.25, G3RUH-scrambled
+        return [("ax25", True)]
+    if f in ("ax25", "aprs"):  # both scramblings (mirrors :func:`deframe`)
+        return [("ax25", False), ("ax25", True)]
+    if "ax100" in f and ("5" in f or "asm" in f or "golay" in f):
+        return [("ax100", 5)]
+    if "ax100" in f and ("6" in f or "rs" in f or "reed" in f):
+        return [("ax100", 6)]
+    if f == "usp":
+        return [("usp",)]
+    if f == "endurosat":
+        return [("endurosat",)]
+    return []
+
+
 def _valid_ax25_address(body: bytes) -> bool:
     """Reject a CRC-16 FALSE POSITIVE. AX.25's FCS is only 16 bits, so over a noisy pass a random
     flag-delimited chunk passes the CRC ~1/65536 of the time and is emitted as a "frame" of garbage
