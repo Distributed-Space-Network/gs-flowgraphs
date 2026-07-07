@@ -166,35 +166,40 @@ def spectrum_summary(iq: np.ndarray, fs: float, *, nfft: int = 8192) -> dict[str
 
 
 def ax25_sweep(
-    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS, *, carriers=None
+    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS, *, carriers=None, target_sps: int = 8
 ) -> list[tuple[float, float, int, list[bytes]]]:
     """Run OUR real AX.25 deframer (``framings.deframe`` — G3RUH + plain, NRZI, FCS-checked) on the
     capture at each candidate baud, with COARSE CARRIER RECOVERY. Doppler compensation leaves the
     bird's fixed oscillator offset (tens of kHz), which parks the carrier outside the narrow demod
-    filter; we de-rotate a candidate carrier to DC first. Candidates default to DC (on-freq bird)
-    AND the spectral peak (offset bird); FCS-gating means a wrong (carrier, baud) yields nothing.
+    filter; we de-rotate a candidate carrier to DC first. TWO-STAGE (cost): try DC + the spectral
+    peak first, and only fall back to a coarse ±21 kHz / 3 kHz GRID when neither decodes — so an
+    on-freq or peak-locked bird is a couple of demods, and the expensive grid runs only when needed.
+    FCS-gating means a wrong (carrier, baud) yields nothing. ``target_sps`` keeps the polyphase
+    resample light (16 upsamples 9600→153.6 k = a huge per-demod convolve on an embedded CPU).
     Returns ``(baud, carrier_hz, n_frames, frames)`` — the winning carrier per baud."""
-    if carriers is None:
+    if carriers is not None:
+        stages: list[list[float]] = [[float(c) for c in carriers]]
+    else:
         sp = spectrum_summary(iq, fs)
         peak = round(sp["peak_hz"]) if sp else 0.0
-        # DC + the spectral peak (which may be a steady RFI line, NOT the bursty bird) + a coarse
-        # grid across the channel, so an off-DC bird is found even when the strongest averaged line
-        # is interference. The demod's FLL + fine CFO absorb the residual between 3 kHz grid steps.
-        grid = {float(h) for h in range(-21000, 21001, 3000)}
-        carriers = sorted({0.0, float(peak)} | grid)
+        grid = sorted({float(h) for h in range(-21000, 21001, 3000)} - {0.0, float(peak)})
+        stages = [[0.0, float(peak)], grid]  # cheap {DC, peak} first; coarse grid only if needed
     out: list[tuple[float, float, int, list[bytes]]] = []
     for baud in bauds:
         best: tuple[float, float, int, list[bytes]] = (float(baud), 0.0, 0, [])
-        for carrier in carriers:
-            # demodulate_capture (not raw demodulate): derotates the carrier + residual CFO and
-            # polyphase-resamples to an integer target_sps before slicing — raw demodulate's timing
-            # recovery DIVERGES at the channel's native sps (e.g. sps=40 for 1200 Bd over 48 kHz).
-            bits = gfsk.demodulate_capture(
-                iq, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT,
-                carrier_hz=carrier)
-            frames, _ = framings.deframe(bits, "ax25")
-            if len(frames) > best[2]:
-                best = (float(baud), float(carrier), len(frames), frames)
+        for stage in stages:
+            for carrier in stage:
+                # demodulate_capture: derotates the carrier + residual CFO and polyphase-resamples
+                # to an integer target_sps before slicing (raw demodulate's timing recovery DIVERGES
+                # at the channel's native sps, e.g. sps=40 for 1200 Bd over 48 kHz).
+                bits = gfsk.demodulate_capture(
+                    iq, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT,
+                    carrier_hz=carrier, target_sps=target_sps)
+                frames, _ = framings.deframe(bits, "ax25")
+                if len(frames) > best[2]:
+                    best = (float(baud), float(carrier), len(frames), frames)
+            if best[2] > 0:
+                break  # decoded without needing the coarse grid
         out.append(best)
     return out
 
@@ -235,7 +240,7 @@ def _center_window(iq: np.ndarray, fs: float, window_s: float) -> tuple[np.ndarr
 
 def analyze_file(
     path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0,
-    *, run_ax25: bool = False, sweep_window_s: float = 60.0,
+    *, run_ax25: bool = False, sweep_window_s: float = 40.0,
     carrier_hz: float | None = None, want_waterfall: bool = False,
 ) -> None:
     cap = load_capture(path, sample_rate_hz)
@@ -265,9 +270,12 @@ def analyze_file(
         win, t0 = _center_window(cap.iq, cap.fs, sweep_window_s)
         span = len(win) / cap.fs if cap.fs else 0.0
         carriers = None if carrier_hz is None else [float(carrier_hz)]
-        print(f"ax25 sweep (our deframer, G3RUH+plain, FCS-checked, carrier-recovered; "
+        # Sweep ONLY the labelled --symbol-rate (default 9600): the baud is known from the pass
+        # params, and a full 4-baud x carrier-grid sweep is 4x the (heavy) demods for nothing.
+        bauds = (float(symbol_rate),) if symbol_rate else DEFAULT_SWEEP_BAUDS
+        print(f"ax25 sweep ({int(symbol_rate)} Bd, G3RUH+plain, FCS-checked, carrier-recovered; "
               f"{span:.0f}s @ t={t0:.0f}s{' [whole pass]' if sweep_window_s <= 0 else ''}):")
-        for baud, carrier, nframes, frames in ax25_sweep(win, cap.fs, carriers=carriers):
+        for baud, carrier, nframes, frames in ax25_sweep(win, cap.fs, bauds, carriers=carriers):
             head = frames[0][:16].hex() if frames else "-"
             print(f"  {int(baud):5d} Bd @ carrier {carrier:+.0f} Hz: {nframes} FCS frame(s)  "
                   f"first={head}")
@@ -296,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--ax25", action="store_true",
                    help="run OUR AX.25 deframer (FCS-checked) sweeping standard bauds + carriers")
-    p.add_argument("--sweep-window-s", type=float, default=60.0,
+    p.add_argument("--sweep-window-s", type=float, default=40.0,
                    help="seconds around TCA (mid-pass) to run the --ax25 sweep on (0 = whole pass)")
     p.add_argument("--carrier-hz", type=float, default=None,
                    help="de-rotate this exact carrier offset (Hz) instead of the auto grid")
