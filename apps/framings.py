@@ -186,6 +186,23 @@ def _bits_to_bytes_any_phase(arr: np.ndarray, decode) -> list[bytes]:
     return out
 
 
+def _valid_ax25_address(body: bytes) -> bool:
+    """Reject a CRC-16 FALSE POSITIVE. AX.25's FCS is only 16 bits, so over a noisy pass a random
+    flag-delimited chunk passes the CRC ~1/65536 of the time and is emitted as a "frame" of garbage
+    (seen on the bench: a frame whose address bytes decode to control chars, not callsigns). A REAL
+    AX.25 frame's 14-byte address field decodes to shifted-ASCII callsigns — each char = ``byte>>1``
+    ∈ ``A-Z`` / ``0-9`` / space. This costs nothing and rejects NO valid AX.25 frame (verified
+    against real SatNOGS captures: ``CQ``/``WQ2XKO`` pass)."""
+    if len(body) < 15:  # 14-byte address field + at least a control byte
+        return False
+    for base in (0, 7):  # destination + source callsigns (6 chars each; SSID byte 6/13 not checked)
+        for i in range(6):
+            c = body[base + i] >> 1
+            if not (0x41 <= c <= 0x5A or 0x30 <= c <= 0x39 or c == 0x20):  # A-Z / 0-9 / space
+                return False
+    return True
+
+
 def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | None]:
     """Hard bits → ``(frames, matched_framing)`` via the LOCAL numpy deframers. ``framing_name``
     (any vocabulary — normalized via :func:`normalize_framing`) runs ONLY that link layer;
@@ -213,6 +230,9 @@ def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | N
             frames = []
             for scramble in (True, False):
                 frames.extend(ax25_framing.decode(arr, scramble=scramble, nrzi=True))
+            # Reject CRC-16 false positives (noise that passed the 16-bit FCS) — a real frame has a
+            # valid callsign address; garbage does not. Keeps decode output trustworthy (bench).
+            frames = [f for f in frames if _valid_ax25_address(f)]
         elif name == "ccsds_tm":  # explicit only — ASM+RS(255,223)+randomize+FECF chain
             frames = ccsds.deframe_tm(arr)
         elif name == "kiss":   # byte-oriented TNC framing — all 8 bit phases tried

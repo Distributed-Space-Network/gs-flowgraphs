@@ -68,3 +68,14 @@ def test_deframe_autodetects_ax25_when_framing_unknown():
     frames, matched = framings.deframe(bits)  # no hint → try all known, report which matched
     assert matched == "ax25"
     assert body in frames
+
+
+def test_ax25_address_check_rejects_crc16_false_positives():
+    # AX.25's FCS is 16-bit → noise passes it ~1/65536; the address-field check rejects those, so a
+    # decoded "frame" is trustworthy. Bytes are real bench data (cmd_101 IPoS pass).
+    real = bytes.fromhex("86a240404040e0aea264b0969ee103f04d1101")  # CQ <- WQ2XKO (real SatNOGS)
+    junk = bytes.fromhex("a99892ab3e26b6c58c60aedea984cd8b")  # bench CRC-16 false positive
+    assert framings._valid_ax25_address(real)
+    assert not framings._valid_ax25_address(junk)
+    # A genuine round-trip frame is NOT rejected (regression guard).
+    assert framings._valid_ax25_address(ax25.encode_ui(dest="DSN", src="ISS", info=b"x"))
