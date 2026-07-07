@@ -177,7 +177,11 @@ def ax25_sweep(
     if carriers is None:
         sp = spectrum_summary(iq, fs)
         peak = round(sp["peak_hz"]) if sp else 0.0
-        carriers = sorted({0.0, float(peak)})
+        # DC + the spectral peak (which may be a steady RFI line, NOT the bursty bird) + a coarse
+        # grid across the channel, so an off-DC bird is found even when the strongest averaged line
+        # is interference. The demod's FLL + fine CFO absorb the residual between 3 kHz grid steps.
+        grid = {float(h) for h in range(-21000, 21001, 3000)}
+        carriers = sorted({0.0, float(peak)} | grid)
     out: list[tuple[float, float, int, list[bytes]]] = []
     for baud in bauds:
         best: tuple[float, float, int, list[bytes]] = (float(baud), 0.0, 0, [])
@@ -217,9 +221,22 @@ def frame_bytes(bits: np.ndarray, *, order: str = "big") -> bytes:
     return np.packbits(b[:n], bitorder=order).tobytes() if n else b""
 
 
+def _center_window(iq: np.ndarray, fs: float, window_s: float) -> tuple[np.ndarray, float]:
+    """A ``window_s`` slice centered on the MIDDLE of the capture (~TCA — strongest signal, Doppler
+    ≈ 0, where the packets are), or the whole capture when ``window_s`` <= 0. The old first-N-sec
+    window sat at AOS (low/weak) and missed the TCA bursts. Returns (window, start_time_s)."""
+    if window_s <= 0 or len(iq) <= int(fs * window_s):
+        return iq, 0.0
+    half = int(fs * window_s / 2)
+    mid = len(iq) // 2
+    start = max(0, mid - half)
+    return iq[start : start + 2 * half], start / fs
+
+
 def analyze_file(
     path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0,
     *, run_ax25: bool = False, sweep_window_s: float = 60.0,
+    carrier_hz: float | None = None, want_waterfall: bool = False,
 ) -> None:
     cap = load_capture(path, sample_rate_hz)
     dur = len(cap.iq) / cap.fs if cap.fs else 0.0
@@ -227,6 +244,15 @@ def analyze_file(
         f"{Path(path).name}: {len(cap.iq):,} samples | fs={cap.fs:.0f} Hz | "
         f"center={cap.center_hz/1e6:.4f} MHz | dur={dur:.3f} s"
     )
+    if want_waterfall:
+        from _recorder import (
+            write_waterfall_png,  # noqa: PLC0415 — matplotlib color / gray fallback
+        )
+
+        wf = Path(path).with_suffix(".analyze.png")
+        write_waterfall_png(
+            wf, cap.iq, sample_rate_hz=cap.fs, center_hz=cap.center_hz, title=Path(path).stem)
+        print(f"waterfall: wrote {wf.name}")
     # Carrier check FIRST: is there ANY signal (weak/continuous too, not just bursts)? A NO CARRIER
     # verdict makes the demod/framing/baud debate moot — the capture is empty (freq/antenna/off).
     sp = spectrum_summary(cap.iq, cap.fs)
@@ -236,11 +262,12 @@ def analyze_file(
         print(f"spectrum: strongest line {sp['peak_hz']:+.0f} Hz, {sp['snr_db']:.1f} dB over floor "
               f"→ {verdict}")
     if run_ax25:
-        win = cap.iq if sweep_window_s <= 0 else cap.iq[: int(cap.fs * sweep_window_s)]
+        win, t0 = _center_window(cap.iq, cap.fs, sweep_window_s)
         span = len(win) / cap.fs if cap.fs else 0.0
+        carriers = None if carrier_hz is None else [float(carrier_hz)]
         print(f"ax25 sweep (our deframer, G3RUH+plain, FCS-checked, carrier-recovered; "
-              f"first {span:.0f}s):")
-        for baud, carrier, nframes, frames in ax25_sweep(win, cap.fs):
+              f"{span:.0f}s @ t={t0:.0f}s{' [whole pass]' if sweep_window_s <= 0 else ''}):")
+        for baud, carrier, nframes, frames in ax25_sweep(win, cap.fs, carriers=carriers):
             head = frames[0][:16].hex() if frames else "-"
             print(f"  {int(baud):5d} Bd @ carrier {carrier:+.0f} Hz: {nframes} FCS frame(s)  "
                   f"first={head}")
@@ -268,12 +295,17 @@ def main(argv: list[str] | None = None) -> int:
         "--sample-rate", type=float, default=0.0, help="cf32 sample rate if no sidecar (Hz)"
     )
     p.add_argument("--ax25", action="store_true",
-                   help="run OUR AX.25 deframer (FCS-checked) sweeping standard bauds")
+                   help="run OUR AX.25 deframer (FCS-checked) sweeping standard bauds + carriers")
     p.add_argument("--sweep-window-s", type=float, default=60.0,
-                   help="seconds of capture to run the --ax25 sweep on (0 = whole pass)")
+                   help="seconds around TCA (mid-pass) to run the --ax25 sweep on (0 = whole pass)")
+    p.add_argument("--carrier-hz", type=float, default=None,
+                   help="de-rotate this exact carrier offset (Hz) instead of the auto grid")
+    p.add_argument("--waterfall", action="store_true",
+                   help="write a colored spectrogram <capture>.analyze.png (needs matplotlib)")
     args = p.parse_args(argv)
     analyze_file(args.capture, symbol_rate=args.symbol_rate, sample_rate_hz=args.sample_rate,
-                 run_ax25=args.ax25, sweep_window_s=args.sweep_window_s)
+                 run_ax25=args.ax25, sweep_window_s=args.sweep_window_s,
+                 carrier_hz=args.carrier_hz, want_waterfall=args.waterfall)
     return 0
 
 
