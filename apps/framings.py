@@ -31,12 +31,22 @@ import numpy as np
 # (gfsk_ax25.kiss.slip_*) remains for its real use, byte-exact TNC/serial pipes (uplink/relay).
 _LOCAL = ("ax25", "endurosat", "ccsds_tm", "kiss")
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
+
 # Local framings whose deframer verifies a REAL integrity check (AX.25 FCS, EnduroSat CRC-16,
 # CCSDS RS+FECF) before emitting a frame. Only these may declare a win in the engine race
 # (docs/10 MED-1): ``kiss`` carries NO checksum and measurably passes ~2 chance "frames" per
 # noise drain, so a KISS hit on the first drain must never gate off the real gr-satellites
 # decoder for the whole pass. KISS frames are still emitted as products — they just can't gate.
 _CRC_GATED = ("ax25", "endurosat", "ccsds_tm")
+
+# docs/13 live-vs-post-pass split (single-sourced here so the RX engine and the post-pass decoder
+# can never drift). LIVE = the LIGHT framings the RX engines run in real time, both at once (the
+# CRC-gated autodetect set). POST_PASS = the OTHER CRC-gated local framings — swept AFTER LOS on
+# the recorded .cf32, so they cost no pass-time CPU. Only CRC-gated framings are auto-swept: a
+# blind whole-pass sweep with an unchecked framing (``kiss`` — no checksum) would emit ~noise
+# "frames", so ``kiss`` is excluded from the default and decoded only on explicit request.
+LIVE_FRAMINGS = _LOCAL_AUTODETECT  # ("ax25", "endurosat")
+POST_PASS_FRAMINGS = tuple(f for f in _CRC_GATED if f not in _LOCAL_AUTODETECT)  # ("ccsds_tm",)
 
 # The gr-satellites framing vocabulary (SatYAML ``framing:`` strings) reused via synthetic
 # SatYAML — advertised here, decoded in the gr-satellites flowgraph. Representative of the ~50
@@ -227,6 +237,12 @@ def _valid_ax25_address(body: bytes) -> bool:
             if not (0x41 <= c <= 0x5A or 0x30 <= c <= 0x39 or c == 0x20):  # A-Z / 0-9 / space
                 return False
     return True
+
+
+# Public alias: the live RX engines (cubesat_gfsk_ax25_rx) apply this same CRC-16-false-positive
+# guard on their AX.25 frames before emitting — their StreamDecoder / framing.decode path gates only
+# on the 16-bit FCS, so without this a noise chunk that passes the FCS would be emitted as a frame.
+valid_ax25_address = _valid_ax25_address
 
 
 def deframe(bits, framing_name: str | None = None) -> tuple[list[bytes], str | None]:

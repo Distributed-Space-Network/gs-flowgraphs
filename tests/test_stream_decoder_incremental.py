@@ -265,26 +265,58 @@ def test_dsp_engine_verbatim_airmac_label_decodes_endurosat(tmp_path):
 
     events, data = _run_engine(cap, 96_000, {"framing": "EnduroSat AirMAC"})
     ready = next(e for e in events if e["event"] == "ready")
-    assert ready["framing"] == "endurosat"
+    # docs/13: both LIGHT framings run live (the label is a hint). The endurosat capture decodes;
+    # ax25 stays silent (CRC-gated), so every emitted frame is tagged endurosat.
+    assert ready["framing"] == "ax25,endurosat"
+    assert ready["framing_hint"] == "endurosat"  # backend label, normalized (hint only)
     assert ready["data_format"] == "raw_bytes"  # explicit gs-client map key (LOW-7)
     frames = [e for e in events if e["event"] == "frame_received"]
     assert [base64.b64decode(f["frame"]["bytes_b64"]) for f in frames] == [payload]
+    assert all(f["framing"] == "endurosat" for f in frames)  # only the endurosat deframer matched
     assert data == payload
 
 
-def test_dsp_engine_unknown_framing_is_record_only_not_ax25(tmp_path):
-    # A label that normalizes to no framing this app implements must NOT be
-    # silently deframed as AX.25 (a wrong link layer): the engine runs
-    # record-only — ready still fires, zero frames, empty data socket.
+def test_dsp_engine_nonlight_label_does_not_suppress_light_framings(tmp_path):
+    # docs/13: the backend framing label is a HINT, not a filter. A non-light label ("USP", which
+    # normalizes to no LOCAL framing) no longer forces record-only — the light framings
+    # (ax25+endurosat) still run, so an EnduroSat capture is captured regardless of the label.
+    # Non-light framings (USP/ccsds/kiss) are decoded POST-PASS on the recorded .cf32.
     cap = tmp_path / "unknown.cf32"
-    body = _ui(b"not-for-this-app")
-    endurosat.transmit(body, _AX_SR).tofile(cap)
+    payload = bytes(range(24))
+    iq = np.concatenate(
+        [np.zeros(2000, np.complex64), el.transmit(payload, 96_000.0), np.zeros(2000, np.complex64)]
+    ).astype(np.complex64)
+    iq.tofile(cap)
 
-    events, data = _run_engine(cap, int(_AX_SR), {"framing": "USP"})
+    events, data = _run_engine(cap, 96_000, {"framing": "USP"})
     ready = next(e for e in events if e["event"] == "ready")
-    assert ready["framing"] == "record_only"
-    assert not [e for e in events if e["event"] == "frame_received"]
-    assert data == b""
+    assert ready["framing"] == "ax25,endurosat"  # both light framings run despite the USP label
+    assert ready["framing_hint"] == "none"  # "USP" normalizes to no LOCAL framing
+    frames = [e for e in events if e["event"] == "frame_received"]
+    assert [base64.b64decode(f["frame"]["bytes_b64"]) for f in frames] == [payload]
+    assert all(f["framing"] == "endurosat" for f in frames)
+    assert data == payload
+
+
+def test_dsp_engine_ax25_label_still_captures_endurosat_traffic(tmp_path):
+    # THE customer scenario: a pass LABELLED "ax25" whose real traffic is EnduroSat. Run-both means
+    # the endurosat deframer runs alongside ax25, so the traffic is still captured (tagged
+    # endurosat) in the SAME pass — the ax25 label no longer suppresses it.
+    cap = tmp_path / "mislabeled.cf32"
+    payload = bytes(range(24))
+    iq = np.concatenate(
+        [np.zeros(2000, np.complex64), el.transmit(payload, 96_000.0), np.zeros(2000, np.complex64)]
+    ).astype(np.complex64)
+    iq.tofile(cap)
+
+    events, data = _run_engine(cap, 96_000, {"framing": "ax25"})
+    ready = next(e for e in events if e["event"] == "ready")
+    assert ready["framing"] == "ax25,endurosat"
+    assert ready["framing_hint"] == "ax25"  # the (wrong) backend label — a hint, not a filter
+    frames = [e for e in events if e["event"] == "frame_received"]
+    assert [base64.b64decode(f["frame"]["bytes_b64"]) for f in frames] == [payload]
+    assert all(f["framing"] == "endurosat" for f in frames)  # decoded despite the ax25 label
+    assert data == payload
 
 
 def test_unknown_framing_warns_exactly_once(caplog):

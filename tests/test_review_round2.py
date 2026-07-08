@@ -205,7 +205,7 @@ def test_final_flush_failure_is_logged_not_swallowed(monkeypatch, caplog):
     # The engine finished cleanly (ready event emitted, no exception escaped)
     # and the flush failure is VISIBLE in the log.
     assert any(e["event"] == "ready" for e in events)
-    assert any("final flush decode failed" in r.getMessage() for r in caplog.records)
+    assert any("final flush failed" in r.getMessage() for r in caplog.records)
 
 
 # ----------------------------------------------------------------------
@@ -480,6 +480,7 @@ def test_gnuradio_engine_has_final_drain_at_stop():
     src = (_APPS / "cubesat_gfsk_ax25_rx.py").read_text(encoding="utf-8")
     fn = src[src.index("async def _run_gnuradio_engine") : src.index("async def amain")]
     fin = fn[fn.rindex("finally:") :]
-    assert "ctx.stop()" in fin and "ctx.drain_bits()" in fin and "_emit_frame" in fin
+    assert "ctx.stop()" in fin and "ctx.drain_bits()" in fin and "_emit_new" in fin
     assert fin.index("ctx.stop()") < fin.index("ctx.drain_bits()")  # drain the flushed graph
-    assert "_decode(tail)" in fin  # same tail-carry dedup as the loop body
+    # _emit_new runs the same per-framing tail-carry dedup (over both light framings) as the loop.
+    assert "_emit_new(bits, tail)" in fin

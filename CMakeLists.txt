@@ -48,8 +48,10 @@ install(
     apps/amateur_fm_narrowband_tx.py
     apps/cubesat_gfsk_ax25_rx.py
     apps/cubesat_gfsk_ax25_tx.py
+    apps/cubesat_gfsk_endurosat_bidir.py  # persistent bidirectional EnduroSat (uplink + downlink)
     apps/satellite_rx.py             # multi-mission gr-satellites receiver (bench)
     apps/iq_views.py                 # post-pass PNG/CSV/SDF from a .cf32 (run by gs-client)
+    apps/iq_decode.py                # post-pass decode of the non-live framings from a .cf32 (docs/13)
   DESTINATION ${GS_APPS_INSTALL_DIR}
 )
 install(

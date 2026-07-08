@@ -48,7 +48,8 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
-from framings import normalize_framing
+from framings import LIVE_FRAMINGS as _LIVE_FRAMINGS
+from framings import normalize_framing, valid_ax25_address
 
 from gfsk_ax25 import ax25, endurosat, endurosat_link
 
@@ -87,7 +88,34 @@ def _select_engine(args, params: dict[str, object]) -> str:
 # Link layers THIS app can deframe. Anything else runs record-only (IQ capture,
 # no deframe) — never silently a wrong link layer.
 _APP_FRAMINGS = ("ax25", "endurosat")
+# ``_LIVE_FRAMINGS`` (imported from the framings registry — single-sourced with the post-pass
+# decoder) is the LIGHT set this app runs LIVE, both at once (docs/13). The backend/SatYAML
+# `framing` label is a HINT, not an exclusive filter: a pass labelled "ax25" whose real traffic is
+# EnduroSat (or vice-versa) is captured in ONE pass. Both are CRC-gated, so the wrong deframer
+# yields nothing (no false frames); the only cost is a second light 2-GFSK demod. Heavier /
+# non-light framings (ccsds_tm, kiss, the gr-satellites catalog) are handled post-pass on the
+# recorded .cf32 — see apps/iq_decode.py.
 _warned_framings: set[str] = set()  # one WARNING per unknown label per process
+
+
+def _build_live_decoder(
+    framing: str,
+    sample_rate: float,
+    params: dict[str, object],
+    profile: endurosat.LinkProfile,
+) -> object:
+    """One IQ ``StreamDecoder`` for a live framing. Both light framings share the pass's 2-GFSK
+    PHY and differ only in the link layer (HDLC/AX.25 vs EnduroSat chip-packet) + its bit-level
+    descrambling/NRZI, so running both on the same IQ costs a second light demod, nothing more."""
+    if framing == "endurosat":
+        sym_hz = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
+        return endurosat_link.StreamDecoder(
+            sample_rate,
+            symbol_rate_hz=sym_hz,
+            mod_index=float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
+            bt=float(params.get("bt", endurosat_link.DEFAULT_BT)),
+        )
+    return endurosat.StreamDecoder(sample_rate, profile=profile, recover_timing=True)
 
 
 def _select_framing(params: dict[str, object]) -> str | None:
@@ -172,6 +200,12 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25", output_dir
     For ``endurosat`` framing the body is the opaque (encrypted AirMAC) payload,
     so we do not attempt an AX.25 parse — the orchestrator decodes it.
     """
+    # Run-both means the AX.25 deframer runs on EVERY pass (incl. EnduroSat/unknown-labelled), and
+    # its 16-bit FCS passes a random noise chunk ~1/65536 of the time. The registry deframe rejects
+    # those by callsign structure; the live StreamDecoder/framing.decode path does not, so apply the
+    # SAME guard here before emitting — else a spurious "ax25" frame pollutes the product.
+    if framing == "ax25" and not valid_ax25_address(body):
+        return
     ui = ax25.decode_ui(body) if framing == "ax25" else None
     event: dict[str, object] = {
         "event": "frame_received",
@@ -192,20 +226,6 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25", output_dir
         logging.getLogger("cubesat_gfsk_ax25_rx").warning("data socket closed; frame not stored")
     if output_dir:  # persist {raw, deframed} alongside the IQ (S3/temp handled by gs-client)
         _append_frame_record(output_dir, body, framing, ui)
-
-
-class _NullStreamDecoder:
-    """Record-only stand-in (unknown framing): accepts IQ, never yields frames.
-    The IQ recording and status plumbing run unchanged — a missing deframer must
-    never cost the capture (docs/10 null-decode rule)."""
-
-    def push(self, _chunk) -> None:
-        return None
-
-    def decode_new(self) -> list[bytes]:
-        return []
-
-    flush = decode_new
 
 
 # ----------------------------------------------------------------------
@@ -393,21 +413,12 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
     log = logging.getLogger("cubesat_gfsk_ax25_rx")
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
     out_dir = getattr(args, "output_dir", None)  # frames.jsonl alongside the IQ
-    framing = _select_framing(params)
-    if framing == "endurosat":
-        # The EnduroSat chip link is 9600 sym/s (endurosat_link defaults), not the
-        # 12480 the AX.25 LinkProfile assumes; honour params overrides if present.
-        sym_hz = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
-        decoder: object = endurosat_link.StreamDecoder(
-            sample_rate,
-            symbol_rate_hz=sym_hz,
-            mod_index=float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
-            bt=float(params.get("bt", endurosat_link.DEFAULT_BT)),
-        )
-    elif framing == "ax25":
-        decoder = endurosat.StreamDecoder(sample_rate, profile=profile, recover_timing=True)
-    else:  # unknown framing (already warned): record-only — keep the IQ, no deframe
-        decoder = _NullStreamDecoder()
+    # Run BOTH light framings live (the `framing` label is only a hint now). Each frame is emitted
+    # tagged with the framing that produced it; the wrong deframer stays silent (CRC-gated).
+    declared = _select_framing(params)  # hint only — logged in the ready event; may be None
+    decoders: list[tuple[str, object]] = [
+        (name, _build_live_decoder(name, sample_rate, params, profile)) for name in _LIVE_FRAMINGS
+    ]
 
     # Digital Doppler NCO. ``doppler`` is shared with the command handler, so a
     # set_doppler mid-pass is picked up here on the next chunk; nco_phase keeps
@@ -425,7 +436,10 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             "sample_rate": int(sample_rate),
             "symbol_rate": int(profile.symbol_rate_hz),
             "engine": "dsp",
-            "framing": framing or "record_only",
+            # Now a list: every light framing tried live. `framing_hint` is the backend/SatYAML
+            # label we were told (informational — no longer an exclusive filter).
+            "framing": ",".join(name for name, _ in decoders),
+            "framing_hint": declared or "none",
             "flowgraph_version": VERSION,
         },
     )
@@ -465,24 +479,28 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                 break
             # Decode OFF the event loop (docs/10 MED-3): a long demod must never
             # stall command/status handling. The decoders lock their chunk
-            # hand-off, so pushes from the loop thread stay safe meanwhile.
-            try:
-                bodies = await asyncio.to_thread(decoder.decode_new)
-            except Exception:  # noqa: BLE001 — docs/J HIGH-1: a decoder bug must
-                # not end live decode. Unhandled, this task's exception would
-                # vanish into gather(return_exceptions=True) below and every
-                # later drain of the pass would be silently dropped. Log it
-                # (rate-limited: one bad window tends to mean many) and keep
-                # draining — the decoder's buffer hand-off already completed, so
-                # the next drain starts clean.
-                decode_errors += 1
-                if decode_errors <= 3 or decode_errors % 50 == 0:
-                    log.exception(
-                        "decode_new failed (error #%d); decode loop continues", decode_errors
-                    )
-                continue
-            for body in bodies:
-                await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
+            # hand-off, so pushes from the loop thread stay safe meanwhile. Each
+            # light framing drains independently and its frames are tagged with it.
+            for fname, dec in decoders:
+                try:
+                    bodies = await asyncio.to_thread(dec.decode_new)
+                except Exception:  # noqa: BLE001 — docs/J HIGH-1: a decoder bug must
+                    # not end live decode. Unhandled, this task's exception would
+                    # vanish into gather(return_exceptions=True) below and every
+                    # later drain of the pass would be silently dropped. Log it
+                    # (rate-limited: one bad window tends to mean many) and keep
+                    # draining — the decoder's buffer hand-off already completed, so
+                    # the next drain starts clean.
+                    decode_errors += 1
+                    if decode_errors <= 3 or decode_errors % 50 == 0:
+                        log.exception(
+                            "%s decode_new failed (error #%d); decode loop continues",
+                            fname,
+                            decode_errors,
+                        )
+                    continue
+                for body in bodies:
+                    await _emit_frame(sockets, body, framing=fname, output_dir=out_dir)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
     try:
@@ -496,20 +514,22 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                 ph = nco_phase - 2.0 * np.pi * off * n / sample_rate
                 chunk = (chunk * np.exp(1j * ph)).astype(np.complex64)
                 nco_phase = float(ph[-1]) if len(ph) else nco_phase
-            decoder.push(chunk)
+            for _, dec in decoders:
+                dec.push(chunk)
     finally:
         stop_requested.set()
         # AWAIT (never cancel) the decode task: a cancel could discard frames a
         # decode_new already consumed from the buffer in its worker thread. The
-        # loop wakes promptly on stop_requested; then flush the remainder.
+        # loop wakes promptly on stop_requested; then flush the remainder of each.
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
-        try:
-            leftovers = await asyncio.to_thread(decoder.flush)
-        except Exception:  # noqa: BLE001 — docs/J HIGH-1: never die invisibly
-            log.exception("final flush decode failed; frames in the last window not emitted")
-            leftovers = []
-        for body in leftovers:
-            await _emit_frame(sockets, body, framing=framing, output_dir=out_dir)
+        for fname, dec in decoders:
+            try:
+                leftovers = await asyncio.to_thread(dec.flush)
+            except Exception:  # noqa: BLE001 — docs/J HIGH-1: never die invisibly
+                log.exception("%s final flush failed; last-window frames not emitted", fname)
+                leftovers = []
+            for body in leftovers:
+                await _emit_frame(sockets, body, framing=fname, output_dir=out_dir)
 
 
 # ----------------------------------------------------------------------
@@ -528,7 +548,7 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     from gfsk_ax25 import framing
 
     log = logging.getLogger("cubesat_gfsk_ax25_rx")
-    framing_kind = _select_framing(params)
+    declared = _select_framing(params)  # hint only (see the dsp engine) — no longer exclusive
     out_dir = getattr(args, "output_dir", None)  # frames.jsonl alongside the IQ
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
     ctx = build_rx_top_block(args, profile, sample_rate, params)
@@ -540,7 +560,9 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
             "data_format": "raw_bytes",
             "sample_rate": int(sample_rate),
             "engine": "gnuradio",
-            "framing": framing_kind or "record_only",
+            # Both light framings run on the ONE recovered bitstream (demod once, deframe many).
+            "framing": ",".join(_LIVE_FRAMINGS),
+            "framing_hint": declared or "none",
             "flowgraph_version": VERSION,
         },
     )
@@ -557,16 +579,24 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     tail = np.empty(0, dtype=np.uint8)
     tail_bits = 4096  # ~2 max-length AX.25 frames
 
-    def _decode(bits_arr):
-        if framing_kind is None:
-            # Unknown framing (already warned): record-only — never parse a
-            # foreign link layer as AX.25 (docs/10 LOW-3 / P0-2).
-            return []
-        if framing_kind == "endurosat":
-            # Bit-level EnduroSat deframe (fallback; the dsp engine's IQ-level
-            # StreamDecoder is the proven path and the default for endurosat).
+    def _decode(bits_arr, framing_name):
+        # One recovered bitstream, deframed by each light link layer (demod once, deframe many):
+        # EnduroSat chip-packet or AX.25/HDLC. Both are CRC-gated → the wrong one yields nothing.
+        if framing_name == "endurosat":
             return list(_endurosat_deframe_bits(bits_arr))
         return list(framing.decode(bits_arr, scramble=profile.scramble, nrzi=profile.nrzi))
+
+    async def _emit_new(bits_arr, prev_tail_arr) -> None:
+        # Emit new frames for EVERY light framing, each tagged, with the SAME positional tail-carry
+        # dedup per framing (subtract exactly what the carried tail alone re-decodes).
+        for fname in _LIVE_FRAMINGS:
+            frames = _decode(bits_arr, fname)
+            if prev_tail_arr.size:
+                for body in _decode(prev_tail_arr, fname):  # already emitted last drain
+                    if body in frames:
+                        frames.remove(body)
+            for body in frames:
+                await _emit_frame(sockets, body, framing=fname, output_dir=out_dir)
 
     try:
         while not stop_requested.is_set():
@@ -579,13 +609,7 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
             bits = np.concatenate([prev_tail, fresh]) if prev_tail.size else fresh
             if bits.size:
                 tail = bits[-tail_bits:].copy()
-            frames = _decode(bits)
-            if prev_tail.size:
-                for body in _decode(prev_tail):  # already emitted last drain
-                    if body in frames:
-                        frames.remove(body)
-            for body in frames:
-                await _emit_frame(sockets, body, framing=framing_kind, output_dir=out_dir)
+            await _emit_new(bits, prev_tail)
     finally:
         ctx.stop()
         ctx.wait()
@@ -597,13 +621,7 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
         try:
             fresh = ctx.drain_bits()
             bits = np.concatenate([tail, fresh]) if tail.size else fresh
-            frames = _decode(bits)
-            if tail.size:
-                for body in _decode(tail):  # already emitted on the last drain
-                    if body in frames:
-                        frames.remove(body)
-            for body in frames:
-                await _emit_frame(sockets, body, framing=framing_kind, output_dir=out_dir)
+            await _emit_new(bits, tail)
         except Exception:  # noqa: BLE001 — docs/J HIGH-1: never die invisibly
             log.exception("final GR drain failed; frames from the last window not emitted")
 

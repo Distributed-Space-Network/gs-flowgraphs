@@ -170,18 +170,20 @@ def spectrum_summary(iq: np.ndarray, fs: float, *, nfft: int = 8192) -> dict[str
     return {"peak_hz": float(freqs[pk]), "snr_db": float(psd_db[pk] - floor), "nseg": float(nseg)}
 
 
-def ax25_sweep(
-    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS, *, carriers=None, target_sps: int = 8
+def framing_sweep(
+    iq: np.ndarray, fs: float, framing: str = "ax25", bauds=DEFAULT_SWEEP_BAUDS,
+    *, carriers=None, target_sps: int = 8,
 ) -> list[tuple[float, float, int, list[bytes]]]:
-    """Run OUR real AX.25 deframer (``framings.deframe`` — G3RUH + plain, NRZI, FCS-checked) on the
+    """Run OUR real deframer (``framings.deframe`` for the given ``framing``: ax25 = G3RUH+plain,
+    NRZI, FCS + callsign-validated; endurosat = chip-packet, CRC-16 gated, both polarities) on the
     capture at each candidate baud, with COARSE CARRIER RECOVERY. Doppler compensation leaves the
     bird's fixed oscillator offset (tens of kHz), which parks the carrier outside the narrow demod
     filter; we de-rotate a candidate carrier to DC first. TWO-STAGE (cost): try DC + the spectral
     peak first, and only fall back to a coarse ±21 kHz / 3 kHz GRID when neither decodes — so an
     on-freq or peak-locked bird is a couple of demods, and the expensive grid runs only when needed.
-    FCS-gating means a wrong (carrier, baud) yields nothing. ``target_sps`` keeps the polyphase
-    resample light (16 upsamples 9600→153.6 k = a huge per-demod convolve on an embedded CPU).
-    Returns ``(baud, carrier_hz, n_frames, frames)`` — the winning carrier per baud."""
+    The checksum gate means a wrong (carrier, baud) yields nothing. ``target_sps`` keeps the
+    polyphase resample light (16 upsamples 9600→153.6 k = a huge per-demod convolve on an embedded
+    CPU). Returns ``(baud, carrier_hz, n_frames, frames)`` — the winning carrier per baud."""
     if carriers is not None:
         stages: list[list[float]] = [[float(c) for c in carriers]]
     else:
@@ -200,7 +202,7 @@ def ax25_sweep(
                 bits = gfsk.demodulate_capture(
                     iq, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT,
                     carrier_hz=carrier, target_sps=target_sps)
-                frames, _ = framings.deframe(bits, "ax25")
+                frames, _ = framings.deframe(bits, framing)
                 if len(frames) > best[2]:
                     best = (float(baud), float(carrier), len(frames), frames)
             if best[2] > 0:
@@ -209,11 +211,26 @@ def ax25_sweep(
     return out
 
 
+def ax25_sweep(
+    iq: np.ndarray, fs: float, bauds=DEFAULT_SWEEP_BAUDS, *, carriers=None, target_sps: int = 8
+) -> list[tuple[float, float, int, list[bytes]]]:
+    """AX.25 carrier/baud sweep — thin wrapper over :func:`framing_sweep` (kept for tests)."""
+    return framing_sweep(iq, fs, "ax25", bauds, carriers=carriers, target_sps=target_sps)
+
+
 def demodulate_burst(
-    iq: np.ndarray, fs: float, *, symbol_rate: float = DEFAULT_SYMBOL_RATE, guard_ms: float = 3.0
+    iq: np.ndarray, fs: float, *, symbol_rate: float = DEFAULT_SYMBOL_RATE, carrier_hz: float = 0.0
 ) -> np.ndarray:
-    """Demodulate one burst (caller passes a slice incl. guard) to hard bits."""
-    return gfsk.demodulate(iq, gfsk_params(fs, symbol_rate), recover_timing=True)
+    """Demodulate one burst (caller passes a slice incl. guard) to hard bits, DE-ROTATING
+    ``carrier_hz`` to DC first. Doppler + the bird's fixed oscillator offset park the carrier
+    outside the narrow demod filter, so a raw demod there gives NO-SYNC — the caller estimates the
+    offset (from the spectrum, or --carrier-hz) and passes it here; ``correct_cfo`` then cleans the
+    residual. Via ``demodulate_capture`` this also polyphase-resamples, so a non-integer
+    samples/symbol rate (e.g. 500 kHz / 9600) still demods — handy for the sample-rate sweeps."""
+    return gfsk.demodulate_capture(
+        iq, fs, symbol_rate_hz=symbol_rate, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT,
+        carrier_hz=carrier_hz, correct_cfo=True, recover_timing=False,
+    )
 
 
 def find_sync(bits: np.ndarray, *, min_preamble: int = 2) -> int | None:
@@ -245,7 +262,7 @@ def _center_window(iq: np.ndarray, fs: float, window_s: float) -> tuple[np.ndarr
 
 def analyze_file(
     path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0,
-    *, run_ax25: bool = False, sweep_window_s: float = 40.0,
+    *, run_ax25: bool = False, run_endurosat: bool = False, sweep_window_s: float = 40.0,
     carrier_hz: float | None = None, want_waterfall: bool = False,
 ) -> None:
     cap = load_capture(path, sample_rate_hz)
@@ -284,19 +301,45 @@ def analyze_file(
             head = frames[0][:16].hex() if frames else "-"
             print(f"  {int(baud):5d} Bd @ carrier {carrier:+.0f} Hz: {nframes} FCS frame(s)  "
                   f"first={head}")
+    if run_endurosat:
+        # Same carrier-recovering sweep as --ax25, but the EnduroSat chip-packet deframer (CRC-16
+        # gated, both bit polarities). This is the DEFRAMED, checksum-validated EnduroSat extraction
+        # — vs the raw byte dump in the burst listing below.
+        win, t0 = _center_window(cap.iq, cap.fs, sweep_window_s)
+        span = len(win) / cap.fs if cap.fs else 0.0
+        carriers = None if carrier_hz is None else [float(carrier_hz)]
+        bauds = (float(symbol_rate),) if symbol_rate else DEFAULT_SWEEP_BAUDS
+        print(f"endurosat sweep ({int(symbol_rate)} Bd, chip-packet CRC-16, carrier-recovered; "
+              f"{span:.0f}s @ t={t0:.0f}s{' [whole pass]' if sweep_window_s <= 0 else ''}):")
+        for baud, carrier, nframes, frames in framing_sweep(
+            win, cap.fs, "endurosat", bauds, carriers=carriers
+        ):
+            head = frames[0][:16].hex() if frames else "-"
+            print(f"  {int(baud):5d} Bd @ carrier {carrier:+.0f} Hz: {nframes} CRC frame(s)  "
+                  f"first={head}")
+    # Carrier for the burst demod: --carrier-hz if given, else the capture's dominant spectral line.
+    # This is what makes the EnduroSat framing readable off a raw .cf32: the bird's fixed oscillator
+    # offset + Doppler park the signal off the narrow demod filter, so de-rotating it to DC turns
+    # NO-SYNC into a decode. 0.0 falls back to correct_cfo alone (fine for a near-DC capture).
+    burst_carrier = (
+        float(carrier_hz)
+        if carrier_hz is not None
+        else (round(sp["peak_hz"]) if sp and sp["snr_db"] >= CARRIER_SNR_DB else 0.0)
+    )
     bursts = find_bursts(cap.iq, cap.fs)
     guard = int(cap.fs * 0.003)
-    print(f"{len(bursts)} bursts:")
+    print(f"{len(bursts)} bursts (demod carrier {burst_carrier:+.0f} Hz):")
     for k, (s, e) in enumerate(bursts):
         seg = cap.iq[max(0, s - guard) : e + guard]
-        bits = demodulate_burst(seg, cap.fs, symbol_rate=symbol_rate)
+        bits = demodulate_burst(seg, cap.fs, symbol_rate=symbol_rate, carrier_hz=burst_carrier)
         idx = find_sync(bits)
         fb = frame_bytes(bits[idx:]) if idx is not None else b""
         synced = f"sync@bit{idx}" if idx is not None else "NO-SYNC"
-        head = fb[:12].hex() if fb else "-"
+        # FULL on-wire frame bytes after the 0xAA/0x7E sync (len + payload + CRC) — the EnduroSat
+        # framing to inspect/extract; bounded per burst. '-' when the burst didn't sync.
         print(
             f"  burst {k}: t={s/cap.fs:7.3f}s dur={(e-s)/cap.fs*1000:6.1f}ms "
-            f"{synced:>10}  payload[0:12]={head}"
+            f"{synced:>10}  frame={fb.hex() if fb else '-'}"
         )
 
 
@@ -309,6 +352,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--ax25", action="store_true",
                    help="run OUR AX.25 deframer (FCS-checked) sweeping standard bauds + carriers")
+    p.add_argument("--endurosat", action="store_true",
+                   help="run OUR EnduroSat chip-packet deframer (CRC-16) with the carrier sweep")
     p.add_argument("--sweep-window-s", type=float, default=40.0,
                    help="seconds around TCA (mid-pass) to run the --ax25 sweep on (0 = whole pass)")
     p.add_argument("--carrier-hz", type=float, default=None,
@@ -317,7 +362,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="write a colored spectrogram <capture>.analyze.png (needs matplotlib)")
     args = p.parse_args(argv)
     analyze_file(args.capture, symbol_rate=args.symbol_rate, sample_rate_hz=args.sample_rate,
-                 run_ax25=args.ax25, sweep_window_s=args.sweep_window_s,
+                 run_ax25=args.ax25, run_endurosat=args.endurosat,
+                 sweep_window_s=args.sweep_window_s,
                  carrier_hz=args.carrier_hz, want_waterfall=args.waterfall)
     return 0
 

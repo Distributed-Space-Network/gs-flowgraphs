@@ -54,6 +54,9 @@ def gaussian_taps(params: GfskParams) -> np.ndarray:
 
 def modulate(bits: np.ndarray, params: GfskParams) -> np.ndarray:
     """Bits (0/1) -> complex64 baseband IQ at ``params.sample_rate_hz``."""
+    bits = np.asarray(bits)
+    if bits.size == 0:
+        return np.empty(0, dtype=np.complex64)  # empty in → empty out (else np.convolve raises)
     sps = params.sps
     if abs(sps - round(sps)) > 1e-9:
         msg = f"sample_rate/symbol_rate must be integer for modulate (got {sps})"
@@ -65,6 +68,53 @@ def modulate(bits: np.ndarray, params: GfskParams) -> np.ndarray:
     inst_freq = params.deviation_hz * shaped  # Hz
     phase = 2.0 * np.pi * np.cumsum(inst_freq) / params.sample_rate_hz
     return np.exp(1j * phase).astype(np.complex64)
+
+
+def modulate_bytes(payload: bytes, params: GfskParams, *, bitorder: str = "big") -> np.ndarray:
+    """Raw bytes -> 2-GFSK IQ, VERBATIM (no framing added). ``bitorder`` is numpy's ``"big"``
+    (MSB-first, the default and the convention ``endurosat_link.frame_bits`` uses) or ``"little"``
+    (LSB-first). For transmitting a blob that is already a complete on-air bitstream."""
+    order = {"msb": "big", "lsb": "little"}.get(bitorder, bitorder)
+    bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8), bitorder=order)
+    return modulate(bits, params)
+
+
+def modulate_bytes_zero_gaps(
+    payload: bytes, params: GfskParams, *, bitorder: str = "big", min_gap_bytes: int = 0
+) -> np.ndarray:
+    """Like :func:`modulate_bytes`, but a run of ``>= min_gap_bytes`` zero bytes becomes
+    zero-amplitude IQ (silence) of the SAME time duration instead of full-power FSK ``0`` symbols.
+
+    For a pre-framed packet TRAIN that uses long ``0x00`` pads as inter-packet gaps: the padding
+    becomes real silence (helps the receiver re-lock per packet) while its timing is preserved.
+    ``min_gap_bytes <= 0`` -> plain verbatim raw (short zero runs stay legal FSK ``0`` bits)."""
+    if min_gap_bytes <= 0:
+        return modulate_bytes(payload, params, bitorder=bitorder)
+    sps = params.sps
+    if abs(sps - round(sps)) > 1e-9:
+        msg = f"sample_rate/symbol_rate must be integer for raw gaps (got {sps})"
+        raise ValueError(msg)
+    sps_i = int(round(sps))
+    parts: list[np.ndarray] = []
+    pos = scan = 0
+    n = len(payload)
+    while scan < n:
+        if payload[scan] != 0:
+            scan += 1
+            continue
+        end = scan + 1
+        while end < n and payload[end] == 0:
+            end += 1
+        run = end - scan
+        if run >= min_gap_bytes:
+            if pos < scan:
+                parts.append(modulate_bytes(payload[pos:scan], params, bitorder=bitorder))
+            parts.append(np.zeros(run * 8 * sps_i, dtype=np.complex64))
+            pos = end
+        scan = end
+    if pos < n:
+        parts.append(modulate_bytes(payload[pos:], params, bitorder=bitorder))
+    return np.concatenate(parts) if parts else np.empty(0, dtype=np.complex64)
 
 
 def _moving_mean(x: np.ndarray, win: int) -> np.ndarray:
@@ -226,4 +276,6 @@ __all__ = [
     "estimate_cfo_rad",
     "gaussian_taps",
     "modulate",
+    "modulate_bytes",
+    "modulate_bytes_zero_gaps",
 ]

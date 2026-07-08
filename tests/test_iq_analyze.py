@@ -99,3 +99,58 @@ def test_ax25_sweep_recovers_an_off_dc_carrier() -> None:
     res = {b: (c, nf) for b, c, nf, _f in ax25_sweep(iq, fs)}
     assert res[1200.0][1] >= 1  # decoded despite the +8 kHz offset (via spectral carrier recovery)
     assert abs(res[1200.0][0] - offset) < 800.0  # and recovered ~the true carrier offset
+
+
+# ── EnduroSat framing extraction off a raw capture WITH a carrier offset (docs/13 fix) ────────
+def test_demodulate_burst_recovers_off_dc_endurosat_framing() -> None:
+    # The EnduroSat framing must be extractable from a raw capture that carries a Doppler/oscillator
+    # offset: shift a framed burst off DC, and demodulate_burst(carrier_hz=offset) must SYNC on the
+    # 0xAA/0x7E preamble and yield the full framed bytes (len + payload + CRC), not NO-SYNC.
+    from iq_analyze import demodulate_burst, find_sync, frame_bytes
+
+    from gfsk_ax25 import endurosat_link as el
+
+    fs, baud, offset = 96_000.0, 9600.0, 12_000.0
+    payload = bytes(range(20))
+    iq = modulate(el.frame_bits(payload), GfskParams(sample_rate_hz=fs, symbol_rate_hz=baud))
+    guard = np.zeros(2000, dtype=np.complex64)
+    seg = np.concatenate([guard, iq, guard]).astype(np.complex64)
+    n = np.arange(len(seg))
+    seg_off = (seg * np.exp(2j * np.pi * offset * n / fs)).astype(np.complex64)
+
+    demod = demodulate_burst(seg_off, fs, symbol_rate=baud, carrier_hz=offset)
+    idx = find_sync(demod)
+    assert idx is not None  # synced despite the +12 kHz offset (de-rotated to DC first)
+    fb = frame_bytes(demod[idx:])
+    assert payload in fb  # full framed bytes recovered, not just a 12-byte preview
+
+
+# ── framing_sweep --endurosat: carrier-recovered, CRC-16-gated EnduroSat extraction ───────────
+def test_endurosat_sweep_recovers_off_dc_frame() -> None:
+    from iq_analyze import framing_sweep
+
+    from gfsk_ax25 import endurosat_link as el
+
+    fs, baud, offset = 96_000.0, 9600.0, 8000.0
+    payload = bytes(range(24))
+    iq = modulate(el.frame_bits(payload), GfskParams(sample_rate_hz=fs, symbol_rate_hz=baud))
+    guard = np.zeros(2000, dtype=np.complex64)
+    seg = np.concatenate([guard, iq, guard]).astype(np.complex64)
+    n = np.arange(len(seg))
+    seg_off = (seg * np.exp(2j * np.pi * offset * n / fs)).astype(np.complex64)
+    # Force the known carrier (the coarse grid would also find it): CRC-gated → decodes at 9600.
+    res = {b: (nf, fr) for b, _c, nf, fr in framing_sweep(seg_off, fs, "endurosat", (baud,),
+                                                          carriers=[offset])}
+    nframes, frames = res[baud]
+    assert nframes >= 1
+    assert any(payload in f for f in frames)  # the EnduroSat payload is recovered
+
+
+def test_endurosat_sweep_no_false_positive_on_noise() -> None:
+    from iq_analyze import framing_sweep
+
+    rng = np.random.default_rng(3)
+    noise = (rng.normal(0, 1, 96_000) + 1j * rng.normal(0, 1, 96_000)).astype(np.complex64)
+    res = {b: nf for b, _c, nf, _f in framing_sweep(noise, 96_000.0, "endurosat", (9600.0,),
+                                                    carriers=[0.0])}
+    assert res[9600.0] == 0  # CRC-16 gate → no garbage frames from noise
