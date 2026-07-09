@@ -74,3 +74,42 @@ def test_gardner_timing_recovery():
     iq_d = _awgn((re + 1j * im).astype(np.complex64), 0.2, seed=5)
     rx = demodulate(iq_d, _params(), recover_timing=True)
     assert _min_ber(bits, rx) < 0.03
+
+
+def test_estimate_cfo_is_amplitude_weighted():
+    # estimate_cfo_rad must be AMPLITUDE-weighted (angle of the mean lag-1 product), not a mean of
+    # per-sample angles. On a real capture the wanted signal is a loud burst sitting in long quiet
+    # gaps; a mean-of-angles estimate weights every low-amplitude gap sample equally and drifts onto
+    # whatever tiny tone lives in the gaps (measured as a bogus +18 kHz CFO on cmd_107). The
+    # amplitude-weighted form lets the loud burst dominate.
+    from gfsk_ax25.gfsk import estimate_cfo_rad
+
+    fs = 96_000.0
+    n = np.arange(6000)
+    burst = np.exp(2j * np.pi * 5000.0 * n / fs).astype(np.complex64)  # loud tone at +5 kHz
+    rng = np.random.default_rng(0)
+    gap = (0.01 * (rng.normal(0, 1, 3000) + 1j * rng.normal(0, 1, 3000))).astype(np.complex64)
+    sig = np.concatenate([gap, burst, gap]).astype(np.complex64)
+    cfo_hz = estimate_cfo_rad(sig) * fs / (2 * np.pi)
+    assert abs(cfo_hz - 5000.0) < 100.0  # locks the loud burst, not the noisy gaps
+
+
+def test_channel_filter_recovers_preamble_beside_carrier():
+    # The cmd_107 failure mode: a STRONG continuous carrier tens of kHz off-channel captures the
+    # wideband FM discriminator (which has no channel filter of its own), corrupting every symbol.
+    # demodulate_capture(channel_bw_hz=...) low-passes at DC first and recovers the signal — shown
+    # here by the 0xAA preamble surviving intact only WITH the filter.
+    from gfsk_ax25.gfsk import GfskParams, demodulate_capture
+
+    fs, baud = 96_000.0, 9600.0
+    pre = modulate(np.tile([1, 0], 400).astype(np.uint8),  # 800-bit 0xAA preamble at DC
+                   GfskParams(sample_rate_hz=fs, symbol_rate_hz=baud))
+    n = np.arange(len(pre))
+    rx = (pre + 10.0 * np.exp(2j * np.pi * 25_000.0 * n / fs)).astype(np.complex64)  # 10x @ +25 kHz
+    no_filter = demodulate_capture(rx, fs, symbol_rate_hz=baud, recover_timing=False)
+    filtered = demodulate_capture(rx, fs, symbol_rate_hz=baud, channel_bw_hz=16_000.0,
+                                  recover_timing=False)
+    from iq_analyze import _longest_alt_run
+
+    assert _longest_alt_run(no_filter) < 20  # interferer shreds the preamble (noise-level run)
+    assert _longest_alt_run(filtered) > 500  # channel filter recovers the long clean preamble

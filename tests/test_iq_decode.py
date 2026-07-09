@@ -68,27 +68,30 @@ def test_derotate_doppler_no_track_is_identity():
 
 
 def test_decode_capture_ccsds_roundtrip_through_doppler(tmp_path):
-    # A CCSDS TM frame shifted +35 kHz — LARGE enough that per-window CFO alone can't pull it back,
-    # so the gs-orbitd track is REQUIRED. This makes the test non-vacuous: without the track (or if
-    # the de-rotation were reverted) it decodes 0 frames; only the matching track recovers it.
+    # A CCSDS TM frame under a DRIFTING Doppler (a +28 kHz → −28 kHz linear sweep across the
+    # capture) — this is what the gs-orbitd track is FOR. A single per-window CFO estimate cannot
+    # follow a carrier that sweeps 56 kHz mid-window (the discriminator sees a moving tone → no
+    # frame), so only the matching track de-rotates the sweep back to DC and decodes it. Makes the
+    # test non-vacuous: no track → 0 frames; matching track → the frame.
     data = bytes(range(100))
-    bits = ccsds.build_tm_frame(_H, data)  # defaults match framings.deframe("ccsds_tm")
-    rx = _apply_offset(_guard(_modulate_bits(bits)), 35_000.0)
+    base = _guard(_modulate_bits(ccsds.build_tm_frame(_H, data)))
+    n = np.arange(len(base))
+    f_of_n = 28_000.0 - 56_000.0 * (n / len(base))  # linear Doppler chirp, Hz
+    rx = (base * np.exp(1j * 2 * np.pi * np.cumsum(f_of_n) / _FS)).astype(np.complex64)
     cap = _write_cf32(tmp_path, rx)
     dur = len(rx) / _FS
 
-    # No track → per-window CFO can't recover +35 kHz on a bursty capture → nothing decodes.
+    # No track → a single per-window CFO can't track the 56 kHz sweep → nothing decodes.
     assert iq_decode.decode_capture(
         cap, sample_rate_hz=_FS, symbol_rate_hz=_SYM,
         framings_to_try=("ccsds_tm",), doppler_track=None,
     ) == []
 
+    # Matching track sampled along the chirp → de-rotates it → decodes.
+    track = [(i * dur / 40.0, 28_000.0 - 56_000.0 * (i / 40.0)) for i in range(41)]
     recs = iq_decode.decode_capture(
-        cap,
-        sample_rate_hz=_FS,
-        symbol_rate_hz=_SYM,
-        framings_to_try=("ccsds_tm",),
-        doppler_track=[(0.0, 35_000.0), (dur, 35_000.0)],
+        cap, sample_rate_hz=_FS, symbol_rate_hz=_SYM,
+        framings_to_try=("ccsds_tm",), doppler_track=track,
     )
     assert len(recs) == 1
     assert recs[0]["framing"] == "ccsds_tm"

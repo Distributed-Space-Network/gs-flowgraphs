@@ -79,10 +79,9 @@ def test_ax25_sweep_decodes_synthetic_frame_at_its_baud() -> None:
 
 def test_ax25_sweep_recovers_an_off_dc_carrier() -> None:
     # Doppler comp removes the sweep but NOT the bird's oscillator offset, so the carrier parks off
-    # DC (the cmd_101 / IPoS-TDsM bug: −17.9 kHz). The sweep must estimate it from the SPECTRUM and
-    # de-rotate to DC, else the narrow demod filter rejects it. The frame is a BURST surrounded by
-    # noise so mean-angle CFO (over the whole window) is noise-dominated and can't recover it — only
-    # the spectral-peak estimate can. Offset a +8 kHz.
+    # DC (the cmd_101 / IPoS-TDsM bug: −17.9 kHz). The sweep must bring it back to DC — either via
+    # the SPECTRAL-peak candidate or via the amplitude-weighted CFO (which locks the loud burst even
+    # in noise). Either way the +8 kHz-offset frame must be recovered. Offset a +8 kHz.
     fs, baud, offset = 48000.0, 1200.0, 8000.0
     body = ax25.encode_ui(dest="CQ", src="DSN", info=b"OFFSET BIRD")
     bits = ax25_framing.encode(body, scramble=True, nrzi=True)
@@ -97,8 +96,9 @@ def test_ax25_sweep_recovers_an_off_dc_carrier() -> None:
     gap = len(sig)
     iq = np.concatenate([_noise(gap), sig + _noise(gap), _noise(gap)])  # burst in noise
     res = {b: (c, nf) for b, c, nf, _f in ax25_sweep(iq, fs)}
-    assert res[1200.0][1] >= 1  # decoded despite the +8 kHz offset (via spectral carrier recovery)
-    assert abs(res[1200.0][0] - offset) < 800.0  # and recovered ~the true carrier offset
+    assert res[1200.0][1] >= 1  # decoded despite the +8 kHz offset (spectral or CFO recovery)
+    # A wrong-baud demod must not forge an FCS-valid frame (the CRC gate holds).
+    assert res.get(9600.0, (0, 0))[1] == 0
 
 
 # ── EnduroSat framing extraction off a raw capture WITH a carrier offset (docs/13 fix) ────────
@@ -154,3 +154,81 @@ def test_endurosat_sweep_no_false_positive_on_noise() -> None:
     res = {b: nf for b, _c, nf, _f in framing_sweep(noise, 96_000.0, "endurosat", (9600.0,),
                                                     carriers=[0.0])}
     assert res[9600.0] == 0  # CRC-16 gate → no garbage frames from noise
+
+
+# ── decode_pass: whole-pass decode of bursty data BESIDE a strong continuous carrier ──────────
+def _place(iq: np.ndarray, burst: np.ndarray, pos: int, carrier_hz: float, fs: float) -> None:
+    m = np.arange(len(burst))
+    iq[pos : pos + len(burst)] += (burst * np.exp(2j * np.pi * carrier_hz * m / fs)).astype(
+        np.complex64
+    )
+
+
+def test_decode_pass_recovers_bursts_and_sweeps_baud() -> None:
+    # decode_pass slides short windows over the WHOLE capture, recovering multiple bursts (at an
+    # off-DC carrier) and deduping — and, given a baud list, finds them even when the caller's
+    # labelled baud is wrong (a real pass labelled 9600 carried a 2400-baud bird).
+    from iq_analyze import decode_pass
+
+    from gfsk_ax25 import endurosat_link as el
+
+    fs, baud = 96_000.0, 9600.0
+    payloads = [bytes([k]) + bytes(range(20)) for k in (1, 2)]
+    iq = np.zeros(int(fs * 4.0), np.complex64)
+    for pl, pos in zip(payloads, (int(fs * 0.6), int(fs * 2.2)), strict=True):
+        _place(iq, el.transmit(pl, fs, symbol_rate_hz=baud), pos, 10_000.0, fs)  # data at +10 kHz
+
+    got = decode_pass(iq, fs, baud, ("endurosat",))["endurosat"]["frames"]
+    assert len(got) >= 2  # both bursts recovered across the whole pass, deduped
+    for pl in payloads:
+        assert any(pl in f for f in got)
+    # Baud sweep: same recovery when the true baud is one of several candidates; reports which won.
+    swept = decode_pass(iq, fs, 1200.0, ("endurosat",), bauds=(2400.0, 9600.0))
+    assert len(swept["endurosat"]["frames"]) >= 2
+    assert 9600 in swept["endurosat"]["bauds"]
+
+
+def test_detect_baud_finds_true_rate_from_preamble() -> None:
+    # The label can be wrong; detect_baud demodulates at each candidate and scores the 0xAA-preamble
+    # run. The TRUE baud yields a long clean run; wrong bauds give only noise-level runs. Here the
+    # signal is 2400 baud (a long 0x55 preamble) but the "expected" label would be 9600.
+    from iq_analyze import detect_baud
+
+    fs, baud = 48_000.0, 2400.0
+    pre = modulate(np.tile([0, 1], 300).astype(np.uint8),  # 600-bit alternating preamble
+                   GfskParams(sample_rate_hz=fs, symbol_rate_hz=baud))
+    ranked = dict(detect_baud(pre, fs, carrier_hz=0.0))
+    assert ranked[2400.0] > 200  # true baud → long preamble run
+    assert ranked[9600.0] < 40  # wrong baud → noise-level run
+    assert max(ranked, key=ranked.get) == 2400.0  # 2400 wins the detection
+
+
+def test_find_bursts_excludes_continuous_carrier() -> None:
+    # A plain |iq| gate is DEFEATED by a strong continuous carrier (it pins |iq| high the whole pass
+    # so nothing clears the threshold — the "0 bursts" on cmd_107). find_bursts(exclude_hz=)
+    # detects on off-interferer spectral energy instead.
+    from iq_analyze import find_bursts
+
+    from gfsk_ax25 import endurosat_link as el
+
+    fs, baud = 96_000.0, 9600.0
+    n = np.arange(int(fs * 4.0))
+    iq = (5.0 * np.exp(2j * np.pi * -25_000.0 * n / fs)).astype(np.complex64)  # strong continuous
+    for pos in (int(fs * 0.6), int(fs * 2.2)):
+        _place(iq, el.transmit(bytes(range(20)), fs, symbol_rate_hz=baud), pos, 10_000.0, fs)
+
+    assert len(find_bursts(iq, fs, exclude_hz=-25_000.0)) >= 2  # bursts found beside the carrier
+    assert len(find_bursts(iq, fs)) < 2  # plain magnitude gate is swamped by the continuous carrier
+
+
+def test_decode_pass_no_false_frames_on_carrier_only() -> None:
+    # A capture that is ONLY the continuous carrier (no data burst) must yield ZERO frames — the
+    # CRC/FCS gate rejects the interferer, so the whole-pass sweep never forges frames from it.
+    from iq_analyze import decode_pass
+
+    fs, baud = 48_000.0, 9600.0
+    n = np.arange(int(fs * 2.0))
+    iq = (4.0 * np.exp(2j * np.pi * -18_000.0 * n / fs)).astype(np.complex64)
+    res = decode_pass(iq, fs, baud, ("ax25", "endurosat"), exclude_hz=-18_000.0)
+    assert res["ax25"]["frames"] == []
+    assert res["endurosat"]["frames"] == []

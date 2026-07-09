@@ -205,11 +205,18 @@ def _max_eye_symbols(mf: np.ndarray, sps: float) -> np.ndarray:
 
 def estimate_cfo_rad(iq: np.ndarray) -> float:
     """Coarse carrier-frequency offset (rad/sample): the mean instantaneous
-    frequency of a balanced 2-FSK burst is ~the carrier offset."""
+    frequency of a balanced 2-FSK burst is ~the carrier offset.
+
+    AMPLITUDE-WEIGHTED — ``angle(mean(product))``, not ``mean(angle(product))``. A balanced 2-FSK
+    burst still averages to the carrier either way, but the mean-of-angles form weights EVERY sample
+    equally, so low-amplitude regions (inter-burst guards, the quiet gaps between packets, the small
+    residual of a channel-filtered-out interferer) pull the estimate onto whatever tiny tone lives
+    in the gaps — measured as a bogus +18 kHz CFO on a channel-filtered burst whose true offset was
+    ~0. Taking the angle of the amplitude-weighted mean product lets the (loud) burst dominate."""
     iq = np.asarray(iq, dtype=np.complex64)
     if len(iq) < 2:
         return 0.0
-    return float(np.mean(np.angle(iq[1:] * np.conj(iq[:-1]))))
+    return float(np.angle(np.mean(iq[1:] * np.conj(iq[:-1]))))
 
 
 def derotate(iq: np.ndarray, cfo_rad: float) -> np.ndarray:
@@ -228,20 +235,31 @@ def demodulate_capture(
     correct_cfo: bool = True,
     recover_timing: bool = False,
     carrier_hz: float = 0.0,
+    channel_bw_hz: float = 0.0,
 ) -> np.ndarray:
     """Robust burst demod for real SDR/VSA captures -> hard bits.
 
     Tuned on EnduroSat lab captures (measured 20/21 vs 12/21 for the plain
     ``demodulate``, and 21/21 with the small ensemble in
     :func:`endurosat_link.receive`): (1) derotate the coarse carrier offset,
-    (2) polyphase resample to an integer ``target_sps`` (real captures land on
-    non-integer samples/symbol, e.g. 128 kHz / 9600 = 13.33), (3) sample at the
+    (2) optionally CHANNEL-SELECT filter to reject an off-channel interferer,
+    (3) polyphase resample to an integer ``target_sps`` (real captures land on
+    non-integer samples/symbol, e.g. 128 kHz / 9600 = 13.33), (4) sample at the
     maximum-eye phase (``recover_timing=False``) — best for short packets, which
     have no intra-burst clock drift. Pass one burst at a time (with a guard).
+
+    ``channel_bw_hz`` (0 = off, the default → identical to the historical behaviour): after the
+    ``carrier_hz`` de-rotation puts the wanted signal at DC, low-pass to ``±channel_bw_hz/2`` so a
+    STRONG OFF-CHANNEL CARRIER (e.g. a co-visible satellite tens of kHz away) is removed BEFORE the
+    two blocks it would otherwise wreck — the ``correct_cfo`` mean-angle estimate (a loud tone
+    dominates the mean instantaneous frequency and drags the derotation onto the interferer) and the
+    wideband FM discriminator in :func:`demodulate` (which has no channel filter of its own, so any
+    in-band interferer beats against the wanted signal in every symbol). This is what lets a bursty
+    GFSK downlink decode next to a continuous carrier; without it the interferer captures the demod.
     """
     from math import gcd
 
-    from scipy.signal import resample_poly
+    from scipy.signal import firwin, resample_poly
 
     iq = np.asarray(iq, dtype=np.complex64)
     if len(iq) < 2:
@@ -256,6 +274,15 @@ def demodulate_capture(
         iq = (iq * np.exp((-2j * np.pi * float(carrier_hz) / float(sample_rate_hz)) * n)).astype(
             np.complex64
         )
+    if channel_bw_hz and channel_bw_hz > 0.0 and len(iq) > 8:
+        # One-sided channel select at baseband (the wanted signal is now at DC): a linear-phase FIR
+        # low-pass at half the channel bandwidth. Applied here — after de-rotation, before CFO and
+        # the discriminator — so an off-channel carrier is gone before it can capture either. Odd
+        # tap count scaled to the sample rate for a sharp-enough transition; clamped to the input.
+        cutoff = min(float(channel_bw_hz) / 2.0, float(sample_rate_hz) / 2.0 * 0.98)
+        ntaps = min(len(iq) - 1 | 1, max(31, int(4.0 * sample_rate_hz / channel_bw_hz) | 1))
+        taps = firwin(ntaps, cutoff, fs=sample_rate_hz).astype(np.float64)
+        iq = np.convolve(iq, taps, mode="same").astype(np.complex64)
     if correct_cfo:
         iq = derotate(iq, estimate_cfo_rad(iq))
     target_fs = symbol_rate_hz * target_sps
