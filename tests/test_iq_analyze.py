@@ -188,6 +188,22 @@ def test_decode_pass_recovers_bursts_and_sweeps_baud() -> None:
     assert 9600 in swept["endurosat"]["bauds"]
 
 
+def test_strongest_burst_window_short_capture_no_crash() -> None:
+    # Regression: a capture shorter than the 0.5 s baud-detect probe that contains a carrier used to
+    # broadcast-crash (fixed-size hanning window vs a shorter seg), aborting the whole analyze run.
+    from iq_analyze import SWEEP_BAUDS, _strongest_burst_window, detect_baud
+
+    fs = 48_000.0
+    n = np.arange(2000)  # ~42 ms @ 48 kHz, well under the 0.5 s probe
+    iq = (5.0 * np.exp(2j * np.pi * 5000.0 * n / fs)).astype(np.complex64)
+    got = _strongest_burst_window(iq, fs, None)
+    assert got is not None  # returns a window instead of raising
+    wseg, wcar = got
+    assert abs(wcar - 5000.0) < 200.0
+    assert len(detect_baud(wseg, fs)) == len(SWEEP_BAUDS)  # baud detect runs on the short window
+    assert _strongest_burst_window(np.zeros(32, np.complex64), fs, None) is None  # tiny -> None
+
+
 def test_detect_baud_finds_true_rate_from_preamble() -> None:
     # The label can be wrong; detect_baud demodulates at each candidate and scores the 0xAA-preamble
     # run. The TRUE baud yields a long clean run; wrong bauds give only noise-level runs. Here the

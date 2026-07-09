@@ -146,6 +146,8 @@ def find_bursts(
     median rises above the bursty data and NOTHING clears the threshold (the observed "0 bursts" on
     cmd_107). Instead detect on the OFF-INTERFERER spectral energy: an STFT with the interferer band
     zeroed, so only the bursty data drives detection — the burst view usable beside a carrier."""
+    if len(iq) == 0:
+        return []
     if exclude_hz is None:
         mag = np.abs(iq)
         thr = max(np.median(mag) * threshold_mult, mag.max() * 0.08)
@@ -251,11 +253,15 @@ def _strongest_burst_window(
     window that merely centres on the strong point clips the preamble and mis-detects the baud.
     ``None`` if nothing stands out."""
     n = int(len(iq))
-    probe = max(1, int(fs * probe_s))
+    if n < 64:  # too short for _peak_excluding to find anything → skip baud detection
+        return None
+    # Clamp the probe to the capture length so hwin/freqs always match seg (a fixed 0.5 s probe on a
+    # sub-0.5 s capture would broadcast-crash on `seg * hwin`). range keeps every seg full-probe.
+    probe = min(max(1, int(fs * probe_s)), n)
     freqs = np.fft.fftshift(np.fft.fftfreq(probe, d=1.0 / fs))
     hwin = np.hanning(probe)
     best: tuple[float, int, float] | None = None  # (amp, offset, carrier)
-    for off in range(0, max(1, n - probe), probe):
+    for off in range(0, n - probe + 1, probe):
         seg = np.asarray(iq[off : off + probe])
         pk = _peak_excluding(seg, fs, exclude_hz)
         if pk is None:
@@ -334,6 +340,10 @@ def decode_pass(
                         out[name]["frames"].append(f)
                         out[name]["carriers"].add(int(carrier))
                         out[name]["bauds"].add(int(baud))
+    # Return sorted lists (not sets) for carriers/bauds so the result is JSON-serializable + stable.
+    for name in out:
+        out[name]["carriers"] = sorted(out[name]["carriers"])
+        out[name]["bauds"] = sorted(out[name]["bauds"])
     return out
 
 
@@ -448,7 +458,7 @@ def frame_bytes(bits: np.ndarray, *, order: str = "big") -> bytes:
 
 def analyze_file(
     path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0,
-    *, run_ax25: bool = False, run_endurosat: bool = False, sweep_window_s: float = 40.0,
+    *, run_ax25: bool = False, run_endurosat: bool = False, sweep_window_s: float = 0.0,
     carrier_hz: float | None = None, want_waterfall: bool = False, channel_bw_hz: float = 0.0,
     interferer_hz: float | None = None, no_interferer_exclude: bool = False,
     decode_window_s: float = 1.0, max_burst_list: int = 40, sweep_baud: bool = True,
@@ -493,13 +503,24 @@ def analyze_file(
     selected = [f for f, on in (("ax25", run_ax25), ("endurosat", run_endurosat)) if on]
     if not selected:  # no framing flag → decode BOTH light framings (what a labelled pass carries)
         selected = ["ax25", "endurosat"]
+    # Optional span cap: --sweep-window-s > 0 restricts the (potentially minutes-long) whole-pass
+    # decode to a centred window around mid-pass, trading coverage for speed; 0 (default) = whole
+    # pass, since real bursts occur throughout the pass, not just at TCA.
+    decode_iq, decode_off = cap.iq, 0
+    if sweep_window_s and sweep_window_s > 0 and len(cap.iq) > int(cap.fs * sweep_window_s):
+        half = max(1, int(cap.fs * sweep_window_s / 2))  # never a degenerate/empty window
+        decode_off = max(0, len(cap.iq) // 2 - half)
+        decode_iq = cap.iq[decode_off : decode_off + 2 * half]
+        print(f"  decode span capped to {sweep_window_s:g}s around mid-pass "
+              f"(t={decode_off/cap.fs:.0f}..{(decode_off + len(decode_iq))/cap.fs:.0f}s of "
+              f"{dur:.0f}s; --sweep-window-s 0 = whole pass)")
     # BAUD DETECTION: the labelled/declared baud can be WRONG (a pass labelled 9600 actually carried
     # a 2400-baud bird). Find the strongest off-interferer burst and report the 0xAA-preamble run
     # per candidate baud — a run >> the ~10-bit noise level flags the true rate even when the
     # framing that follows is encrypted/whitened and won't validate. Label-independent ground truth.
     sweep_bauds: tuple[float, ...] | None = None
     if sweep_baud:
-        strong = _strongest_burst_window(cap.iq, cap.fs, interferer)
+        strong = _strongest_burst_window(decode_iq, cap.fs, interferer)
         if strong is not None:
             wseg, wcar = strong
             ranked = sorted(detect_baud(wseg, cap.fs, carrier_hz=wcar), key=lambda r: -r[1])
@@ -512,7 +533,9 @@ def analyze_file(
             if top_run >= 32 and abs(top_baud - symbol_rate) > 1:
                 print(f"  NOTE: detected baud {int(top_baud)} != labelled {int(symbol_rate)} - "
                       "decoding will sweep both.")
-            sweep_bauds = tuple(sorted({symbol_rate, *[b for b, r in ranked if r >= 24]}))
+            # sweep the label + the top-2 detected candidates (>=24-bit run) — capped so a harmonic
+            # that also scores doesn't multiply the whole-pass demod cost by 4-5x.
+            sweep_bauds = tuple(sorted({symbol_rate, *[b for b, r in ranked[:2] if r >= 24]}))
     # PRIMARY decode: whole-pass, short-window, channel-filtered, interferer-excluding. Recovers the
     # bursty downlink frames across the ENTIRE pass (the single-window sweep only saw one carrier /
     # one slice). --carrier-hz forces the data carrier; else it is estimated per window. Sweeps the
@@ -520,25 +543,27 @@ def analyze_file(
     forced = None if carrier_hz is None else [float(carrier_hz)]
     ch = channel_bw_hz if channel_bw_hz > 0 else 2.0 * symbol_rate
     bshow = ("/".join(str(int(b)) for b in sweep_bauds) if sweep_bauds else int(symbol_rate))
-    print(f"whole-pass decode ({bshow} Bd, channel~{ch/1e3:.1f} kHz, "
-          f"{decode_window_s:g}s windows, CRC-gated; framings={','.join(selected)}):")
+    n_baud = len(sweep_bauds) if sweep_bauds else 1
+    n_win = max(1, int((len(decode_iq) / cap.fs) / max(decode_window_s * 0.5, 1e-9)))
+    print(f"whole-pass decode ({bshow} Bd, channel~{ch/1e3:.1f} kHz, {decode_window_s:g}s windows, "
+          f"CRC-gated; framings={','.join(selected)}; ~{n_win * n_baud} demods):")
     res = decode_pass(
-        cap.iq, cap.fs, symbol_rate, tuple(selected), exclude_hz=interferer,
+        decode_iq, cap.fs, symbol_rate, tuple(selected), exclude_hz=interferer,
         channel_bw_hz=channel_bw_hz, window_s=decode_window_s, carriers=forced, bauds=sweep_bauds,
     )
     for name in selected:
         frames = res[name]["frames"]
-        carriers = sorted(res[name]["carriers"])
         head = frames[0][:16].hex() if frames else "-"
-        cshow = f" carriers~{[f'{c:+d}' for c in carriers[:6]]}" if carriers else ""
-        print(f"  {name}: {len(frames)} frame(s){cshow}  first={head}")
+        cshow = f" carriers~{[f'{c:+d}' for c in res[name]['carriers'][:6]]}" if frames else ""
+        bshow2 = f" bauds={res[name]['bauds']}" if frames else ""
+        print(f"  {name}: {len(frames)} frame(s){cshow}{bshow2}  first={head}")
     # Raw burst view (diagnostic): interferer-aware detection + per-burst carrier + channel filter.
-    bursts = find_bursts(cap.iq, cap.fs, exclude_hz=interferer)
+    bursts = find_bursts(decode_iq, cap.fs, exclude_hz=interferer)
     guard = int(cap.fs * 0.003)
     shown = min(len(bursts), max_burst_list)
     print(f"{len(bursts)} bursts (showing {shown}; per-burst carrier, channel-filtered):")
     for k, (s, e) in enumerate(bursts[:max_burst_list]):
-        seg = cap.iq[max(0, s - guard) : e + guard]
+        seg = decode_iq[max(0, s - guard) : e + guard]
         # Per-burst DATA carrier: the burst's own strongest line (excluding the interferer), so each
         # burst is de-rotated to its Doppler-current frequency — not a single whole-pass carrier.
         bc = carrier_hz if carrier_hz is not None else _peak_excluding(seg, cap.fs, interferer)
@@ -547,8 +572,8 @@ def analyze_file(
         idx = find_sync(bits)
         fb = frame_bytes(bits[idx:]) if idx is not None else b""
         synced = f"sync@bit{idx}" if idx is not None else "NO-SYNC"
-        print(
-            f"  burst {k}: t={s/cap.fs:7.3f}s dur={(e-s)/cap.fs*1000:6.1f}ms "
+        print(  # burst t is absolute in the pass (decode_off accounts for any --sweep-window-s cap)
+            f"  burst {k}: t={(decode_off + s)/cap.fs:7.3f}s dur={(e-s)/cap.fs*1000:6.1f}ms "
             f"carrier={float(bc or 0):+7.0f}Hz {synced:>10}  frame={fb[:24].hex() if fb else '-'}"
         )
 
@@ -564,8 +589,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="decode ONLY AX.25 (FCS-checked); no framing flag = both ax25+endurosat")
     p.add_argument("--endurosat", action="store_true",
                    help="decode ONLY EnduroSat chip-packet framing (CRC-16)")
-    p.add_argument("--sweep-window-s", type=float, default=40.0,
-                   help="(legacy) unused by the whole-pass decoder; kept for compatibility")
+    p.add_argument("--sweep-window-s", type=float, default=0.0,
+                   help="0=decode whole pass (default); >0 caps decode to N s around mid-pass")
     p.add_argument("--carrier-hz", type=float, default=None,
                    help="force this exact data-carrier offset (Hz) instead of per-window estimate")
     p.add_argument("--channel-bw", type=float, default=0.0,
