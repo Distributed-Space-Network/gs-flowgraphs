@@ -37,6 +37,7 @@ from _soapy import (
     make_sink,
     make_source,
     merge_sdr_params,
+    merge_sdr_params_tx,
     open_analog_bandwidth,
     sdr_env,
     tune_below,
@@ -378,7 +379,8 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
     sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, sample_rate)
     sink.set_frequency(0, float(args.center_freq_hz))  # TX: no LO offset (mod at baseband 0)
-    configure_soapy_source(sink, merge_sdr_params(params))  # TX antenna + gain (PA drive)
+    # R-22: TX-explicit settings only (sdr_tx_* / GS_SDR_TX_*) — RX names raise here.
+    configure_soapy_source(sink, merge_sdr_params_tx(params))
     # Analog TX filter ≈ the SDR sample rate, NOT the narrow channel width — the latter is
     # below the device filter floor (~0.8 MHz on the XTRX) and would break the path (same
     # treatment as the FM TX app). TX levels are BENCH-PENDING.

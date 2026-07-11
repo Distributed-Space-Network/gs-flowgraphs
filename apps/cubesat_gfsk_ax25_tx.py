@@ -32,7 +32,7 @@ from _fallback_select import symbol_rate_hz_of
 from _soapy import (
     apply_corrections,
     configure_soapy_source,
-    merge_sdr_params,
+    merge_sdr_params_tx,
     readback_soapy_settings,
     sdr_env,
     sdr_ready_fields,
@@ -110,19 +110,25 @@ def _sink_iq(
     iq: np.ndarray,
     params: dict[str, object] | None = None,
     on_first_accept=None,
+    should_abort=None,
 ):
     """Sink the burst; returns a ``_soapy_tx.BurstResult`` describing what was
-    ACTUALLY accepted (R-16 — completion events must not fabricate success)."""
+    ACTUALLY accepted (R-16 — completion events must not fabricate success).
+    ``should_abort`` is polled between chunks so a pass stop cancels an
+    in-flight burst instead of radiating it to completion."""
     from _soapy_tx import BurstResult
 
     sdr_args = str(args.sdr_args or "")
     if sdr_args.startswith("file:"):
         data = iq.astype(np.complex64)
+        if should_abort is not None and should_abort():
+            return BurstResult(accepted=0, total=len(data), outcome="cancelled",
+                               detail="aborted by caller")
         Path(sdr_args[len("file:") :]).write_bytes(data.tobytes())
         if on_first_accept is not None:
             on_first_accept()
         return BurstResult(accepted=len(data), total=len(data), outcome="complete")
-    return _soapy_sink(args, iq, params, on_first_accept)  # pragma: no cover (needs SoapySDR)
+    return _soapy_sink(args, iq, params, on_first_accept, should_abort)  # pragma: no cover
 
 
 class _SoapyDeviceAdapter:
@@ -151,11 +157,17 @@ class _SoapyDeviceAdapter:
 
 
 def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
-    """Apply antenna + gain (per-pass ``params`` merged over station ``GS_SDR_*`` env —
-    per-pass wins) + ppm correction to a raw SoapySDR TX device, mirroring the sink treatment
-    the FM TX app / ``gnuradio_gfsk.transmit_gnuradio`` give their gr-soapy sinks. Without
-    this the default engine transmitted with NO gain/antenna configured (deaf-in-reverse:
-    radiates nothing). Returns the applied-settings dict for logging.
+    """Apply TX-direction settings + ppm correction to a raw SoapySDR TX device,
+    mirroring the sink treatment the FM TX app / ``gnuradio_gfsk.transmit_gnuradio``
+    give their gr-soapy sinks. Without this the default engine transmitted with NO
+    gain configured (deaf-in-reverse: radiates nothing). Returns the applied dict.
+
+    R-22: settings come from :func:`merge_sdr_params_tx` — per-pass ``sdr_tx_*``
+    over station ``GS_SDR_TX_*`` ONLY. RX-oriented names (``GS_SDR_ANTENNA``
+    ``LNAW``, ``GS_SDR_GAINS`` ``LNA/TIA/PGA``) never reach the TX endpoint;
+    on LMS7/XTRX they'd raise in ``setAntenna``/``setGain`` and kill the pass.
+    With nothing TX-specific configured the sane manual default gain still
+    applies (the deaf-TX trap), TX-direction-addressed.
 
     Also sets the ANALOG TX filter to the SAMPLE rate, never the narrow channel width —
     below the device filter floor (~0.8 MHz on the XTRX) the analog path goes silent
@@ -164,8 +176,8 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
     NOTE: TX gain LEVELS are BENCH-PENDING — validate actual PA drive on the bench before a
     real uplink; this only ensures the front-end is configured at all."""
     endpoint = _SoapyDeviceAdapter(dev, direction)
-    applied = configure_soapy_source(endpoint, merge_sdr_params(params))
-    apply_corrections(endpoint, ppm=sdr_env()["ppm"], dc_removal=False)
+    applied = configure_soapy_source(endpoint, merge_sdr_params_tx(params))
+    applied.update(apply_corrections(endpoint, ppm=sdr_env()["ppm"], dc_removal=False))
     with contextlib.suppress(Exception):  # bandwidth setting is optional per driver
         dev.setBandwidth(direction, 0, float(sample_rate))
     return applied
@@ -215,7 +227,7 @@ def _tx_spawn_probe(args, params) -> tuple[bool, dict[str, object]]:
         return False, {"code": "tx-device-probe-failed", "detail": repr(e)}
     fields = sdr_ready_fields(
         device=sdr_args,
-        requested=merge_sdr_params(params),
+        requested=merge_sdr_params_tx(params),
         applied=report.get("applied"),  # type: ignore[arg-type]
         actual=report.get("actual"),  # type: ignore[arg-type]
         stream_active=False,  # TX opens its stream per burst; ready proves the DEVICE
@@ -225,7 +237,9 @@ def _tx_spawn_probe(args, params) -> tuple[bool, dict[str, object]]:
     return True, fields
 
 
-def _soapy_sink(args, iq: np.ndarray, params=None, on_first_accept=None):  # pragma: no cover
+def _soapy_sink(  # pragma: no cover
+    args, iq: np.ndarray, params=None, on_first_accept=None, should_abort=None
+):
     """P0-07: uses the shared bounded TX transport (apps/_soapy_tx.py) — MTU
     chunking, bounded zero/timeout/error handling, END_BURST on the final data
     chunk, per-burst deadline — instead of the fixed-4096 ret>0-only loop that
@@ -255,6 +269,7 @@ def _soapy_sink(args, iq: np.ndarray, params=None, on_first_accept=None):  # pra
             mtu=query_tx_mtu(dev, stream),
             deadline_s=deadline_s,
             on_first_accept=on_first_accept,
+            should_abort=should_abort,
         )
         if not result.complete:
             log.warning(
@@ -326,7 +341,9 @@ async def amain(args) -> int:
 
         iq = _build_frame_iq(args, params, profile)
         result = await asyncio.to_thread(
-            _sink_iq, args, iq, params, on_first_accept=_first_accept
+            _sink_iq, args, iq, params,
+            on_first_accept=_first_accept,
+            should_abort=stop_requested.is_set,  # a pass stop cancels the burst
         )
         await send_event(
             sockets.status_writer,

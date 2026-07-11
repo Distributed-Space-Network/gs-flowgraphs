@@ -151,7 +151,8 @@ _TX = 1  # SoapySDR.SOAPY_SDR_TX
 
 def _clear_sdr_env(monkeypatch) -> None:
     for name in ("GS_SDR_ANTENNA", "GS_SDR_GAIN_DB", "GS_SDR_GAINS", "GS_SDR_AGC",
-                 "GS_SDR_LO_OFFSET", "GS_SDR_PPM", "GS_SDR_DC_REMOVAL", "GS_SDR_CAPTURE_RATE"):
+                 "GS_SDR_LO_OFFSET", "GS_SDR_PPM", "GS_SDR_DC_REMOVAL", "GS_SDR_CAPTURE_RATE",
+                 "GS_SDR_TX_ANTENNA", "GS_SDR_TX_GAIN_DB", "GS_SDR_TX_GAINS"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -173,25 +174,45 @@ def test_tx_sink_analog_bandwidth_is_sample_rate_not_channel(monkeypatch):
     assert ("setBandwidth", _TX, 0, 2_048_000.0) in dev.calls
 
 
-def test_tx_sink_merges_env_and_per_pass_params(monkeypatch):
+def test_tx_sink_merges_tx_env_and_per_pass_tx_params(monkeypatch):
+    # R-22: TX settings come from TX-explicit sources ONLY — per-pass sdr_tx_*
+    # wins over GS_SDR_TX_* env; ppm (direction-neutral) still applies TX-side.
     _clear_sdr_env(monkeypatch)
-    monkeypatch.setenv("GS_SDR_ANTENNA", "TX/RX")
-    monkeypatch.setenv("GS_SDR_GAIN_DB", "20")
+    monkeypatch.setenv("GS_SDR_TX_ANTENNA", "BAND1")
+    monkeypatch.setenv("GS_SDR_TX_GAIN_DB", "20")
     monkeypatch.setenv("GS_SDR_PPM", "-1.5")
     dev = _FakeSoapyDevice()
-    # per-pass gain wins over env; antenna comes from env; ppm applied TX-side.
-    applied = txapp.configure_tx_sink(dev, _TX, {"sdr_gain_db": 12.0}, 96_000.0)
-    assert ("setAntenna", _TX, 0, "TX/RX") in dev.calls
+    applied = txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gain_db": 12.0}, 96_000.0)
+    assert ("setAntenna", _TX, 0, "BAND1") in dev.calls
     assert ("setGain", _TX, 0, 12.0) in dev.calls
     assert ("setGain", _TX, 0, 20.0) not in dev.calls
     assert ("setFrequencyCorrection", _TX, 0, -1.5) in dev.calls
     assert applied["gain_db"] == 12.0 and "gain_default" not in applied
 
 
+def test_tx_sink_never_receives_rx_oriented_names(monkeypatch):
+    # THE R-22 repro: station RX env (LNAW antenna, LNA/TIA/PGA staging) and
+    # generic per-pass RX keys must NOT reach a TX endpoint — on LMS7/XTRX
+    # setAntenna(TX, LNAW)/setGain(TX, "LNA", ..) raise and kill the pass.
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_ANTENNA", "LNAW")
+    monkeypatch.setenv("GS_SDR_GAINS", "LNA=30,TIA=9,PGA=3")
+    monkeypatch.setenv("GS_SDR_GAIN_DB", "45")
+    dev = _FakeSoapyDevice()
+    applied = txapp.configure_tx_sink(
+        dev, _TX, {"sdr_antenna": "LNAL", "sdr_gains": {"LNA": 10}, "sdr_gain_db": 45.0},
+        96_000.0,
+    )
+    assert not any(c[0] == "setAntenna" for c in dev.calls)
+    assert not any(c[0] == "setGain" and isinstance(c[3], str) for c in dev.calls)
+    # ... and the deaf-TX default still applies instead (never 0 dB).
+    assert applied["gain_db"] == 30.0 and applied.get("gain_default") is True
+
+
 def test_tx_sink_per_element_gains(monkeypatch):
     _clear_sdr_env(monkeypatch)
     dev = _FakeSoapyDevice()
-    txapp.configure_tx_sink(dev, _TX, {"sdr_gains": {"PAD": 40, "IAMP": 6}}, 96_000.0)
+    txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": 40, "IAMP": 6}}, 96_000.0)
     assert ("setGain", _TX, 0, "PAD", 40.0) in dev.calls
     assert ("setGain", _TX, 0, "IAMP", 6.0) in dev.calls
 

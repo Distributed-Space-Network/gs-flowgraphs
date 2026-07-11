@@ -45,7 +45,13 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
-from _soapy import apply_corrections, configure_soapy_source, make_sink, merge_sdr_params, sdr_env
+from _soapy import (
+    apply_corrections,
+    configure_soapy_source,
+    make_sink,
+    merge_sdr_params_tx,
+    sdr_env,
+)
 from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
@@ -136,8 +142,10 @@ def build_top_block(
     sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     sink.set_sample_rate(0, float(args.sample_rate))
     sink.set_frequency(0, float(args.center_freq_hz))  # TX: no LO offset (modulator at baseband 0)
-    # antenna + PA gain. Precedence: sdr_gain_db param > GS_SDR_GAIN_DB env > 30 dB.
-    configure_soapy_source(sink, merge_sdr_params(p))
+    # TX antenna + PA gain — TX-explicit sources ONLY (R-22): sdr_tx_* params >
+    # GS_SDR_TX_* env > 30 dB default. RX names (LNAW / LNA,TIA,PGA) would raise
+    # on a TX endpoint on LMS7/XTRX-class devices and kill the pass.
+    configure_soapy_source(sink, merge_sdr_params_tx(p))
     apply_corrections(sink, ppm=sdr_env()["ppm"], dc_removal=False)
     # Analog TX filter ≈ the SDR sample rate, NOT the narrow channel width — the latter is
     # below the device filter floor (~0.8 MHz on the XTRX) and would break the path.

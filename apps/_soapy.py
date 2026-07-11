@@ -178,6 +178,14 @@ def sdr_env() -> dict[str, Any]:
       down to the channel ``--sample-rate``. Many real SDRs (XTRX/LMS7 floor ~2.1 Msps)
       can't stream narrow channel rates. Default **2.048 Msps** (SatNOGS's value); set
       ``0`` to disable (capture directly at the channel rate, e.g. RTL-class SDRs).
+
+    R-22 — TX has its OWN keys (RX antenna/gain-element names like ``LNAW`` /
+    ``LNA,TIA,PGA`` are RX-only on LMS7/XTRX-class devices; pushing them onto a
+    TX endpoint raises and kills the pass):
+
+    * ``GS_SDR_TX_ANTENNA`` — TX antenna name (e.g. ``BAND1``).
+    * ``GS_SDR_TX_GAIN_DB`` — overall TX gain in dB (PA drive — bench-validate).
+    * ``GS_SDR_TX_GAINS``  — per-element TX staging, e.g. ``"PAD=40,IAMP=6"``.
     """
     return {
         "antenna": os.environ.get("GS_SDR_ANTENNA", "").strip() or None,
@@ -188,6 +196,9 @@ def sdr_env() -> dict[str, Any]:
         "ppm": _env_float("GS_SDR_PPM") or 0.0,
         "dc_removal": _env_bool("GS_SDR_DC_REMOVAL"),
         "capture_rate_hz": _capture_rate(),
+        "tx_antenna": os.environ.get("GS_SDR_TX_ANTENNA", "").strip() or None,
+        "tx_gain_db": _env_float("GS_SDR_TX_GAIN_DB"),
+        "tx_gains": _env_gains("GS_SDR_TX_GAINS"),
     }
 
 
@@ -287,7 +298,8 @@ def make_lo_rotator(sdr_rate_hz: float, lo_offset_hz: float, doppler_hz: float =
 
 def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
     """Per-pass ``params`` with station ``GS_SDR_*`` antenna/gain/agc filled in as
-    defaults (per-pass values win). Feed the result to :func:`configure_soapy_source`."""
+    defaults (per-pass values win). Feed the result to :func:`configure_soapy_source`.
+    RX-oriented — TX endpoints use :func:`merge_sdr_params_tx` (R-22)."""
     env = sdr_env()
     merged: dict[str, Any] = dict(params or {})
     if env["antenna"] and "sdr_antenna" not in merged:
@@ -298,6 +310,36 @@ def merge_sdr_params(params: dict[str, Any] | None) -> dict[str, Any]:
         merged["sdr_gain_db"] = env["gain_db"]
     if "sdr_agc" not in merged:
         merged["sdr_agc"] = env["agc"]
+    return merged
+
+
+def merge_sdr_params_tx(params: dict[str, Any] | None) -> dict[str, Any]:
+    """R-22: the settings dict for a **TX** endpoint, built ONLY from
+    TX-explicit sources — per-pass ``sdr_tx_antenna``/``sdr_tx_gain_db``/
+    ``sdr_tx_gains`` (winning) over station ``GS_SDR_TX_*`` env. The generic /
+    RX-oriented keys (``sdr_antenna``, ``sdr_gains``, ``GS_SDR_ANTENNA``,
+    ``GS_SDR_GAINS`` — names like ``LNAW`` / ``LNA,TIA,PGA``) NEVER leak here:
+    they are RX-only on LMS7/XTRX-class devices and ``setAntenna``/``setGain``
+    on the TX direction would raise, killing the pass (and on a shared bidir
+    device, the downlink too). Returns the ``sdr_antenna``/``sdr_gain_db``/
+    ``sdr_gains`` shape :func:`configure_soapy_source` consumes; empty when
+    nothing TX-specific is configured (TX drive levels are BENCH-PENDING)."""
+    p = params or {}
+    env = sdr_env()
+    merged: dict[str, Any] = {}
+    antenna = p.get("sdr_tx_antenna") or env["tx_antenna"]
+    if isinstance(antenna, str) and antenna:
+        merged["sdr_antenna"] = antenna
+    gains = p.get("sdr_tx_gains")
+    if not isinstance(gains, dict) or not gains:
+        gains = env["tx_gains"]
+    if isinstance(gains, dict) and gains:
+        merged["sdr_gains"] = gains
+    gain_db = p.get("sdr_tx_gain_db")
+    if not _is_number(gain_db):
+        gain_db = env["tx_gain_db"]
+    if _is_number(gain_db):
+        merged["sdr_gain_db"] = float(gain_db)  # type: ignore[arg-type]
     return merged
 
 
@@ -481,6 +523,7 @@ __all__ = [
     "make_sink",
     "make_source",
     "merge_sdr_params",
+    "merge_sdr_params_tx",
     "open_analog_bandwidth",
     "readback_soapy_settings",
     "resample_ratio",

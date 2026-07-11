@@ -172,11 +172,17 @@ class BidirIo(Protocol):
         ...
 
     def transmit_burst(
-        self, iq: np.ndarray, *, on_first_accept: Callable[[], None] | None = None
+        self,
+        iq: np.ndarray,
+        *,
+        on_first_accept: Callable[[], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> BurstResult:
         """Send one uplink burst; returns the shared transport's BurstResult
         (accepted count + explicit outcome — R-16). ``on_first_accept`` fires
-        when the sink provably takes samples. Pauses RX internally if the
+        when the sink provably takes samples; ``should_abort`` is polled between
+        chunks so a pass stop cancels an in-flight burst (outcome="cancelled")
+        instead of radiating it to completion. Pauses RX internally if the
         underlying device is shared (so RX and TX never touch it concurrently)."""
         ...
 
@@ -206,9 +212,16 @@ class FileBidirIo:
                 yield np.frombuffer(raw[:whole], dtype=np.complex64)
 
     def transmit_burst(
-        self, iq: np.ndarray, *, on_first_accept: Callable[[], None] | None = None
+        self,
+        iq: np.ndarray,
+        *,
+        on_first_accept: Callable[[], None] | None = None,
+        should_abort: Callable[[], bool] | None = None,
     ) -> BurstResult:
         buf = np.asarray(iq, dtype=np.complex64)
+        if should_abort is not None and should_abort():
+            return BurstResult(accepted=0, total=len(buf), outcome="cancelled",
+                               detail="aborted by caller")
         if self._tx_path:
             with open(self._tx_path, "ab") as f:
                 f.write(buf.tobytes())
@@ -284,10 +297,14 @@ class _TxController:
         doppler: dict[str, float] | None = None,
         downlink_hz: float = 0.0,
         uplink_hz: float = 0.0,
+        should_abort: Callable[[], bool] | None = None,
     ) -> None:
         self._io = io
         self._lock = asyncio.Lock()
         self.tx_active = threading.Event()
+        # Polled between burst chunks: a pass stop cancels an in-flight burst
+        # (P0-07/P0-08 stop semantics) instead of radiating it to completion.
+        self._should_abort = should_abort
         # Shared with run_rx: the orchestrator's set_doppler push lands here (downlink Doppler).
         # With no doppler dict or a 0 downlink freq the pre-comp is inert (tx_doppler_hz → 0).
         self._doppler = doppler if doppler is not None else {"hz": 0.0}
@@ -329,7 +346,9 @@ class _TxController:
             try:
                 iq = await asyncio.to_thread(self._build_tx_iq, payload, sample_rate, params)
                 result = await asyncio.to_thread(
-                    self._io.transmit_burst, iq, on_first_accept=_first_accept
+                    lambda: self._io.transmit_burst(
+                        iq, on_first_accept=_first_accept, should_abort=self._should_abort
+                    )
                 )
                 accepted = int(result.accepted)
                 outcome = result.outcome
@@ -550,12 +569,17 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                 self._d.setFrequencyCorrection(self._dir, ch, ppm)
 
         configure_soapy_source(_EP(dev, SOAPY_SDR_RX), merged)
-        # Deliberately DO NOT push the RX-oriented ``merged`` params (GS_SDR_ANTENNA/GS_SDR_GAINS —
-        # e.g. antenna "LNAW", gain elements LNA/TIA/PGA) onto the TX endpoint: those names are
-        # RX-only on LMS7/XTRX-class devices and setAntenna/setGain would RAISE, aborting the shared
-        # device init and losing the DOWNLINK too (not just the uplink). TX freq/rate/bandwidth are
-        # set explicitly above and the ppm correction below; TX antenna + PA-drive gain staging is
-        # BENCH-PENDING and must be configured with TX-appropriate element names once validated.
+        # The RX-oriented ``merged`` params (GS_SDR_ANTENNA/GS_SDR_GAINS — e.g. antenna "LNAW",
+        # gain elements LNA/TIA/PGA) are NEVER pushed onto the TX endpoint: those names are
+        # RX-only on LMS7/XTRX-class devices and setAntenna/setGain would RAISE, aborting the
+        # shared device init and losing the DOWNLINK too (not just the uplink). R-22: TX gets its
+        # OWN explicit settings — sdr_tx_* params / GS_SDR_TX_* env via merge_sdr_params_tx —
+        # applied only when configured (no manual default: PA-drive levels are BENCH-PENDING).
+        from _soapy import merge_sdr_params_tx
+
+        tx_settings = merge_sdr_params_tx(params)
+        if tx_settings:
+            configure_soapy_source(_EP(dev, SOAPY_SDR_TX), tx_settings, default_gain_db=None)
         apply_corrections(_EP(dev, SOAPY_SDR_RX), ppm=env["ppm"], dc_removal=env["dc_removal"])
         # The uplink LO shares the XTRX reference, so the SAME ppm correction must ride the TX chain
         # — otherwise the calibrated reference error (ppm * uplink_hz, ~kHz) rides on top of the
@@ -588,7 +612,7 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
             else:
                 _log.warning("bidir RX readStream ret=%d", sr.ret)
 
-    def transmit_burst(self, iq: np.ndarray, *, on_first_accept=None):
+    def transmit_burst(self, iq: np.ndarray, *, on_first_accept=None, should_abort=None):
         """One uplink burst through the shared bounded TX transport (P0-07).
 
         R-15: a REAL half-duplex transition — the RX stream is DEACTIVATED
@@ -623,6 +647,7 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                         mtu=query_tx_mtu(self._dev, tx),
                         deadline_s=deadline_s,
                         on_first_accept=on_first_accept,
+                        should_abort=should_abort,
                     )
                     if not result.complete:
                         _log.warning(
@@ -664,7 +689,10 @@ async def amain(args) -> int:
     # uplink_hz (split-freq TX tune; falls back to the downlink centre for a same-freq link).
     downlink_hz = float(args.center_freq_hz or 0.0)
     uplink_hz = float(params.get("uplink_hz", downlink_hz) or downlink_hz)
-    tx = _TxController(io, doppler=doppler, downlink_hz=downlink_hz, uplink_hz=uplink_hz)
+    tx = _TxController(
+        io, doppler=doppler, downlink_hz=downlink_hz, uplink_hz=uplink_hz,
+        should_abort=stop_requested.is_set,
+    )
     # If the device exposes a shared tx_active flag (SoapySDR path), let the TX controller drive it
     # so the RX generator parks during a burst.
     io_flag = getattr(io, "tx_active", None)

@@ -231,6 +231,9 @@ _SDR_ENV_VARS = (
     "GS_SDR_PPM",
     "GS_SDR_DC_REMOVAL",
     "GS_SDR_CAPTURE_RATE",
+    "GS_SDR_TX_ANTENNA",
+    "GS_SDR_TX_GAIN_DB",
+    "GS_SDR_TX_GAINS",
 )
 
 
@@ -251,6 +254,9 @@ def test_sdr_env_defaults_when_unset(monkeypatch) -> None:
         "ppm": 0.0,
         "dc_removal": False,
         "capture_rate_hz": 2_048_000.0,  # default = SatNOGS rate
+        "tx_antenna": None,  # R-22: TX has its OWN keys; RX names never leak
+        "tx_gain_db": None,
+        "tx_gains": None,
     }
 
 
