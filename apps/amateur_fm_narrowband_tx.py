@@ -184,15 +184,11 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         # ``gs_client.core.orchestrator``).
         await send_event(sockets.status_writer, {"event": "transmit_started"})
 
+    stop_reason = {"value": "command"}
+
     async def _on_stop(cmd: dict[str, object]) -> None:
         stop_requested.set()
-        if started.is_set():
-            tb.stop()
-            tb.wait()
-        await send_event(
-            sockets.status_writer,
-            {"event": "stopped", "reason": str(cmd.get("reason", "command"))},
-        )
+        stop_reason["value"] = str(cmd.get("reason", "command"))
 
     async def _on_set_doppler(cmd: dict[str, object]) -> None:
         offset = cmd.get("offset_hz", 0)
@@ -223,9 +219,13 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         "set_doppler": _on_set_doppler,
         "transmit_frame": _on_transmit_frame,
     }
-    try:
-        await run_command_loop(sockets.control_reader, handlers)
-    finally:
+    engine_down = {"done": False}
+
+    async def _shutdown_engine() -> None:
+        """Idempotent: stop the transmit graph."""
+        if engine_down["done"]:
+            return
+        engine_down["done"] = True
         stop_requested.set()
         if started.is_set():
             try:
@@ -233,8 +233,23 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
                 tb.wait()
             except Exception:
                 log.exception("tb.stop/wait raised")
+
+    try:
+        reason = await run_command_loop(sockets.control_reader, handlers)
+        # P0-08: engine teardown BEFORE the explicit stopped ack; then exit 0.
+        # EOF is transport loss — no ack, exit nonzero.
+        await _shutdown_engine()
+        if reason == "stop":
+            await send_event(
+                sockets.status_writer,
+                {"event": "stopped", "reason": stop_reason["value"]},
+            )
+            return 0
+        log.warning("control EOF without stop — transport loss; exiting nonzero (P0-08)")
+        return 1
+    finally:
+        await _shutdown_engine()
         await sockets.aclose()
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

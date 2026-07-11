@@ -267,20 +267,29 @@ async def amain(args) -> int:
             },
         )
 
+    stop_reason = {"value": "command"}
+
     async def _on_stop(cmd: dict[str, object]) -> None:
         stop_requested.set()
-        await send_event(
-            sockets.status_writer,
-            {"event": "stopped", "reason": str(cmd.get("reason", "command"))},
-        )
+        stop_reason["value"] = str(cmd.get("reason", "command"))
 
     handlers = {"start": _on_start, "stop": _on_stop}
     try:
-        await run_command_loop(sockets.control_reader, handlers)
+        reason = await run_command_loop(sockets.control_reader, handlers)
+        if reason == "stop":
+            # P0-08: dispatch ended on the accepted stop; the explicit stopped
+            # ack follows cleanup (nothing to tear down here beyond sockets)
+            # and the process exits 0.
+            await send_event(
+                sockets.status_writer,
+                {"event": "stopped", "reason": stop_reason["value"]},
+            )
+            return 0
+        log.warning("control EOF without stop — transport loss; exiting nonzero (P0-08)")
+        return 1
     finally:
         stop_requested.set()
         await sockets.aclose()
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

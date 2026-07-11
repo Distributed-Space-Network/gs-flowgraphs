@@ -310,15 +310,11 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         # Already streaming since spawn; just confirm to the orchestrator.
         await send_event(sockets.status_writer, {"event": "started"})
 
+    stop_reason = {"value": "command"}
+
     async def _on_stop(cmd: dict[str, object]) -> None:
         stop_requested.set()
-        if started.is_set():
-            tb.stop()
-            tb.wait()
-        await send_event(
-            sockets.status_writer,
-            {"event": "stopped", "reason": str(cmd.get("reason", "command"))},
-        )
+        stop_reason["value"] = str(cmd.get("reason", "command"))
 
     async def _on_set_doppler(cmd: dict[str, object]) -> None:
         offset = cmd.get("offset_hz", 0)
@@ -365,9 +361,13 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         "stop": _on_stop,
         "set_doppler": _on_set_doppler,
     }
-    try:
-        await run_command_loop(sockets.control_reader, handlers)
-    finally:
+    engine_down = {"done": False}
+
+    async def _shutdown_engine() -> None:
+        """Idempotent: stop the graph, tear down the data pump."""
+        if engine_down["done"]:
+            return
+        engine_down["done"] = True
         stop_requested.set()
         if started.is_set():
             try:
@@ -377,12 +377,26 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
                 tb.wait()
             except Exception:
                 log.exception("tb.stop/wait raised")
-        # Tear down data pump.
         data_queue.put(None)
         signal_task.cancel()
         await asyncio.gather(pump_task, signal_task, return_exceptions=True)
+
+    try:
+        reason = await run_command_loop(sockets.control_reader, handlers)
+        # P0-08: engine teardown BEFORE the explicit stopped ack; then exit 0.
+        # EOF is transport loss — no ack, exit nonzero.
+        await _shutdown_engine()
+        if reason == "stop":
+            await send_event(
+                sockets.status_writer,
+                {"event": "stopped", "reason": stop_reason["value"]},
+            )
+            return 0
+        log.warning("control EOF without stop — transport loss; exiting nonzero (P0-08)")
+        return 1
+    finally:
+        await _shutdown_engine()
         await sockets.aclose()
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

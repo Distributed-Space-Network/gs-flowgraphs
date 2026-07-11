@@ -216,16 +216,27 @@ async def run_command_loop(
     handlers: dict[str, CommandHandler],
     *,
     on_unknown: CommandHandler | None = None,
-) -> None:
-    """Dispatch loop. Runs until the control socket closes (EOF).
-    Each command's ``cmd`` field selects a handler in ``handlers``;
-    unknown ``cmd`` values fall through to ``on_unknown`` (or are
-    logged + ignored)."""
+    terminal_cmds: frozenset[str] = frozenset({"stop"}),
+) -> str:
+    """Dispatch loop. Each command's ``cmd`` field selects a handler in
+    ``handlers``; unknown ``cmd`` values fall through to ``on_unknown`` (or are
+    logged + ignored).
+
+    P0-08 exit semantics — returns the exit reason:
+
+    * a name in ``terminal_cmds`` (default ``"stop"``): accepting a stop ENDS
+      command dispatch. The app then tears its engine down, emits the explicit
+      ``stopped`` event AFTER cleanup, and exits 0 — the supervisor never has
+      to force-terminate a healthy stop.
+    * ``"eof"``: the control socket closed WITHOUT a stop — that is transport
+      loss (a crashed/stopped supervisor), never a clean acknowledgement. The
+      app must clean up and exit nonzero.
+    """
     while True:
         cmd = await read_command(reader)
         if cmd is None:
-            log.info("control socket EOF; exiting command loop")
-            return
+            log.info("control socket EOF; exiting command loop (transport loss)")
+            return "eof"
         name = cmd.get("cmd")
         if not isinstance(name, str):
             log.debug("control: ignoring command without 'cmd' string: %r", cmd)
@@ -241,6 +252,10 @@ async def run_command_loop(
             await handler(cmd)
         except Exception:
             log.exception("control: handler for cmd=%r raised", name)
+        if name in terminal_cmds:
+            # Even a raising stop handler ends dispatch — the caller's cleanup
+            # path owns the rest (P0-08).
+            return name
 
 
 # ----------------------------------------------------------------------

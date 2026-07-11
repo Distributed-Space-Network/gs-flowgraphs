@@ -129,13 +129,12 @@ async def amain(args) -> int:
         started.set()
         await send_event(sockets.status_writer, {"event": "started"})
 
+    stop_reason = {"value": "command"}
+
     async def _on_stop(cmd: dict[str, object]) -> None:
         stop_requested.set()
         started.set()
-        await send_event(
-            sockets.status_writer,
-            {"event": "stopped", "reason": str(cmd.get("reason", "command"))},
-        )
+        stop_reason["value"] = str(cmd.get("reason", "command"))
 
     async def _on_set_doppler(cmd: dict[str, object]) -> None:
         off = cmd.get("offset_hz", 0)
@@ -217,14 +216,29 @@ async def amain(args) -> int:
 
     engine_task = asyncio.create_task(_engine(), name="gr-satellites")
     handlers = {"start": _on_start, "stop": _on_stop, "set_doppler": _on_set_doppler}
-    try:
-        await run_command_loop(sockets.control_reader, handlers)
-    finally:
+
+    async def _shutdown_engine() -> None:
+        """Idempotent engine teardown — settle the gr-satellites task fully."""
         stop_requested.set()
         started.set()
         await asyncio.gather(engine_task, return_exceptions=True)
+
+    try:
+        reason = await run_command_loop(sockets.control_reader, handlers)
+        # P0-08: engine teardown BEFORE the explicit stopped ack; then exit 0.
+        # EOF is transport loss — no ack, exit nonzero.
+        await _shutdown_engine()
+        if reason == "stop":
+            await send_event(
+                sockets.status_writer,
+                {"event": "stopped", "reason": stop_reason["value"]},
+            )
+            return 0
+        log.warning("control EOF without stop — transport loss; exiting nonzero (P0-08)")
+        return 1
+    finally:
+        await _shutdown_engine()
         await sockets.aclose()
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
