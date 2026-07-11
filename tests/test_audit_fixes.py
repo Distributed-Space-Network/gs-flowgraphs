@@ -208,8 +208,9 @@ def test_soapy_sink_actually_calls_configure_tx_sink():
     # only rate+frequency — the deaf transmitter) fails.
     src = inspect.getsource(txapp._soapy_sink)
     assert "configure_tx_sink(" in src
-    # and the app threads the pass params through to it
-    assert "await asyncio.to_thread(_sink_iq, args, iq, params)" in inspect.getsource(txapp.amain)
+    # and the app threads the pass params through to it (F-03 added the
+    # on_first_accept hook to the same call)
+    assert "_sink_iq, args, iq, params" in inspect.getsource(txapp.amain)
 
 
 def test_sink_iq_file_path_accepts_params(tmp_path):

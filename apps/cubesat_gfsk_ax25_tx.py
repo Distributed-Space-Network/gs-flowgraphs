@@ -98,12 +98,24 @@ def _build_frame_iq(args, params: dict[str, object], profile) -> np.ndarray:
     return endurosat.transmit(body, sample_rate, profile=profile)
 
 
-def _sink_iq(args, iq: np.ndarray, params: dict[str, object] | None = None) -> None:
+def _sink_iq(
+    args,
+    iq: np.ndarray,
+    params: dict[str, object] | None = None,
+    on_first_accept=None,
+):
+    """Sink the burst; returns a ``_soapy_tx.BurstResult`` describing what was
+    ACTUALLY accepted (R-16 — completion events must not fabricate success)."""
+    from _soapy_tx import BurstResult
+
     sdr_args = str(args.sdr_args or "")
     if sdr_args.startswith("file:"):
-        Path(sdr_args[len("file:") :]).write_bytes(iq.astype(np.complex64).tobytes())
-        return
-    _soapy_sink(args, iq, params)  # pragma: no cover (needs hardware/SoapySDR)
+        data = iq.astype(np.complex64)
+        Path(sdr_args[len("file:") :]).write_bytes(data.tobytes())
+        if on_first_accept is not None:
+            on_first_accept()
+        return BurstResult(accepted=len(data), total=len(data), outcome="complete")
+    return _soapy_sink(args, iq, params, on_first_accept)  # pragma: no cover (needs SoapySDR)
 
 
 class _SoapyDeviceAdapter:
@@ -152,24 +164,43 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
     return applied
 
 
-def _soapy_sink(args, iq: np.ndarray, params=None) -> None:  # pragma: no cover (needs hardware)
+def _soapy_sink(args, iq: np.ndarray, params=None, on_first_accept=None):  # pragma: no cover
+    """P0-07: uses the shared bounded TX transport (apps/_soapy_tx.py) — MTU
+    chunking, bounded zero/timeout/error handling, END_BURST on the final data
+    chunk, per-burst deadline — instead of the fixed-4096 ret>0-only loop that
+    could spin forever or oversize a native driver write."""
     import SoapySDR
+    from _soapy_tx import query_tx_mtu, write_burst
     from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_TX
 
+    log = logging.getLogger("cubesat_gfsk_ax25_tx")
     dev = SoapySDR.Device(args.sdr_args)
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
     dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
     dev.setFrequency(SOAPY_SDR_TX, 0, float(args.center_freq_hz))
     applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, sample_rate)
-    logging.getLogger("cubesat_gfsk_ax25_tx").info("TX sink configured: %s", applied)
+    log.info("TX sink configured: %s", applied)
     stream = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32)
     dev.activateStream(stream)
     try:
         buf = iq.astype(np.complex64)
-        i = 0
-        while i < len(buf):
-            sr = dev.writeStream(stream, [buf[i : i + 4096]], len(buf[i : i + 4096]))
-            i += sr.ret if sr.ret > 0 else 0
+        # Deadline: the burst's real-time duration plus generous margin — a TX
+        # that cannot drain a one-burst buffer inside this is wedged, not slow.
+        deadline_s = max(10.0, 3.0 * len(buf) / max(1.0, sample_rate))
+        result = write_burst(
+            dev,
+            stream,
+            buf,
+            mtu=query_tx_mtu(dev, stream),
+            deadline_s=deadline_s,
+            on_first_accept=on_first_accept,
+        )
+        if not result.complete:
+            log.warning(
+                "TX burst incomplete: %d/%d samples (%s: %s)",
+                result.accepted, result.total, result.outcome, result.detail,
+            )
+        return result
     finally:
         dev.deactivateStream(stream)
         dev.closeStream(stream)
@@ -204,12 +235,36 @@ async def amain(args) -> int:
             from gnuradio_gfsk import transmit_gnuradio
 
             await asyncio.to_thread(transmit_gnuradio, args, params, profile)
-        else:
-            iq = _build_frame_iq(args, params, profile)
-            await asyncio.to_thread(_sink_iq, args, iq, params)
+            await send_event(
+                sockets.status_writer,
+                {"event": "transmit_complete", "samples": 0, "outcome": "complete"},
+            )
+            return
+        # R-16: transmit_started is emitted only when the stream provably
+        # accepts samples (bridged threadsafe from the sink worker thread),
+        # and transmit_complete reports the ACCEPTED count + a bounded
+        # explicit outcome — never a fabricated zero-sample success.
+        loop = asyncio.get_running_loop()
+
+        def _first_accept() -> None:
+            loop.call_soon_threadsafe(
+                lambda: loop.create_task(
+                    send_event(sockets.status_writer, {"event": "transmit_started"})
+                )
+            )
+
+        iq = _build_frame_iq(args, params, profile)
+        result = await asyncio.to_thread(
+            _sink_iq, args, iq, params, on_first_accept=_first_accept
+        )
         await send_event(
             sockets.status_writer,
-            {"event": "transmit_complete", "samples": 0},
+            {
+                "event": "transmit_complete",
+                "samples": int(result.accepted),
+                "outcome": result.outcome,
+                "detail": result.detail,
+            },
         )
 
     async def _on_stop(cmd: dict[str, object]) -> None:

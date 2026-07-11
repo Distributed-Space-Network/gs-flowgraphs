@@ -35,13 +35,14 @@ import math
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 from _fallback_select import symbol_rate_hz_of
 from _recorder import StreamRecorder
+from _soapy_tx import BurstResult
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
@@ -57,7 +58,9 @@ _DEFAULT_SAMPLE_RATE = 96_000  # multiple of 9600 → integer samples/symbol (en
 _DECODE_PERIOD_S = 2.0  # how often the RX decoder is drained
 _SIGNAL_PERIOD_S = 1.0  # how often an RSSI signal event is emitted
 _READ_CHUNK = 4096
-_TX_MAX_STALLS = 20  # consecutive writeStream timeouts before aborting a burst (bounded, no spin)
+# R-15: samples read in this window after a TX burst reactivates the RX stream
+# are the front-end's settling transient and are discarded, not decoded.
+_RX_SETTLE_S = 0.05
 _UPLINK_MAX_BYTES = 65_536  # sanity cap on a raw uplink train (~54 s @ 9600); guards against GB IQ
 _log = logging.getLogger("cubesat_gfsk_endurosat_bidir")
 
@@ -168,9 +171,13 @@ class BidirIo(Protocol):
         """Blocking generator of complex64 downlink chunks; ends (StopIteration) on source EOF."""
         ...
 
-    def transmit_burst(self, iq: np.ndarray) -> int:
-        """Send one uplink burst; returns the sample count sent. Pauses RX internally if the
-        underlying device is shared (so RX and TX never touch the device concurrently)."""
+    def transmit_burst(
+        self, iq: np.ndarray, *, on_first_accept: Callable[[], None] | None = None
+    ) -> BurstResult:
+        """Send one uplink burst; returns the shared transport's BurstResult
+        (accepted count + explicit outcome — R-16). ``on_first_accept`` fires
+        when the sink provably takes samples. Pauses RX internally if the
+        underlying device is shared (so RX and TX never touch it concurrently)."""
         ...
 
     def close(self) -> None: ...
@@ -198,13 +205,17 @@ class FileBidirIo:
                     return
                 yield np.frombuffer(raw[:whole], dtype=np.complex64)
 
-    def transmit_burst(self, iq: np.ndarray) -> int:
+    def transmit_burst(
+        self, iq: np.ndarray, *, on_first_accept: Callable[[], None] | None = None
+    ) -> BurstResult:
         buf = np.asarray(iq, dtype=np.complex64)
         if self._tx_path:
             with open(self._tx_path, "ab") as f:
                 f.write(buf.tobytes())
+        if len(buf) and on_first_accept is not None:
+            on_first_accept()
         self.sent_samples += len(buf)
-        return len(buf)
+        return BurstResult(accepted=len(buf), total=len(buf), outcome="complete")
 
     def close(self) -> None:
         return None
@@ -294,24 +305,50 @@ class _TxController:
     async def transmit(
         self, sockets, payload: bytes, sample_rate: float, params: dict[str, object]
     ) -> int:
-        """Emit transmit_started, build+burst the uplink, emit transmit_complete (samples sent, 0 on
-        failure). transmit_complete ALWAYS fires after transmit_started — a build/burst exception is
-        logged, not propagated, so the orchestrator's half-duplex loop never stalls on it."""
+        """R-16: ``transmit_started`` fires only when the sink ACCEPTS its first
+        sample (bridged threadsafe from the burst worker), never on command
+        receipt/IQ build; ``transmit_complete`` ALWAYS fires and carries the
+        accepted count plus an explicit bounded outcome — a build/burst failure
+        is outcome="error", not a nominal zero-sample success. Exceptions are
+        logged, not propagated, so the orchestrator's half-duplex loop never
+        stalls on them."""
         async with self._lock:
-            await send_event(sockets.status_writer, {"event": "transmit_started"})
-            sent = 0
+            loop = asyncio.get_running_loop()
+
+            def _first_accept() -> None:
+                loop.call_soon_threadsafe(
+                    lambda: loop.create_task(
+                        send_event(sockets.status_writer, {"event": "transmit_started"})
+                    )
+                )
+
+            accepted = 0
+            outcome = "error"
+            detail = ""
             self.tx_active.set()
             try:
                 iq = await asyncio.to_thread(self._build_tx_iq, payload, sample_rate, params)
-                sent = await asyncio.to_thread(self._io.transmit_burst, iq)
-            except Exception:  # noqa: BLE001 — must still emit transmit_complete (no orchestrator hang)
-                _log.exception("bidir TX: uplink build/send failed; reporting 0 samples")
+                result = await asyncio.to_thread(
+                    self._io.transmit_burst, iq, on_first_accept=_first_accept
+                )
+                accepted = int(result.accepted)
+                outcome = result.outcome
+                detail = result.detail
+            except Exception as e:  # noqa: BLE001 — must still emit transmit_complete
+                _log.exception("bidir TX: uplink build/send failed")
+                detail = repr(e)
             finally:
                 self.tx_active.clear()
                 await send_event(
-                    sockets.status_writer, {"event": "transmit_complete", "samples": sent}
+                    sockets.status_writer,
+                    {
+                        "event": "transmit_complete",
+                        "samples": accepted,
+                        "outcome": outcome,
+                        "detail": detail,
+                    },
                 )
-            return sent
+            return accepted
 
 
 async def run_rx(
@@ -527,6 +564,9 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         apply_corrections(_EP(dev, SOAPY_SDR_TX), ppm=env["ppm"], dc_removal=False)
         self._rx_stream = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [0])
         dev.activateStream(self._rx_stream)
+        # R-15: after a TX burst reactivates RX, samples before this monotonic
+        # deadline are the front-end's settling transient and are discarded.
+        self._rx_settle_until = 0.0
         _log.info("bidir SoapySDR: rx=%.0f tx=%.0f rate=%.0f", args.center_freq_hz, uplink_hz, rate)
 
     def rx_chunks(self) -> Iterator[np.ndarray]:
@@ -540,50 +580,65 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
             with self._lock:
                 sr = self._dev.readStream(self._rx_stream, [buff], len(buff), timeoutUs=200_000)
             if sr.ret > 0:
+                if time.monotonic() < self._rx_settle_until:
+                    continue  # R-15: post-reactivation settling transient — discard
                 yield buff[: sr.ret].copy()
             elif sr.ret in (SOAPY_SDR_TIMEOUT, SOAPY_SDR_OVERFLOW):
                 continue
             else:
                 _log.warning("bidir RX readStream ret=%d", sr.ret)
 
-    def transmit_burst(self, iq: np.ndarray) -> int:
-        from SoapySDR import SOAPY_SDR_END_BURST, SOAPY_SDR_TIMEOUT
+    def transmit_burst(self, iq: np.ndarray, *, on_first_accept=None):
+        """One uplink burst through the shared bounded TX transport (P0-07).
+
+        R-15: a REAL half-duplex transition — the RX stream is DEACTIVATED
+        before the TX stream activates (break-before-make at the stream level;
+        the antenna-side T/R relay is gs-client's safety sequencer), and
+        reactivated afterwards with a settle window during which the reader
+        discards samples (front-end transient, not downlink).
+
+        Returns a ``_soapy_tx.BurstResult`` (R-16: the caller's events must
+        report the ACCEPTED count and an explicit outcome, never a nominal
+        zero-sample completion)."""
+        from _soapy_tx import query_tx_mtu, write_burst
 
         buf = np.asarray(iq, dtype=np.complex64)
         self.tx_active.set()
-        sent = 0
         try:
             with self._lock:
+                with contextlib.suppress(Exception):
+                    self._dev.deactivateStream(self._rx_stream)  # break RX first (R-15)
                 tx = self._dev.setupStream(self._TX, self._CF32, [0])
                 self._dev.activateStream(tx)
                 try:
-                    n = len(buf)
-                    i = 0
-                    stalls = 0
-                    while i < n:
-                        block = buf[i : i + 4096]
-                        # END_BURST on the LAST DATA chunk flushes the tail (payload + CRC-16) and
-                        # transmits. A separate 0-length END_BURST write BLOCKS on XTRX/LMS drivers.
-                        flags = SOAPY_SDR_END_BURST if (i + len(block)) >= n else 0
-                        sr = self._dev.writeStream(tx, [block], len(block), flags, 0, 1_000_000)
-                        if sr.ret > 0:
-                            i += sr.ret
-                            sent = i
-                            stalls = 0
-                        elif sr.ret == SOAPY_SDR_TIMEOUT:
-                            stalls += 1
-                            if stalls > _TX_MAX_STALLS:  # bounded — never spin holding the lock
-                                _log.warning("bidir TX: writeStream stalled x%d; aborting", stalls)
-                                break
-                        else:
-                            _log.warning("bidir TX: writeStream error ret=%d; aborting", sr.ret)
-                            break
+                    # Deadline: burst real-time duration + generous margin — a
+                    # writer that cannot drain one burst in this is wedged; it
+                    # must not hold the device lock through ~21 one-second
+                    # timeouts (P0-07).
+                    deadline_s = max(5.0, 3.0 * len(buf) / max(1.0, self._rate))
+                    result = write_burst(
+                        self._dev,
+                        tx,
+                        buf,
+                        mtu=query_tx_mtu(self._dev, tx),
+                        deadline_s=deadline_s,
+                        on_first_accept=on_first_accept,
+                    )
+                    if not result.complete:
+                        _log.warning(
+                            "bidir TX burst incomplete: %d/%d (%s: %s)",
+                            result.accepted, result.total, result.outcome, result.detail,
+                        )
                     with contextlib.suppress(Exception):
                         self._dev.readStreamStatus(tx, timeoutUs=200_000)  # let the burst flush
                 finally:
                     self._dev.deactivateStream(tx)
                     self._dev.closeStream(tx)
-            return sent
+                    with contextlib.suppress(Exception):
+                        self._dev.activateStream(self._rx_stream)  # make RX again (R-15)
+                    # Reader discards until here — reactivation transient.
+                    self._rx_settle_until = time.monotonic() + _RX_SETTLE_S
+            return result
         finally:
             self.tx_active.clear()
 

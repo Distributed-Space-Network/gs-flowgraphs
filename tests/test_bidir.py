@@ -132,15 +132,17 @@ def test_file_bidir_io_rx_and_tx(tmp_path):
     io = bidir.FileBidirIo(str(rx), str(tx))
     chunks = list(io.rx_chunks())
     assert sum(len(c) for c in chunks) == len(iq)
-    sent = io.transmit_burst(bidir.build_uplink_iq(b"cmd", _SR, {}))
-    assert sent > 0 and io.sent_samples == sent
-    assert tx.stat().st_size == sent * 8  # complex64
+    result = io.transmit_burst(bidir.build_uplink_iq(b"cmd", _SR, {}))
+    assert result.complete and result.accepted > 0
+    assert io.sent_samples == result.accepted
+    assert tx.stat().st_size == result.accepted * 8  # complex64
 
 
 def test_file_bidir_io_no_rx_file_is_empty():
     io = bidir.FileBidirIo(None, None)
     assert list(io.rx_chunks()) == []
-    assert io.transmit_burst(np.zeros(10, np.complex64)) == 10  # discarded, still counted
+    result = io.transmit_burst(np.zeros(10, np.complex64))  # discarded, still counted
+    assert result.accepted == 10 and result.complete
 
 
 # --------------------------------------------------------------------------- payload resolution
@@ -193,15 +195,18 @@ def test_tx_controller_emits_started_and_complete(tmp_path):
 
 
 def test_tx_controller_still_emits_complete_when_build_fails():
-    # MED regression: a build/burst failure must STILL emit transmit_complete (samples=0), or the
-    # orchestrator's half-duplex loop hangs waiting for it. A non-integer-sps rate makes the
-    # modulator raise inside the controller.
+    # MED regression: a build/burst failure must STILL emit transmit_complete, or the
+    # orchestrator's half-duplex loop hangs waiting for it. R-16: transmit_started
+    # must NOT fire (no sample was ever accepted) and the completion carries an
+    # explicit error outcome — never a nominal zero-sample success.
     socks = _FakeSockets()
     tx = bidir._TxController(bidir.FileBidirIo(None, None))
     sent = asyncio.run(tx.transmit(socks, b"payload", 100_000.0, {}))  # 10.42 sps → raises
     evs = _events(socks)
-    assert [e["event"] for e in evs] == ["transmit_started", "transmit_complete"]
-    assert evs[1]["samples"] == sent == 0
+    assert [e["event"] for e in evs] == ["transmit_complete"]
+    assert evs[0]["samples"] == sent == 0
+    assert evs[0]["outcome"] == "error"
+    assert evs[0]["detail"]  # the failure reason travels with the event
     assert not tx.tx_active.is_set()
 
 
