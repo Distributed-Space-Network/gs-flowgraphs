@@ -229,6 +229,10 @@ async def amain(args: argparse.Namespace) -> int:
                 # tests can verify the file actually reached the flowgraph.
                 fid_obj = cmd.get("frame_id", "")
                 fid = fid_obj if isinstance(fid_obj, str) else ""
+                # R-16 contract: a per-burst transmit announces acceptance
+                # FIRST (the orchestrator flips KEYED_READY -> KEYED on it),
+                # then completes with the accepted count + explicit outcome.
+                await _send_line(status_writer, {"event": "transmit_started"})
                 bytes_transmitted = 0
                 payload_file_obj = cmd.get("payload_file")
                 if isinstance(payload_file_obj, str) and payload_file_obj:
@@ -267,6 +271,8 @@ async def amain(args: argparse.Namespace) -> int:
                         "event": "transmit_complete",
                         "frame_id": fid,
                         "bytes_transmitted": bytes_transmitted,
+                        "samples": max(1, bytes_transmitted),
+                        "outcome": "complete",
                     },
                 )
             elif name == "stop":
