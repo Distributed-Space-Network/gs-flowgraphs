@@ -35,18 +35,29 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 import numpy as np
 from _fallback_select import symbol_rate_hz_of
-from _recorder import StreamRecorder
-from _soapy import capture_plan, merge_sdr_params, resample_ratio, sdr_env
+from _recorder import StreamRecorder, first_sample_probe
+from _soapy import (
+    capture_plan,
+    merge_sdr_params,
+    readback_soapy_settings,
+    resample_ratio,
+    sdr_env,
+    sdr_ready_fields,
+)
 from _spawn_contract import (
+    EngineFailure,
+    await_first_samples,
     build_argparser,
     connect_spawn_sockets,
     load_params,
     run_command_loop,
     send_event,
+    watch_engine_death,
 )
 from framings import LIVE_FRAMINGS as _LIVE_FRAMINGS
 from framings import normalize_framing, valid_ax25_address
@@ -59,6 +70,10 @@ _DEFAULT_SAMPLE_RATE = 96_000  # >= 5x the 18.7 kHz channel; integer-ish sps
 _DECODE_PERIOD_S = 2.0  # how often the dsp engine re-decodes the capture
 _READ_CHUNK = 4096
 _DEFAULT_SDR_GAIN_DB = 40.0  # manual RX gain when none is configured (0 dB = deaf)
+# R-11: how long the source gets to deliver its FIRST samples before the pass
+# fails closed. SDR open + stream activation is seconds; the supervisor's
+# ready timeout is 30 s, so 15 s leaves room for the open itself.
+_FIRST_SAMPLE_TIMEOUT_S = 15.0
 
 
 def _select_engine(args, params: dict[str, object]) -> str:
@@ -233,13 +248,19 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25", output_dir
 # ----------------------------------------------------------------------
 
 
-def _open_iq_source(args, params=None):
-    """Return a blocking iterator of complex64 chunks (SoapySDR or cf32 file)."""
+def _open_iq_source(args, params=None, report=None):
+    """Return a blocking iterator of complex64 chunks (SoapySDR or cf32 file).
+    ``report`` (optional dict) is filled with the R-21 identity/settings record
+    during source setup — device, requested vs applied vs read-back — so the
+    ready event can carry what the front-end ACTUALLY runs."""
     sdr_args = str(args.sdr_args or "")
     if sdr_args.startswith("file:"):
         path = sdr_args[len("file:") :]
+        if report is not None:
+            report["device"] = sdr_args
+            report["source"] = "file"
         return _file_iq_chunks(path)
-    return _soapy_iq_chunks(args, params or {})  # pragma: no cover (needs hardware)
+    return _soapy_iq_chunks(args, params or {}, report)  # pragma: no cover (needs hardware)
 
 
 def _file_iq_chunks(path: str):
@@ -286,7 +307,7 @@ def _resample_poly(x, up: int, down: int):  # pragma: no cover (needs scipy + ha
     return resample_poly(x, up, down).astype(np.complex64)
 
 
-def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR)
+def _soapy_iq_chunks(args, params, report=None):  # pragma: no cover (needs hardware/SoapySDR)
     import SoapySDR  # lazy: only the dsp+hardware path needs it
     from SoapySDR import (
         SOAPY_SDR_CF32,
@@ -366,6 +387,20 @@ def _soapy_iq_chunks(args, params):  # pragma: no cover (needs hardware/SoapySDR
         "dc_removal=%s — opening RX stream",
         args.sdr_args, ch, sdr_rate, rate, freq, lo, gain_str, env["ppm"], env["dc_removal"],
     )
+    # R-21: requested vs read-back settings for the ready event. The readback
+    # runs AFTER every setter above, so "actual" is what the hardware settled on.
+    actual = readback_soapy_settings(dev, channel=ch, direction=SOAPY_SDR_RX)
+    log.info("dsp SDR readback: %s", actual)
+    if report is not None:
+        report.update(
+            device=str(args.sdr_args),
+            source="soapy",
+            requested={
+                "sample_rate_hz": sdr_rate, "frequency_hz": freq, "lo_offset_hz": lo,
+                "gain": gain_str, "ppm": env["ppm"], "dc_removal": env["dc_removal"],
+            },
+            actual=actual,
+        )
 
     stream = dev.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [ch])
     dev.activateStream(stream)
@@ -425,6 +460,53 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
     # the correction phase-continuous across chunks.
     nco_phase = 0.0
 
+    # RX: stream + record from spawn (arm — before AOS); don't gate on cmd:start.
+    # ``started`` still tracks the cmd:start/stop lifecycle for the status events.
+    _ = started
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    loop = asyncio.get_running_loop()
+    # Pre-demod IQ capture: record the RAW chunk (before the Doppler NCO / demod).
+    recorder = StreamRecorder.maybe_start(args, sample_rate_hz=sample_rate)
+    sdr_report: dict[str, object] = {}
+
+    def _reader() -> None:
+        try:
+            for chunk in _open_iq_source(args, params, sdr_report):
+                if stop_requested.is_set():
+                    break
+                arr = np.asarray(chunk, dtype=np.complex64)
+                if recorder is not None:
+                    recorder.write(arr)
+                loop.call_soon_threadsafe(queue.put_nowait, arr)
+        except Exception:
+            log.exception("IQ source error")
+        finally:
+            if recorder is not None:
+                recorder.close()  # close the cf32; views derived post-pass by iq_views
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    # Daemon thread, NOT run_in_executor: a wedged SoapySDR readStream must not
+    # block interpreter exit on the fail-closed path (executor threads are
+    # joined at exit; a daemon thread is not).
+    reader_thread = threading.Thread(target=_reader, name="iq-reader", daemon=True)
+    reader_thread.start()
+
+    # R-11: 'ready' is PROOF, not process startup — it goes out only after the
+    # source delivered its first samples (device open + settings applied +
+    # stream active + data flowing). A source that cannot open or stays silent
+    # fails the pass HERE (EngineFailure → the amain death watch emits an
+    # ``error`` event and the app exits nonzero), not at LOS with 0 bytes.
+    try:
+        first_chunk = await asyncio.wait_for(queue.get(), timeout=_FIRST_SAMPLE_TIMEOUT_S)
+    except TimeoutError:
+        stop_requested.set()
+        msg = f"IQ source delivered no samples within {_FIRST_SAMPLE_TIMEOUT_S:.0f}s"
+        raise EngineFailure(msg) from None
+    if first_chunk is None:
+        msg = "IQ source ended before the first sample (open/configure failed?)"
+        raise EngineFailure(msg)
+
     await send_event(
         sockets.status_writer,
         {
@@ -441,34 +523,16 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
             "framing": ",".join(name for name, _ in decoders),
             "framing_hint": declared or "none",
             "flowgraph_version": VERSION,
+            **sdr_ready_fields(
+                device=str(sdr_report.get("device", args.sdr_args or "")),
+                requested=sdr_report.get("requested"),  # type: ignore[arg-type]
+                applied=sdr_report.get("applied"),  # type: ignore[arg-type]
+                actual=sdr_report.get("actual"),  # type: ignore[arg-type]
+                stream_active=True,
+                first_samples=True,
+            ),
         },
     )
-    # RX: stream + record from spawn (arm — before AOS); don't gate on cmd:start.
-    # ``started`` still tracks the cmd:start/stop lifecycle for the status events.
-    _ = started
-
-    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
-    loop = asyncio.get_running_loop()
-    # Pre-demod IQ capture: record the RAW chunk (before the Doppler NCO / demod).
-    recorder = StreamRecorder.maybe_start(args, sample_rate_hz=sample_rate)
-
-    def _reader() -> None:
-        try:
-            for chunk in _open_iq_source(args, params):
-                if stop_requested.is_set():
-                    break
-                arr = np.asarray(chunk, dtype=np.complex64)
-                if recorder is not None:
-                    recorder.write(arr)
-                loop.call_soon_threadsafe(queue.put_nowait, arr)
-        except Exception:
-            log.exception("IQ source error")
-        finally:
-            if recorder is not None:
-                recorder.close()  # close the cf32; views derived post-pass by iq_views
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-
-    reader_task = loop.run_in_executor(None, _reader)
 
     async def _decode_loop() -> None:
         decode_errors = 0
@@ -503,9 +567,9 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                     await _emit_frame(sockets, body, framing=fname, output_dir=out_dir)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
+    chunk: np.ndarray | None = first_chunk  # the proof chunk is data — decode it too
     try:
         while True:
-            chunk = await queue.get()
             if chunk is None:
                 break
             off = doppler["hz"]
@@ -516,12 +580,16 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                 nco_phase = float(ph[-1]) if len(ph) else nco_phase
             for _, dec in decoders:
                 dec.push(chunk)
+            chunk = await queue.get()
     finally:
         stop_requested.set()
         # AWAIT (never cancel) the decode task: a cancel could discard frames a
         # decode_new already consumed from the buffer in its worker thread. The
         # loop wakes promptly on stop_requested; then flush the remainder of each.
-        await asyncio.gather(reader_task, decode_task, return_exceptions=True)
+        # The reader join is BOUNDED (daemon thread): a wedged SDR read must not
+        # hang teardown past the supervisor's stop deadline.
+        await asyncio.to_thread(reader_thread.join, 5.0)
+        await asyncio.gather(decode_task, return_exceptions=True)
         for fname, dec in decoders:
             try:
                 leftovers = await asyncio.to_thread(dec.flush)
@@ -552,6 +620,22 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     out_dir = getattr(args, "output_dir", None)  # frames.jsonl alongside the IQ
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
     ctx = build_rx_top_block(args, profile, sample_rate, params)
+    # RX: stream + record from spawn (don't gate on cmd:start — that's TX keying);
+    # cmd:start still fires 'started' and cmd:stop ends the pass.
+    _ = started
+    # R-11: start the graph BEFORE declaring ready — 'ready' means an ACTIVE
+    # stream with first-sample proof (the recorder's unbuffered cf32 grows the
+    # moment the SDR delivers), not process startup. No recorder → the proof is
+    # reported unavailable (None), never fabricated.
+    ctx.start()
+    probe = first_sample_probe(getattr(ctx, "recorder", None))
+    first: bool | None = None
+    if probe is not None:
+        first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)
+        if not first:
+            ctx.stop()
+            msg = f"gr-soapy stream active but no samples within {_FIRST_SAMPLE_TIMEOUT_S:.0f}s"
+            raise EngineFailure(msg)
     await send_event(
         sockets.status_writer,
         {
@@ -564,12 +648,16 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
             "framing": ",".join(_LIVE_FRAMINGS),
             "framing_hint": declared or "none",
             "flowgraph_version": VERSION,
+            **sdr_ready_fields(
+                device=str(args.sdr_args or ""),
+                requested=merge_sdr_params(params),
+                applied=getattr(ctx, "sdr_applied", None),
+                actual=readback_soapy_settings(ctx.src),
+                stream_active=True,
+                first_samples=first,
+            ),
         },
     )
-    # RX: stream + record from spawn (don't gate on cmd:start — that's TX keying);
-    # cmd:start still fires 'started' and cmd:stop ends the pass.
-    _ = started
-    ctx.start()
     last_doppler = 0.0
     # Carry the tail bits across drain boundaries so a frame straddling one isn't lost
     # (~5-10 % of frames otherwise, at 2000-bit AX.25 frames per ~2 s drain @9k6). Dedup is
@@ -664,6 +752,10 @@ async def amain(args) -> int:
         engine_fn(args, sockets, params, started, stop_requested, profile, doppler),
         name=f"engine-{engine}",
     )
+    # R-11: an engine that dies (failed SDR open, silent source, DSP crash)
+    # fails the pass — error event + nonzero exit — instead of idling behind
+    # a live command loop with nothing captured.
+    watch_engine_death(engine_task, sockets.status_writer, sockets.control_reader, stop_requested)
     async def _shutdown_engine() -> None:
         """Idempotent engine teardown — settle the engine task fully."""
         stop_requested.set()

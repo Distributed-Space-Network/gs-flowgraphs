@@ -107,6 +107,7 @@ class _SatContext:
         fallbacks=None,
         valve_ours=None,
         valve_grsat=None,
+        sdr_applied: dict | None = None,
     ) -> None:
         self.tb = tb
         self.src = src
@@ -115,7 +116,8 @@ class _SatContext:
         self._lo_offset = lo_offset_hz
         self._rotator = rotator        # software LO+Doppler NCO (Phase 1); None ⇒ no retune
         self._sdr_rate = sdr_rate_hz
-        self._recorder = recorder
+        self.recorder = recorder       # public: the app's R-11 first-sample probe reads it
+        self.sdr_applied = dict(sdr_applied or {})  # R-21: what configure/corrections applied
         # Frames come from gr-satellites (``sink``) and/or our own demod (``fallbacks``, one
         # demod for the bird's known mode). With demod params present AND the bird catalogued
         # we run BOTH (each behind a valve), and the FIRST to produce a CRC-valid frame wins:
@@ -441,8 +443,8 @@ def build_satellites_rx(
     src.set_sample_rate(0, sdr_rate)
     open_analog_bandwidth(src, sdr_rate)  # widen analog BW so the +lo_offset carrier survives
     tune_below(src, float(args.center_freq_hz), lo)  # LO to center-lo_offset (plain; no BB CORDIC)
-    configure_soapy_source(src, merge_sdr_params(params))  # antenna + gain (else deaf)
-    apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
+    sdr_applied = configure_soapy_source(src, merge_sdr_params(params))  # antenna+gain (else deaf)
+    sdr_applied.update(apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"]))
     # Front-end plan — the ONE line that says what the RX actually did this pass (so a
     # mis-deployed offset / mis-sized channel is never silent again). lo != 0 now means the
     # SOFTWARE rotator dodges the spike (works on the XTRX, unlike the old hardware BB offset).
@@ -583,6 +585,7 @@ def build_satellites_rx(
         rotator=rotator,
         sdr_rate_hz=sdr_rate,
         fallbacks=fallbacks,
+        sdr_applied=sdr_applied,
     )
 
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import queue
@@ -29,6 +30,14 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 CommandHandler = Callable[[dict[str, object]], Awaitable[None]]
+
+
+class EngineFailure(RuntimeError):
+    """An RX/TX engine could not start or prove its stream flows (R-11).
+
+    Raised by app engines so the pass FAILS CLOSED — the death watch (or the
+    app's own try) turns it into an ``error`` status event and a nonzero exit,
+    instead of a live-looking process that captures nothing."""
 
 
 # ----------------------------------------------------------------------
@@ -259,6 +268,70 @@ async def run_command_loop(
 
 
 # ----------------------------------------------------------------------
+# R-11: first-sample proof + engine death watch
+# ----------------------------------------------------------------------
+
+
+async def await_first_samples(
+    probe: Callable[[], int],
+    *,
+    timeout_s: float,
+    poll_s: float = 0.1,
+) -> bool:
+    """Bounded wait for first-sample proof: poll ``probe`` (a count of
+    samples/bytes seen so far — e.g. the recorder's on-disk cf32 size) until it
+    goes positive. Returns False on timeout — the SDR opened and 'started' but
+    delivered NOTHING, the classic deaf-radio 0-byte-capture failure that must
+    fail the pass at spawn, not at LOS."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        try:
+            n = probe()
+        except Exception:  # noqa: BLE001 — a flaky probe reads as "no proof yet"
+            n = 0
+        if n > 0:
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(poll_s)
+
+
+def watch_engine_death(
+    task: asyncio.Task,
+    status_writer: asyncio.StreamWriter,
+    control_reader: asyncio.StreamReader,
+    stop_requested: asyncio.Event,
+) -> None:
+    """R-11: an engine task that dies mid-pass must FAIL the pass, not linger
+    behind a live command loop that keeps answering the orchestrator. On an
+    unexpected exception (not a clean return, not during a requested stop) this
+    emits an ``error`` status event and feeds EOF to the control reader — the
+    command loop exits on the P0-08 transport-loss path and the process exits
+    nonzero, so the supervisor classifies a real crash."""
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is None or stop_requested.is_set():
+            return
+        log.error("engine task died: %r — failing the pass (R-11)", exc)
+
+        async def _fail() -> None:
+            with contextlib.suppress(Exception):
+                await send_event(
+                    status_writer,
+                    {"event": "error", "code": "engine-died", "detail": repr(exc)},
+                )
+            control_reader.feed_eof()
+
+        t.get_loop().create_task(_fail())
+
+    task.add_done_callback(_on_done)
+
+
+# ----------------------------------------------------------------------
 # Per-pass parameters (Document C C.5.5: PassDirective RfLink
 # waveform_parameters Struct)
 # ----------------------------------------------------------------------
@@ -299,8 +372,10 @@ def load_params(args: argparse.Namespace) -> dict[str, object]:
 
 __all__ = [
     "CommandHandler",
+    "EngineFailure",
     "SpawnSockets",
     "TcpEndpoint",
+    "await_first_samples",
     "build_argparser",
     "connect_spawn_sockets",
     "load_params",
@@ -309,4 +384,5 @@ __all__ = [
     "read_command",
     "run_command_loop",
     "send_event",
+    "watch_engine_death",
 ]

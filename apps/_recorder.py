@@ -328,7 +328,7 @@ class StreamRecorder:
     pass by iq_views (run by gs-client), so nothing is generated in-pass but the cf32."""
 
     def __init__(self, iq_path: Path, center_hz: float, sample_rate_hz: float) -> None:
-        self._iq_path = iq_path
+        self.iq_path = iq_path
         self._fh = iq_path.open("wb")
         write_cf32_sidecar(iq_path, sample_rate_hz=sample_rate_hz, center_hz=center_hz)
 
@@ -353,10 +353,31 @@ class StreamRecorder:
             self._fh.close()
 
 
+def first_sample_probe(recorder) -> object:  # type: ignore[no-untyped-def]
+    """R-11: a first-sample-proof probe off a recorder's on-disk cf32 size (the
+    sinks are unbuffered, so bytes hit disk as soon as the SDR delivers). Works
+    for both :class:`PassRecorder` (GR native file sink) and
+    :class:`StreamRecorder` (dsp path). Returns a ``() -> int`` callable, or
+    ``None`` when recording is off — the caller then reports first-sample proof
+    as unavailable instead of fabricating one."""
+    iq_path = getattr(recorder, "iq_path", None)
+    if iq_path is None:
+        return None
+
+    def _probe() -> int:
+        try:
+            return iq_path.stat().st_size
+        except OSError:
+            return 0
+
+    return _probe
+
+
 __all__ = [
     "PassRecorder",
     "StreamRecorder",
     "finalize_recording",
+    "first_sample_probe",
     "iq_to_sdf_bytes",
     "make_sdf_sink",
     "parse_formats",

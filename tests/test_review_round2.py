@@ -152,7 +152,7 @@ def _drive_engine(monkeypatch, wrapper, chunks, *, pause_s: float) -> tuple[list
     monkeypatch.setattr(rxapp.endurosat_link, "StreamDecoder", wrapped)
     monkeypatch.setattr(rxapp, "_DECODE_PERIOD_S", 0.05)
 
-    def fake_source(args, params=None):
+    def fake_source(args, params=None, report=None):
         for c in chunks:
             yield c
             time.sleep(pause_s)

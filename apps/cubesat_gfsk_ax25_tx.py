@@ -29,7 +29,14 @@ from pathlib import Path
 
 import numpy as np
 from _fallback_select import symbol_rate_hz_of
-from _soapy import apply_corrections, configure_soapy_source, merge_sdr_params, sdr_env
+from _soapy import (
+    apply_corrections,
+    configure_soapy_source,
+    merge_sdr_params,
+    readback_soapy_settings,
+    sdr_env,
+    sdr_ready_fields,
+)
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
@@ -164,6 +171,60 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
     return applied
 
 
+def _probe_tx_device(args, params) -> dict:  # pragma: no cover (needs SoapySDR)
+    """R-11 explicit TX readiness: prove the configured TX device OPENS and
+    takes the front-end settings BEFORE reporting ready — fail closed at spawn,
+    not at KEYED_READY with the PA energized. Opens, configures, reads back,
+    closes; no stream is set up, nothing radiates (and the PA is off — keying
+    is the orchestrator's safety FSM, never this app). Assumes this app owns
+    the device at spawn, the same assumption ``_soapy_sink`` makes at transmit."""
+    import SoapySDR
+    from SoapySDR import SOAPY_SDR_TX
+
+    dev = SoapySDR.Device(args.sdr_args)
+    try:
+        sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
+        dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
+        dev.setFrequency(SOAPY_SDR_TX, 0, float(args.center_freq_hz))
+        applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, sample_rate)
+        actual = readback_soapy_settings(dev, channel=0, direction=SOAPY_SDR_TX)
+        return {"applied": applied, "actual": actual}
+    finally:
+        with contextlib.suppress(Exception):  # release before the transmit-time reopen
+            SoapySDR.Device.unmake(dev)
+
+
+def _tx_spawn_probe(args, params) -> tuple[bool, dict[str, object]]:
+    """Resolve the app's TX readiness condition at spawn. Non-hardware sinks
+    (``file:`` bench mode / empty args) skip the device probe — recorded as
+    such, never implied verified. Returns ``(ready_ok, ready_fields)``."""
+    sdr_args = str(args.sdr_args or "")
+    if not sdr_args or sdr_args.startswith("file:"):
+        fields = sdr_ready_fields(
+            device=sdr_args or "none", requested=None, applied=None, actual=None,
+            stream_active=False, first_samples=None,
+        )
+        fields["tx_ready"] = "non-hardware-sink"
+        return True, fields
+    try:
+        report = _probe_tx_device(args, params)
+    except Exception as e:  # noqa: BLE001 — unopenable hardware fails closed
+        logging.getLogger("cubesat_gfsk_ax25_tx").exception(
+            "TX device probe failed for %r", sdr_args
+        )
+        return False, {"code": "tx-device-probe-failed", "detail": repr(e)}
+    fields = sdr_ready_fields(
+        device=sdr_args,
+        requested=merge_sdr_params(params),
+        applied=report.get("applied"),  # type: ignore[arg-type]
+        actual=report.get("actual"),  # type: ignore[arg-type]
+        stream_active=False,  # TX opens its stream per burst; ready proves the DEVICE
+        first_samples=None,
+    )
+    fields["tx_ready"] = "device-verified"
+    return True, fields
+
+
 def _soapy_sink(args, iq: np.ndarray, params=None, on_first_accept=None):  # pragma: no cover
     """P0-07: uses the shared bounded TX transport (apps/_soapy_tx.py) — MTU
     chunking, bounded zero/timeout/error handling, END_BURST on the final data
@@ -219,6 +280,15 @@ async def amain(args) -> int:
     sockets = await connect_spawn_sockets(args)
     stop_requested = asyncio.Event()
 
+    # R-11: explicit TX readiness — a hardware sink is probed (open + configure
+    # + readback, nothing radiates) BEFORE ready; configured-but-unopenable
+    # hardware fails closed at spawn, not at KEYED_READY with the PA energized.
+    tx_ok, tx_fields = await asyncio.to_thread(_tx_spawn_probe, args, params)
+    if not tx_ok:
+        await send_event(sockets.status_writer, {"event": "error", **tx_fields})
+        await sockets.aclose()
+        return 1
+
     await send_event(
         sockets.status_writer,
         {
@@ -226,6 +296,7 @@ async def amain(args) -> int:
             "data_format": "none",
             "engine": engine,
             "flowgraph_version": VERSION,
+            **tx_fields,
         },
     )
 

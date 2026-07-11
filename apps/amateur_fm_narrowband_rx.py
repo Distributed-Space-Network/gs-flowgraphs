@@ -52,6 +52,7 @@ import sys
 import time
 
 from _spawn_contract import (
+    await_first_samples,
     build_argparser,
     connect_spawn_sockets,
     load_params,
@@ -59,7 +60,7 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
-from _recorder import PassRecorder
+from _recorder import PassRecorder, first_sample_probe
 from _soapy import (
     apply_corrections,
     auto_lo_offset,
@@ -68,8 +69,10 @@ from _soapy import (
     make_decimator,
     make_source,
     merge_sdr_params,
+    readback_soapy_settings,
     retune_source,
     sdr_env,
+    sdr_ready_fields,
     tune_source,
 )
 from gnuradio import analog, filter as gr_filter, gr, soapy
@@ -85,6 +88,9 @@ _SIGNAL_PERIOD_S = 0.1
 _AUDIO_RATE_HZ = 48_000
 _IF_RATE_HZ = 192_000  # 4× audio for clean LPF + quad-demod headroom
 _CHANNEL_BW_HZ = 25_000
+# R-11: how long the started stream gets to deliver its FIRST samples before
+# the pass fails closed (supervisor ready timeout is 30 s).
+_FIRST_SAMPLE_TIMEOUT_S = 15.0
 
 # Queue depth: enough for ~50 ms of audio at 48 kHz mono float32
 # (50 ms × 48k × 4 B = 9.6 KB per chunk; ~10 chunks keeps lag <0.5 s).
@@ -131,11 +137,13 @@ class FlowgraphContext:
         src: object,
         recorder: object = None,
         lo_offset_hz: float = 0.0,
+        sdr_applied: dict | None = None,
     ) -> None:
         self.tb = tb
         self.src = src
         self.recorder = recorder  # pre-demod IQ capture (PassRecorder) or None
         self.lo_offset_hz = lo_offset_hz  # LO offset the Doppler retune must preserve
+        self.sdr_applied = dict(sdr_applied or {})  # R-21: what configure/corrections applied
 
 
 def _retune_locked(
@@ -195,8 +203,8 @@ def build_top_block(
     tune_source(src, float(args.center_freq_hz), lo_offset_hz)  # LO offset → DC spike off-signal
     # antenna + gain (else the front-end is on a disconnected antenna / 0 dB).
     # Precedence: per-pass sdr_gain_db param > GS_SDR_GAIN_DB env > 30 dB default.
-    configure_soapy_source(src, merge_sdr_params(p))
-    apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"])
+    sdr_applied = configure_soapy_source(src, merge_sdr_params(p))
+    sdr_applied.update(apply_corrections(src, ppm=env["ppm"], dc_removal=env["dc_removal"]))
     # Analog RX filter ≈ the SDR CAPTURE rate, NOT the channel width. The XTRX's filter
     # floor is ~0.8 MHz, so setting it to the narrow channel BW (e.g. --bandwidth-hz
     # 25000) lands below the floor and breaks the analog path → 0 samples → 0-byte
@@ -257,7 +265,9 @@ def build_top_block(
 
     # Pre-demod IQ capture at the CHANNEL rate (the decimator output), not wideband.
     recorder = PassRecorder.maybe_start(args, tb, chan_src, sample_rate_hz=float(args.sample_rate))
-    return FlowgraphContext(tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz)
+    return FlowgraphContext(
+        tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz, sdr_applied=sdr_applied
+    )
 
 
 # ----------------------------------------------------------------------
@@ -287,6 +297,43 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         name="data-pump",
     )
 
+    started = asyncio.Event()
+    stop_requested = asyncio.Event()
+
+    # RX: start the flowgraph at spawn (arm — before AOS) so the SDR is warm + recording
+    # before AOS. Do NOT gate streaming on cmd:start (that's for TX keying); cmd:start
+    # still confirms via the 'started' status event and cmd:stop ends the pass.
+    # R-11: the start happens BEFORE 'ready' — ready means an ACTIVE stream with
+    # first-sample proof (recorder cf32 growth), not process startup. A source
+    # that cannot start or stays silent fails the pass here, fail-closed.
+    try:
+        tb.start()
+    except Exception as e:
+        log.exception("flowgraph failed to start")
+        await send_event(
+            sockets.status_writer,
+            {"event": "error", "code": "engine-start-failed", "detail": repr(e)},
+        )
+        return 1
+    started.set()
+    probe = first_sample_probe(ctx.recorder)
+    first: bool | None = None
+    if probe is not None:
+        first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)
+        if not first:
+            log.error("SDR stream active but delivered no samples — failing closed (R-11)")
+            await send_event(
+                sockets.status_writer,
+                {
+                    "event": "error",
+                    "code": "engine-no-samples",
+                    "detail": f"no samples within {_FIRST_SAMPLE_TIMEOUT_S:.0f}s",
+                },
+            )
+            tb.stop()
+            tb.wait()
+            return 1
+
     await send_event(
         sockets.status_writer,
         {
@@ -294,17 +341,16 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
             "data_format": "audio_pcm_f32_48k",
             "sample_rate": _AUDIO_RATE_HZ,
             "flowgraph_version": VERSION,
+            **sdr_ready_fields(
+                device=str(args.sdr_args or ""),
+                requested=merge_sdr_params(params),
+                applied=ctx.sdr_applied,
+                actual=readback_soapy_settings(src),
+                stream_active=True,
+                first_samples=first,
+            ),
         },
     )
-
-    started = asyncio.Event()
-    stop_requested = asyncio.Event()
-
-    # RX: start the flowgraph at spawn (arm — before AOS) so the SDR is warm + recording
-    # before AOS. Do NOT gate streaming on cmd:start (that's for TX keying); cmd:start
-    # still confirms via the 'started' status event and cmd:stop ends the pass.
-    tb.start()
-    started.set()
 
     async def _on_start(_cmd: dict[str, object]) -> None:
         # Already streaming since spawn; just confirm to the orchestrator.

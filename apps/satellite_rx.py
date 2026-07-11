@@ -30,17 +30,25 @@ import time
 from pathlib import Path
 
 from _doppler import NullDopplerSource, make_doppler_source, run_doppler_poll
+from _recorder import first_sample_probe
+from _soapy import merge_sdr_params, readback_soapy_settings, sdr_ready_fields
 from _spawn_contract import (
+    await_first_samples,
     build_argparser,
     connect_spawn_sockets,
     load_params,
     run_command_loop,
     send_event,
+    watch_engine_death,
 )
 
 VERSION = "0.1.0"
 _DECODE_PERIOD_S = 2.0
 _DEFAULT_SAMPLE_RATE = 2_000_000
+# R-11: how long the started stream gets to deliver its FIRST samples before
+# the pass fails closed (supervisor ready timeout is 30 s; leave room for the
+# gr-soapy open itself).
+_FIRST_SAMPLE_TIMEOUT_S = 15.0
 
 
 def _append_frame_record(output_dir: str | None, frame: bytes, decoder: str) -> None:
@@ -109,6 +117,65 @@ async def amain(args) -> int:
     doppler_poll = not isinstance(doppler_source, NullDopplerSource)
     poll_period_s = 1.0 / max(1.0, float(getattr(args, "doppler_poll_hz", 25.0) or 25.0))
 
+    if not satellite:
+        # R-11 fail-closed: a multi-mission RX with no target is a config
+        # error — reporting ready would fake a live pass that captures nothing.
+        log.error("no 'satellite' selected (params 'satellite' / --satellite); failing closed")
+        await send_event(
+            sockets.status_writer,
+            {"event": "error", "code": "no-satellite", "detail": "no satellite selected"},
+        )
+        return 1
+
+    # R-11: build + START the engine BEFORE declaring ready — 'ready' means the
+    # SDR opened, the settings applied, the stream is ACTIVE and samples flow.
+    # A build/open failure fails the pass here (error event + nonzero exit)
+    # instead of being swallowed behind a live-looking command loop.
+    try:
+        # Import INSIDE the try: a missing dependency (e.g. an un-deployed helper
+        # module) must surface as a failed pass, not a silent journal line —
+        # which once left a dead pass with no capture and no error.
+        from gnuradio_satellites import build_satellites_rx
+
+        # Pre-demod IQ capture is wired inside build_satellites_rx (PassRecorder taps
+        # the SDR source; ctx.stop() finalizes) — uniform with the other RX engines.
+        ctx = build_satellites_rx(args, satellite, sample_rate, params)
+        # RX: start streaming + recording at spawn (arm — before AOS) so the
+        # front-end is warm and the whole window is captured. Do NOT gate on
+        # cmd:start (that's for TX keying); cmd:start still fires the 'started'
+        # status event and cmd:stop ends the pass.
+        ctx.start()
+    except Exception as e:
+        log.exception("gr-satellites: engine failed to start (satellite=%s)", satellite)
+        with contextlib.suppress(Exception):
+            await send_event(
+                sockets.status_writer,
+                {"event": "error", "code": "engine-start-failed", "detail": repr(e)},
+            )
+        return 1
+    # First-sample proof off the recorder's unbuffered cf32 (grows the moment
+    # the SDR delivers). No recorder → proof unavailable, reported as such.
+    probe = first_sample_probe(getattr(ctx, "recorder", None))
+    first: bool | None = None
+    if probe is not None:
+        first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)
+        if not first:
+            log.error("SDR stream active but delivered no samples — failing closed (R-11)")
+            with contextlib.suppress(Exception):
+                await send_event(
+                    sockets.status_writer,
+                    {
+                        "event": "error",
+                        "code": "engine-no-samples",
+                        "detail": f"no samples within {_FIRST_SAMPLE_TIMEOUT_S:.0f}s",
+                    },
+                )
+            with contextlib.suppress(Exception):
+                ctx.stop()
+            return 1
+    decoder = "gr-satellites" if ctx.framing == "grsatellites" else "fallback"
+    out_dir = getattr(args, "output_dir", None)
+
     await send_event(
         sockets.status_writer,
         {
@@ -119,9 +186,17 @@ async def amain(args) -> int:
             # socket; its frames product ships via the gr-satellites path.
             "data_format": "frames_jsonl",
             "engine": "gnuradio",
-            "decoder": "gr-satellites",
+            "decoder": decoder,
             "satellite": satellite,
             "flowgraph_version": VERSION,
+            **sdr_ready_fields(
+                device=str(args.sdr_args or ""),
+                requested=merge_sdr_params(params),
+                applied=getattr(ctx, "sdr_applied", None),
+                actual=readback_soapy_settings(ctx.src),
+                stream_active=True,
+                first_samples=first,
+            ),
         },
     )
 
@@ -144,36 +219,13 @@ async def amain(args) -> int:
             doppler["hz"] = float(off)
 
     async def _engine() -> None:  # pragma: no cover (bench)
-        if not satellite:
-            log.error("no 'satellite' selected (params 'satellite' / --satellite); nothing to do")
-            return
-        try:
-            # Import INSIDE the try: a missing dependency (e.g. an un-deployed helper
-            # module) must surface in the journal, not get swallowed by the outer gather()
-            # — which once left a dead pass with no capture and no error.
-            from gnuradio_satellites import build_satellites_rx
-
-            # Pre-demod IQ capture is wired inside build_satellites_rx (PassRecorder taps
-            # the SDR source; ctx.stop() finalizes) — uniform with the other RX engines.
-            ctx = build_satellites_rx(args, satellite, sample_rate, params)
-            # RX: start streaming + recording at spawn (arm — before AOS) so the
-            # front-end is warm and the whole window is captured. Do NOT gate on
-            # cmd:start (that's for TX keying); cmd:start still fires the 'started'
-            # status event and cmd:stop ends the pass.
-            ctx.start()
-            decoder = "gr-satellites" if ctx.framing == "grsatellites" else "fallback"
-            out_dir = getattr(args, "output_dir", None)
-            log.info(
-                "satellite_rx: flowgraph started (sat=%s, decoder=%s); streaming+recording",
-                satellite,
-                decoder,
-            )
-        except Exception:
-            # Build/start failures used to be swallowed by the outer gather() — log
-            # them so a bad gr-satellites build / SDR error is visible at teardown.
-            log.exception("gr-satellites: engine failed to start (satellite=%s)", satellite)
-            stop_requested.set()
-            return
+        # The engine context was built + started (and its stream proven) BEFORE
+        # the ready event above (R-11); this task only runs the pass loop.
+        log.info(
+            "satellite_rx: flowgraph started (sat=%s, decoder=%s); streaming+recording",
+            satellite,
+            decoder,
+        )
         last_doppler = 0.0
         # Flowgraph OWNS Doppler: poll the source and drive ctx.set_doppler at the poll rate,
         # decoupled from the control socket. Runs until stop_requested; a source outage just keeps
@@ -215,6 +267,9 @@ async def amain(args) -> int:
             ctx.wait()
 
     engine_task = asyncio.create_task(_engine(), name="gr-satellites")
+    # R-11: an engine loop that dies mid-pass fails the pass (error event +
+    # nonzero exit), never idles behind a live command loop.
+    watch_engine_death(engine_task, sockets.status_writer, sockets.control_reader, stop_requested)
     handlers = {"start": _on_start, "stop": _on_stop, "set_doppler": _on_set_doppler}
 
     async def _shutdown_engine() -> None:

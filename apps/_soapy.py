@@ -369,14 +369,104 @@ def retune_source(
 
 def apply_corrections(
     src: Any, *, ppm: float = 0.0, dc_removal: bool = False, channel: int = 0
-) -> None:
-    """Best-effort ppm + DC-removal on a gr-soapy endpoint (drivers vary; never raises)."""
+) -> dict[str, Any]:
+    """Best-effort ppm + DC-removal on a gr-soapy endpoint (drivers vary; never
+    raises). R-21: returns a report of what actually applied — a correction the
+    driver refused is WARNED and recorded (``ppm_error``/``dc_removal_error``),
+    never silently dropped: an unapplied ppm on a warm XTRX is hundreds of Hz of
+    unexplained carrier offset."""
+    report: dict[str, Any] = {}
     if ppm:
-        with contextlib.suppress(Exception):
+        try:
             src.set_frequency_correction(channel, float(ppm))
+            report["ppm"] = float(ppm)
+        except Exception as e:  # noqa: BLE001 — driver-dependent; report, don't raise
+            report["ppm_error"] = repr(e)
+            _log.warning("ppm correction %.2f NOT applied: %s", ppm, e)
     if dc_removal:
-        with contextlib.suppress(Exception):
+        try:
             src.set_dc_offset_mode(channel, True)
+            report["dc_removal"] = True
+        except Exception as e:  # noqa: BLE001 — driver-dependent; report, don't raise
+            report["dc_removal_error"] = repr(e)
+            _log.warning("DC-offset removal NOT applied: %s", e)
+    return report
+
+
+# R-21 readback: key → candidate getter names. snake_case = gr-soapy block
+# surface, takes (channel); camelCase = native ``SoapySDR.Device``, takes
+# (direction, channel) — callers with a native device pass ``direction``.
+_READBACK_GETTERS: dict[str, tuple[str, ...]] = {
+    "antenna": ("get_antenna", "getAntenna"),
+    "gain_db": ("get_gain", "getGain"),
+    "agc": ("get_gain_mode", "getGainMode"),
+    "sample_rate_hz": ("get_sample_rate", "getSampleRate"),
+    "bandwidth_hz": ("get_bandwidth", "getBandwidth"),
+    "frequency_hz": ("get_frequency", "getFrequency"),
+    "ppm": ("get_frequency_correction", "getFrequencyCorrection"),
+    "dc_removal": ("get_dc_offset_mode", "getDCOffsetMode"),
+}
+
+
+def readback_soapy_settings(
+    endpoint: Any, *, channel: int = 0, direction: object = None
+) -> dict[str, Any]:
+    """R-21: the ACTUAL front-end state read back from the device — what the
+    hardware settled on, not what we asked for. Works on both surfaces: a
+    gr-soapy block (snake_case getters, per-channel) and a native
+    ``SoapySDR.Device`` (camelCase getters, pass ``direction``). Each key is
+    individually guarded; keys the driver/binding cannot read back are listed
+    under ``"unreadable"`` so the report says so explicitly instead of looking
+    complete."""
+    actual: dict[str, Any] = {}
+    unreadable: list[str] = []
+    for key, names in _READBACK_GETTERS.items():
+        got = False
+        for name in names:
+            fn = getattr(endpoint, name, None)
+            if fn is None:
+                continue
+            native = name[3:4].isupper()  # getAntenna vs get_antenna
+            if native and direction is None:
+                continue  # native getters need the direction constant
+            try:
+                value = fn(direction, channel) if native else fn(channel)
+            except Exception:  # noqa: BLE001 — getter exists but driver refuses
+                continue
+            actual[key] = value
+            got = True
+            break
+        if not got:
+            unreadable.append(key)
+    if unreadable:
+        actual["unreadable"] = unreadable
+    return actual
+
+
+def sdr_ready_fields(
+    *,
+    device: str,
+    requested: dict[str, Any] | None,
+    applied: dict[str, Any] | None,
+    actual: dict[str, Any] | None,
+    stream_active: bool,
+    first_samples: bool | None,
+) -> dict[str, Any]:
+    """R-11/R-21: the ``ready`` event block proving the front-end works —
+    device identity, requested vs applied vs read-back settings, an ACTIVE
+    stream, and first-sample proof. ``first_samples`` is ``None`` when no
+    probe is available (recorded as such — absence of proof is stated, not
+    implied)."""
+    return {
+        "sdr": {
+            "device": device,
+            "requested": dict(requested or {}),
+            "applied": dict(applied or {}),
+            "actual": dict(actual or {}),
+        },
+        "stream_active": bool(stream_active),
+        "first_samples": first_samples,
+    }
 
 
 __all__ = [
@@ -392,9 +482,11 @@ __all__ = [
     "make_source",
     "merge_sdr_params",
     "open_analog_bandwidth",
+    "readback_soapy_settings",
     "resample_ratio",
     "retune_source",
     "sdr_env",
+    "sdr_ready_fields",
     "tune_below",
     "tune_source",
 ]
