@@ -222,13 +222,18 @@ async def connect_spawn_sockets(args: argparse.Namespace) -> SpawnSockets:
 # ----------------------------------------------------------------------
 
 
+# Exit reason when a command handler raised: the app must exit NONZERO on this, so the
+# supervisor sees a crash rather than a clean stop (audit).
+_HANDLER_FAILED = "handler-failed"
+
+
 async def run_command_loop(
     reader: asyncio.StreamReader,
     handlers: dict[str, CommandHandler],
+    status_writer: asyncio.StreamWriter,
     *,
     on_unknown: CommandHandler | None = None,
     terminal_cmds: frozenset[str] = frozenset({"stop"}),
-    status_writer: asyncio.StreamWriter | None = None,
 ) -> str:
     """Dispatch loop. Each command's ``cmd`` field selects a handler in
     ``handlers``; unknown ``cmd`` values fall through to ``on_unknown`` (or are
@@ -263,23 +268,31 @@ async def run_command_loop(
         try:
             await handler(cmd)
         except Exception as e:
-            # Audit round 2 (silent-success class): this used to log and KEEP GOING,
-            # with no error event and no effect on the exit code. The TX apps do all
-            # of their transmitting inside these handlers — so a `transmit` that blew
-            # up was invisible to gs-client, and the pass completed as if it had
-            # radiated. An engine that cannot execute a command must SAY so.
+            # Audit: this used to log and KEEP DISPATCHING, with no error event and no
+            # effect on the exit code. The TX apps do ALL of their transmitting inside
+            # these handlers, so a `transmit` that blew up was invisible to gs-client and
+            # the pass completed as if it had radiated. The first fix made the error event
+            # OPTIONAL (status_writer defaulted to None) and no app passed one — so it
+            # stayed silent. It is REQUIRED now, and a failed handler ENDS the loop:
+            # the app exits nonzero, the supervisor classifies a real crash, the pass
+            # fails. An engine that cannot execute a command must not keep answering.
             log.exception("control: handler for cmd=%r raised", name)
-            if status_writer is not None:
-                with contextlib.suppress(Exception):
-                    await send_event(
-                        status_writer,
-                        {
-                            "event": "error",
-                            "code": "handler-failed",
-                            "cmd": name,
-                            "detail": repr(e),
-                        },
-                    )
+            with contextlib.suppress(Exception):
+                await send_event(
+                    status_writer,
+                    {
+                        "event": "error",
+                        "code": "handler-failed",
+                        "cmd": name,
+                        "detail": repr(e),
+                    },
+                )
+            if name not in terminal_cmds:
+                # A NON-terminal handler (start, transmit_*) failed: the engine could not
+                # do what it was told. End dispatch and let the app exit nonzero so the
+                # supervisor sees a crash. A raising STOP handler keeps the P0-08
+                # semantics below — dispatch ends and the caller's cleanup owns the rest.
+                return _HANDLER_FAILED
         if name in terminal_cmds:
             # Even a raising stop handler ends dispatch — the caller's cleanup
             # path owns the rest (P0-08).

@@ -243,10 +243,19 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
                 log.exception("tb.stop/wait raised")
 
     try:
-        reason = await run_command_loop(sockets.control_reader, handlers)
+        reason = await run_command_loop(sockets.control_reader, handlers, sockets.status_writer)
         # P0-08: engine teardown BEFORE the explicit stopped ack; then exit 0.
         # EOF is transport loss — no ack, exit nonzero.
         await _shutdown_engine()
+        if reason == "handler-failed":
+            # A command handler raised. The app must NOT return 0: gs-client's supervisor
+            # classifies a clean exit as a normal stop, and the pass would complete as if
+            # the command had been executed (audit — the TX apps transmit inside handlers).
+            _log_handler_failure = logging.getLogger(__name__)
+            _log_handler_failure.error(
+                "a control-command handler failed — exiting nonzero so the pass fails"
+            )
+            return 1
         if reason == "stop":
             await send_event(
                 sockets.status_writer,

@@ -186,7 +186,9 @@ def test_watch_engine_death_emits_error_and_feeds_eof() -> None:
         watch_engine_death(task, writer, reader, stop_requested)  # type: ignore[arg-type]
         # The command loop must exit on the transport-loss path ("eof"), which
         # the app turns into a nonzero exit (P0-08) — the pass FAILS.
-        reason = await asyncio.wait_for(run_command_loop(reader, {}), timeout=5.0)
+        reason = await asyncio.wait_for(
+            run_command_loop(reader, {}, writer), timeout=5.0  # type: ignore[arg-type]
+        )
         events = [
             json.loads(line)
             for line in writer.buf.decode().splitlines()

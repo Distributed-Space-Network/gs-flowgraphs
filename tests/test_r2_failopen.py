@@ -4,10 +4,11 @@ R2-02 (a recorder-only pass reporting a clean decode) was one instance of a patt
 engine could not do the job it was asked to do, degraded silently, and the pass still
 reported success.** An adversarial sweep found the rest of the family in this repo.
 
-GNU Radio is not importable off-bench, so the *logic* lives in pure helpers that ARE
-testable, and the wiring is pinned at the source level. Where a fix is purely structural
-(the bidir reader re-raising, the TX app reporting a real BurstResult), the source pin is
-the honest limit of what a dev box can prove — those are re-verified at Gate 5/6.
+GNU Radio is not importable off-bench, so the *logic* lives in pure helpers and the app
+coroutines are driven directly with stubs. Source-text assertions are used ONLY to pin that
+a deleted code path has not come back — never as evidence that a behaviour works. (An
+earlier version of this file did exactly that, and passed implementations that did nothing:
+see tests/test_r2_engine_death.py and tests/test_r2_tx_safety.py, which replace them.)
 """
 
 from __future__ import annotations
@@ -62,39 +63,90 @@ class TestTheEngineWiresTheDeframerCheck:
         assert "deframer_available=deframer_available" in src
 
 
-class TestTheTxAppReportsWhatItActuallyDid:
-    """`transmit_complete outcome="complete", samples=0` was HARDCODED in the gnuradio TX
-    branch — a fabricated success, directly beneath the comment forbidding exactly that."""
-
-    def test_tx_app_no_longer_hardcodes_a_zero_sample_success(self) -> None:
-        src = (_APPS / "cubesat_gfsk_ax25_tx.py").read_text(encoding="utf-8")
-        assert '{"event": "transmit_complete", "samples": 0, "outcome": "complete"}' not in src
-        assert '"code": "tx-engine-failed"' in src, "an engine that raises must say so"
-        assert 'getattr(burst, "accepted", 0)' in src, "report the ACCEPTED sample count"
-
-    def test_the_gnuradio_engine_returns_a_burst_result(self) -> None:
-        src = (_APPS / "gnuradio_gfsk.py").read_text(encoding="utf-8")
-        assert "BurstResult(" in src
-        assert "outcome=\"complete\" if total > 0 else \"error\"" in src
-
-
 class TestAnEngineThatCannotRunACommandSaysSo:
-    def test_command_loop_emits_an_error_event_on_a_raising_handler(self) -> None:
-        """The TX apps do ALL of their transmitting inside these handlers. A `transmit`
-        that blew up was logged and then ignored — dispatch continued, the exit code was
-        unaffected, and gs-client saw a pass that completed as if it had radiated."""
-        src = (_APPS / "_spawn_contract.py").read_text(encoding="utf-8")
-        assert '"code": "handler-failed"' in src
-        assert "status_writer: asyncio.StreamWriter | None = None" in src
+    """The TX apps do ALL of their transmitting inside these handlers. A `transmit` that
+    blew up was logged and then IGNORED — dispatch continued, the exit code was unaffected,
+    and gs-client saw a pass that completed as if it had radiated.
+
+    (These replace source-text greps. The first fix made the error event OPTIONAL and no
+    app passed a writer, so it stayed silent — and my grep-test passed anyway. Behaviour
+    is the only thing worth asserting.)"""
+
+    @staticmethod
+    def _drive(handlers: dict, *cmds: dict) -> tuple[str, list[dict]]:
+        import asyncio
+        import json
+
+        from _spawn_contract import run_command_loop
+
+        NL = b"\n"
+
+        class _W:
+            def __init__(self) -> None:
+                self.buf = b""
+
+            def write(self, data: bytes) -> None:
+                self.buf += data
+
+            async def drain(self) -> None:
+                return None
+
+        async def _run() -> tuple[str, list[dict]]:
+            reader = asyncio.StreamReader()
+            for c in cmds:
+                reader.feed_data(json.dumps(c).encode() + NL)
+            reader.feed_eof()
+            w = _W()
+            reason = await run_command_loop(reader, handlers, w)  # type: ignore[arg-type]
+            events = [
+                json.loads(ln) for ln in w.buf.decode().splitlines() if ln.strip()
+            ]
+            return reason, events
+
+        return asyncio.run(_run())
+
+    def test_a_failed_transmit_emits_an_error_and_ends_dispatch(self) -> None:
+        seen: list[str] = []
+
+        async def boom(_cmd: dict) -> None:
+            raise RuntimeError("SDR write failed")
+
+        async def later(_cmd: dict) -> None:
+            seen.append("later")
+
+        reason, events = self._drive(
+            {"start": boom, "stop": later},
+            {"cmd": "start"},          # raises
+            {"cmd": "stop"},           # must NOT be dispatched — the engine is broken
+        )
+        assert reason == "handler-failed", "the app must exit nonzero, not report a clean stop"
+        assert seen == [], "dispatch continued past a failed handler"
+        err = [e for e in events if e.get("event") == "error"]
+        assert err and err[0]["code"] == "handler-failed"
+        assert err[0]["cmd"] == "start"
+
+    def test_a_raising_stop_handler_still_ends_dispatch_cleanly(self) -> None:
+        """P0-08 must survive: a teardown that throws still ends dispatch as a STOP —
+        the caller's cleanup path owns the rest."""
+        async def boom(_cmd: dict) -> None:
+            raise RuntimeError("teardown died")
+
+        reason, events = self._drive({"stop": boom}, {"cmd": "stop"})
+        assert reason == "stop"
+        assert any(e.get("event") == "error" for e in events), "still reported, just not fatal"
+
+    def test_a_healthy_pass_reports_a_clean_stop(self) -> None:
+        async def ok(_cmd: dict) -> None:
+            return None
+
+        reason, events = self._drive({"start": ok, "stop": ok}, {"cmd": "start"}, {"cmd": "stop"})
+        assert reason == "stop"
+        assert not [e for e in events if e.get("event") == "error"]
 
 
-class TestTheBidirEngineDoesNotSwallowItsOwnDeath:
-    def test_reader_failure_is_captured_not_laundered_into_a_clean_eof(self) -> None:
-        """The reader used to push the SAME `None` terminator a clean EOF uses, so a dead
-        SDR ended the pass NORMALLY: zero frames, no error event, a completed pass."""
-        src = (_APPS / "cubesat_gfsk_endurosat_bidir.py").read_text(encoding="utf-8")
-        assert "reader_error: list[BaseException] = []" in src
-        assert "reader_error.append(e)" in src
+# The bidir engine's death is covered by tests/test_r2_engine_death.py, which DRIVES
+# run_rx with a dying IQ source. The grep-test that used to live here asserted the string
+# "reader_error.append(e)" was present — and passed an implementation that never raised.
 
 
 class TestTheRecorderDoesNotInventArtifacts:

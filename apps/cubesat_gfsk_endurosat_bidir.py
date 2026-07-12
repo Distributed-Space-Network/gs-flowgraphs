@@ -43,12 +43,14 @@ from _fallback_select import symbol_rate_hz_of
 from _recorder import StreamRecorder
 from _soapy_tx import BurstResult
 from _spawn_contract import (
+    EngineFailure,
     build_argparser,
     connect_spawn_sockets,
     frame_received_event,
     load_params,
     run_command_loop,
     send_event,
+    watch_engine_death,
 )
 from _stream import (
     StreamingDecimator,
@@ -485,6 +487,17 @@ async def run_rx(
             leftovers = []
         for body in leftovers:
             await emit_frame(sockets, body)
+    # The reader's death must NOT look like a clean EOF. It used to: the except logged and
+    # the finally pushed the SAME `None` terminator an exhausted stream uses, so run_rx
+    # returned normally after the SDR failed and the pass completed with zero frames — a
+    # dead radio was indistinguishable from a quiet sky. Capturing the exception was not
+    # enough (audit): it has to be RAISED, after the queue has drained so nothing already
+    # received is lost.
+    if reader_error:
+        raise EngineFailure(
+            f"bidir RX: the IQ source DIED mid-pass — {reader_error[0]!r}. Frames received "
+            f"before the failure were emitted; the rest of the pass captured NOTHING."
+        ) from reader_error[0]
 
 
 def _uplink_payload_from_cmd(cmd: dict[str, object], args, params: dict[str, object]) -> bytes:
@@ -766,6 +779,10 @@ async def amain(args) -> int:
         run_rx(args, sockets, params, io, stop_requested=stop_requested, doppler=doppler, tx=tx),
         name="bidir-rx",
     )
+    # R-11 / audit: a dead RX engine must FAIL the pass, not linger behind a live command
+    # loop that keeps cheerfully answering the orchestrator. This app was the ONE engine
+    # that never wired the watcher, which is why a dead SDR still looked like a clean stop.
+    watch_engine_death(rx_task, sockets.status_writer, sockets.control_reader, stop_requested)
     handlers = {
         "start": _on_start,
         "stop": _on_stop,
@@ -781,10 +798,19 @@ async def amain(args) -> int:
             io.close()
 
     try:
-        reason = await run_command_loop(sockets.control_reader, handlers)
+        reason = await run_command_loop(sockets.control_reader, handlers, sockets.status_writer)
         # P0-08: engine teardown BEFORE the explicit stopped ack; then exit 0.
         # EOF is transport loss — no ack, exit nonzero.
         await _shutdown_engine()
+        if reason == "handler-failed":
+            # A command handler raised. The app must NOT return 0: gs-client's supervisor
+            # classifies a clean exit as a normal stop, and the pass would complete as if
+            # the command had been executed (audit — the TX apps transmit inside handlers).
+            _log_handler_failure = logging.getLogger(__name__)
+            _log_handler_failure.error(
+                "a control-command handler failed — exiting nonzero so the pass fails"
+            )
+            return 1
         if reason == "stop":
             await send_event(
                 sockets.status_writer,

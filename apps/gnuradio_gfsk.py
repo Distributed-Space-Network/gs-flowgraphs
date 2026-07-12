@@ -34,10 +34,8 @@ from _soapy import (
     lo_phase_inc,
     make_decimator,
     make_lo_rotator,
-    make_sink,
     make_source,
     merge_sdr_params,
-    merge_sdr_params_tx,
     open_analog_bandwidth,
     sdr_env,
     tune_below,
@@ -352,14 +350,23 @@ def build_rx_top_block(
         lo_offset_hz=lo, rotator=rotator, sdr_rate_hz=sdr_rate, sdr_applied=applied)
 
 
-def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile):
-    """Build the AX.25 frame, GFSK-modulate via GNU Radio, and key it out the SDR.
+def modulate_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile):
+    """GFSK-modulate the uplink frame with GNU Radio and RETURN the baseband IQ.
 
-    Returns a ``_soapy_tx.BurstResult``. It used to return None and the caller then
-    emitted a HARDCODED ``transmit_complete outcome="complete", samples=0`` — a
-    fabricated success, sitting directly under the comment forbidding exactly that
-    (R-16). A burst that radiated nothing must never report completion."""
-    import base64
+    It does NOT touch the SDR. The previous ``transmit_gnuradio`` opened its own soapy
+    sink and ran its own graph, which made it a SECOND transmit path that bypassed every
+    invariant the shared one enforces: it never emitted ``transmit_started`` (so safety
+    stayed in KEYED_READY and the orchestrator's immediate de-key — which only fires from
+    KEYED — never ran, leaving the PA energized and T/R on TX until LOS), it counted
+    SOURCE items instead of samples the SDR accepted, it skipped the shared payload
+    selection, and it never validated the hardware rate. That is a TX-safety defect, not
+    a reporting one.
+
+    Now there is ONE transmit path. This function is the modulator; the caller feeds its
+    IQ to ``_sink_iq`` exactly like the dsp engine, so MTU handling, rate validation,
+    first-accept proof and the accepted-sample count are identical for both engines.
+    """
+    import base64  # noqa: PLC0415
 
     sample_rate = float(args.sample_rate or 96_000)
     sps = int(round(sample_rate / profile.symbol_rate_hz))
@@ -373,37 +380,20 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
         info=payload[: endurosat.AX25_INFO_MAX_BYTES],
     )
     bits = framing.encode(body, scramble=profile.scramble, nrzi=profile.nrzi)
-
     sensitivity = math.pi * profile.mod_index / sps  # rad/sample at full deflection
-    tb = gr.top_block("cubesat_gfsk_ax25_tx_gr")
+    tb = gr.top_block("cubesat_gfsk_ax25_mod_gr")
     # gfsk_mod defaults to do_unpack=True: it expects PACKED bytes and unpacks internally.
     # Feeding unpacked 0/1 bits would make each bit 8 symbols (8x-slow, garbled waveform).
-    # np.packbits pads the tail with zero bits — harmless after the closing HDLC flags.
     src = blocks.vector_source_b(np.packbits(bits.astype(np.uint8)).tolist(), repeat=False)
     mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=profile.bt)
-    sink = make_sink(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
-    sink.set_sample_rate(0, sample_rate)
-    sink.set_frequency(0, float(args.center_freq_hz))  # TX: no LO offset (mod at baseband 0)
-    # R-22: TX-explicit settings only (sdr_tx_* / GS_SDR_TX_*) — RX names raise here.
-    configure_soapy_source(sink, merge_sdr_params_tx(params))
-    # Analog TX filter ≈ the SDR sample rate, NOT the narrow channel width — the latter is
-    # below the device filter floor (~0.8 MHz on the XTRX) and would break the path (same
-    # treatment as the FM TX app). TX levels are BENCH-PENDING.
-    sink.set_bandwidth(0, sample_rate)
-    tb.connect(src, mod, sink)
+    snk = blocks.vector_sink_c()
+    tb.connect(src, mod, snk)
     tb.run()
-    # R-16 / audit round 2: report what was ACTUALLY pushed. `src` is the finite
-    # vector source feeding the modulator, so its item count is the burst we handed
-    # to the SDR; tb.run() returns only when the graph has drained it.
-    from _soapy_tx import BurstResult  # noqa: PLC0415 — bench-only import
-
-    total = int(getattr(src, "nitems_written", lambda _i: 0)(0))
-    return BurstResult(
-        accepted=total,
-        total=total,
-        outcome="complete" if total > 0 else "error",
-        detail="" if total > 0 else "GNU Radio TX graph pushed zero items",
-    )
+    iq = np.asarray(snk.data(), dtype=np.complex64)
+    if iq.size == 0:
+        msg = "GNU Radio GFSK modulator produced ZERO samples — refusing to key the PA"
+        raise RuntimeError(msg)
+    return iq
 
 
-__all__ = ["build_rx_top_block", "transmit_gnuradio"]
+__all__ = ["build_rx_top_block", "modulate_gnuradio"]

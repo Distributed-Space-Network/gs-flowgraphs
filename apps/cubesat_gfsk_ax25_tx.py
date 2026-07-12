@@ -105,6 +105,64 @@ def _build_frame_iq(args, params: dict[str, object], profile) -> np.ndarray:
     return endurosat.transmit(body, sample_rate, profile=profile)
 
 
+async def emit_burst(
+    status_writer, args, params: dict[str, object], profile, engine: str, *, should_abort=None
+) -> None:
+    """Modulate, key the burst through the ONE validated sink, and report it honestly.
+
+    Module-level (not a closure) so it is DRIVEABLE BY A TEST — the previous version was
+    nested inside the app's main coroutine, which is how a TX-safety defect survived: the
+    only "test" possible was a source-text grep.
+
+    Both engines share this path (audit round 2). The gnuradio engine used to open its own
+    soapy sink and run its own graph: it never emitted ``transmit_started``, so safety
+    stayed in KEYED_READY and the orchestrator's immediate de-key — which fires only from
+    KEYED — never ran. The PA stayed energized and T/R stayed on TX until LOS. It also
+    counted SOURCE items instead of samples the SDR accepted, skipped the shared payload
+    selection, and never validated the hardware rate. The engine now only MODULATES.
+
+    R-16: ``transmit_started`` is emitted only when the stream PROVABLY accepts a sample
+    (bridged threadsafe from the sink worker thread); ``transmit_complete`` reports the
+    ACCEPTED count and a bounded outcome — never a fabricated success.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _first_accept() -> None:
+        loop.call_soon_threadsafe(
+            lambda: loop.create_task(
+                send_event(status_writer, {"event": "transmit_started"})
+            )
+        )
+
+    try:
+        if engine == "gnuradio":  # pragma: no cover (bench: needs GNU Radio)
+            from gnuradio_gfsk import modulate_gnuradio  # noqa: PLC0415
+
+            iq = await asyncio.to_thread(modulate_gnuradio, args, params, profile)
+        else:
+            iq = _build_frame_iq(args, params, profile)
+        result = await asyncio.to_thread(
+            _sink_iq, args, iq, params,
+            on_first_accept=_first_accept,
+            should_abort=should_abort,
+        )
+    except Exception as e:
+        logging.getLogger("cubesat_gfsk_ax25_tx").exception("TX burst failed")
+        await send_event(
+            status_writer, {"event": "error", "code": "tx-failed", "detail": repr(e)}
+        )
+        return
+    await send_event(
+        status_writer,
+        {
+            "event": "transmit_complete",
+            "samples": int(result.accepted),
+            "outcome": result.outcome,
+            "detail": result.detail,
+        },
+    )
+
+
 def _sink_iq(
     args,
     iq: np.ndarray,
@@ -330,62 +388,9 @@ async def amain(args) -> int:
 
     async def _on_start(_cmd: dict[str, object]) -> None:
         await send_event(sockets.status_writer, {"event": "started"})
-        if engine == "gnuradio":  # pragma: no cover (bench)
-            from gnuradio_gfsk import transmit_gnuradio
-
-            # Audit round 2: this used to emit a HARDCODED
-            # {"samples": 0, "outcome": "complete"} whatever the engine did — a
-            # fabricated success for a burst that may have radiated nothing, and an
-            # engine exception was swallowed by the command loop on top. Report the
-            # REAL burst result, and fail loudly if the engine raises.
-            try:
-                burst = await asyncio.to_thread(transmit_gnuradio, args, params, profile)
-            except Exception as e:
-                logging.getLogger("cubesat_gfsk_ax25_tx").exception(
-                    "gnuradio TX engine failed"
-                )
-                await send_event(
-                    sockets.status_writer,
-                    {"event": "error", "code": "tx-engine-failed", "detail": repr(e)},
-                )
-                return
-            await send_event(
-                sockets.status_writer,
-                {
-                    "event": "transmit_complete",
-                    "samples": int(getattr(burst, "accepted", 0)),
-                    "outcome": str(getattr(burst, "outcome", "error")),
-                    "detail": str(getattr(burst, "detail", "")),
-                },
-            )
-            return
-        # R-16: transmit_started is emitted only when the stream provably
-        # accepts samples (bridged threadsafe from the sink worker thread),
-        # and transmit_complete reports the ACCEPTED count + a bounded
-        # explicit outcome — never a fabricated zero-sample success.
-        loop = asyncio.get_running_loop()
-
-        def _first_accept() -> None:
-            loop.call_soon_threadsafe(
-                lambda: loop.create_task(
-                    send_event(sockets.status_writer, {"event": "transmit_started"})
-                )
-            )
-
-        iq = _build_frame_iq(args, params, profile)
-        result = await asyncio.to_thread(
-            _sink_iq, args, iq, params,
-            on_first_accept=_first_accept,
-            should_abort=stop_requested.is_set,  # a pass stop cancels the burst
-        )
-        await send_event(
-            sockets.status_writer,
-            {
-                "event": "transmit_complete",
-                "samples": int(result.accepted),
-                "outcome": result.outcome,
-                "detail": result.detail,
-            },
+        await emit_burst(
+            sockets.status_writer, args, params, profile, engine,
+            should_abort=stop_requested.is_set,
         )
 
     stop_reason = {"value": "command"}
@@ -396,7 +401,16 @@ async def amain(args) -> int:
 
     handlers = {"start": _on_start, "stop": _on_stop}
     try:
-        reason = await run_command_loop(sockets.control_reader, handlers)
+        reason = await run_command_loop(sockets.control_reader, handlers, sockets.status_writer)
+        if reason == "handler-failed":
+            # A command handler raised. The app must NOT return 0: gs-client's supervisor
+            # classifies a clean exit as a normal stop, and the pass would complete as if
+            # the command had been executed (audit — the TX apps transmit inside handlers).
+            _log_handler_failure = logging.getLogger(__name__)
+            _log_handler_failure.error(
+                "a control-command handler failed — exiting nonzero so the pass fails"
+            )
+            return 1
         if reason == "stop":
             # P0-08: dispatch ended on the accepted stop; the explicit stopped
             # ack follows cleanup (nothing to tear down here beyond sockets)

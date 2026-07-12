@@ -9,6 +9,20 @@ import json
 from _spawn_contract import run_command_loop
 
 
+class _NullWriter:
+    """The status socket is REQUIRED now: a handler failure must always be able to reach
+    gs-client. These P0-08 tests do not assert on events, so they capture and drop them."""
+
+    def __init__(self) -> None:
+        self.events: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.events.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
 def _reader_with(*commands: dict, eof: bool = True) -> asyncio.StreamReader:
     reader = asyncio.StreamReader()
     for cmd in commands:
@@ -31,7 +45,7 @@ def test_stop_ends_dispatch_even_with_more_commands_queued():
             {"cmd": "start"},  # must never be dispatched (P0-08)
         )
         reason = await run_command_loop(
-            reader, {"start": handler, "stop": handler}
+            reader, {"start": handler, "stop": handler}, _NullWriter()
         )
         return reason, seen
 
@@ -42,7 +56,7 @@ def test_stop_ends_dispatch_even_with_more_commands_queued():
 
 def test_eof_without_stop_reports_transport_loss():
     async def run() -> str:
-        return await run_command_loop(_reader_with({"cmd": "start"}), {})
+        return await run_command_loop(_reader_with({"cmd": "start"}), {}, _NullWriter())
 
     assert asyncio.run(run()) == "eof"
 
@@ -52,6 +66,8 @@ def test_raising_stop_handler_still_ends_dispatch():
         async def boom(_cmd: dict) -> None:
             raise RuntimeError("stop handler died")
 
-        return await run_command_loop(_reader_with({"cmd": "stop"}), {"stop": boom})
+        return await run_command_loop(
+            _reader_with({"cmd": "stop"}), {"stop": boom}, _NullWriter()
+        )
 
     assert asyncio.run(run()) == "stop"
