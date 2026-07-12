@@ -58,6 +58,9 @@ install(
   FILES
     apps/_spawn_contract.py
     apps/_soapy.py                   # SoapySDR gain/antenna config, shared by the GR engines
+    apps/_soapy_tx.py                # shared soapy TX sink setup, imported by the TX apps
+    apps/_stream.py                  # shared stream-tap/fan-out helpers, imported by the RX apps
+    apps/_rateplan.py                # channel/capture rate planning, imported by RX/TX apps
     apps/_doppler.py                 # flowgraph-owned Doppler poll (docs/12), imported by satellite_rx
     apps/_recorder.py                # pre-demod IQ capture (cf32/CSV/PNG), imported by the RX engines
     apps/_fallback_select.py         # fallback demod selection (imported by gnuradio_satellites)
