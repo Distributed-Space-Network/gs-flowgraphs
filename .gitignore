@@ -16,3 +16,7 @@ build/
 .vscode/
 *.swp
 .DS_Store
+
+# Ephemeral run logs (pytest/hypothesis dumps, trace files) — never evidence:
+# release-gate evidence lives in the umbrella's docs/release-evidence/.
+*.log
