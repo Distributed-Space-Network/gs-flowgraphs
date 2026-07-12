@@ -38,6 +38,7 @@ import pmt  # PMT is a standalone top-level module in GNU Radio 3.10 (NOT gr.pmt
 from _fallback_select import (  # pure, testable, no GNU Radio
     CHANNEL_OVERSAMPLE,
     channel_rate_for,
+    no_decode_reason,
     symbol_rate_hz_of,
 )
 from _recorder import PassRecorder
@@ -108,6 +109,7 @@ class _SatContext:
         valve_ours=None,
         valve_grsat=None,
         sdr_applied: dict | None = None,
+        no_decode_reason: str = "",
     ) -> None:
         self.tb = tb
         self.src = src
@@ -128,10 +130,27 @@ class _SatContext:
         self._valve_ours = valve_ours
         self._valve_grsat = valve_grsat
         self._winner: str | None = None
+        # R2-02: did we build ANY decoder at all? A pass with no demod params (the backend
+        # transmitter has a null/zero baud) and gr-satellites gated off degrades to a
+        # RECORDER-ONLY graph — it captures IQ and produces exactly zero frames. That is a
+        # legitimate outcome (the .cf32 can be decoded offline), but it must never be
+        # reported as an ordinary successful decode pass: the operator sees a green pass and
+        # no frames, with nothing saying why. The app puts these on the `ready` event.
+        self._no_decode_reason = no_decode_reason
 
     @property
     def framing(self) -> str:
         return "fallback" if self._fallbacks else "grsatellites"
+
+    @property
+    def decode_built(self) -> bool:
+        """False when the graph is RECORDER-ONLY (no decoder was constructed)."""
+        return not self._no_decode_reason
+
+    @property
+    def no_decode_reason(self) -> str:
+        """Why no decoder exists (empty when one does). Rides the `ready` event."""
+        return self._no_decode_reason
 
     def start(self) -> None:
         self.tb.start()
@@ -553,7 +572,14 @@ def build_satellites_rx(
         tb.msg_connect(fg, "out", sink, "in")
         _log.info("gr-satellites monolithic only for %s (no demod params)", satellite)
     else:
-        _log.warning("no decode: no demod params and no gr-satellites decoder for %r", satellite)
+        _log.error(
+            "NO DECODER BUILT for %r — this pass is RECORDER-ONLY and will produce ZERO "
+            "frames. Cause: the backend sent no usable demod params (a transmitter with a "
+            "null/zero baud yields no modulation+symbol_rate) and GS_GRSAT_LIVE is unset, so "
+            "gr-satellites could not supply one either. The .cf32 is still captured — decode "
+            "it offline (iq_decode.py) — but the pass must not be read as a successful decode.",
+            satellite,
+        )
     # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
     # the backend rfLink implies. Construction above drives the graph; the plan is the explanation.
     try:
@@ -572,6 +598,16 @@ def build_satellites_rx(
         tb.connect(demod_tap, blocks.null_sink(gr.sizeof_gr_complex))
     elif not decode_consumers and recorder is None:
         tb.connect(chan, blocks.null_sink(gr.sizeof_gr_complex))
+    # R2-02: a graph with NO decode consumer is recorder-only. Say so out loud, on the
+    # `ready` event, so the pass result cannot read as a successful decode (a green pass
+    # with zero frames and no explanation is indistinguishable from a bird that was silent).
+    # The reason itself is computed by a PURE helper so it is testable without GNU Radio.
+    reason = no_decode_reason(
+        has_decode_consumer=decode_consumers,
+        mode=mode,
+        grsat_live=grsat_live,
+        framing=framing,
+    )
     # Decoupled model: both decode libraries run off our one demod, so there are no valves to gate
     # (valve_ours/valve_grsat stay None → drain_frames just collects + dedups; the race_winner
     # gating it still carries is dormant unless a future path re-introduces valves).
@@ -586,6 +622,7 @@ def build_satellites_rx(
         sdr_rate_hz=sdr_rate,
         fallbacks=fallbacks,
         sdr_applied=sdr_applied,
+        no_decode_reason=reason,
     )
 
 

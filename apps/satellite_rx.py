@@ -176,10 +176,20 @@ async def amain(args) -> int:
     decoder = "gr-satellites" if ctx.framing == "grsatellites" else "fallback"
     out_dir = getattr(args, "output_dir", None)
 
+    # R2-02: a recorder-only graph (no decoder could be built) must NOT be reported as an
+    # ordinary decode pass. It still runs — the .cf32 is genuinely useful and can be decoded
+    # offline — but `decode_built=False` + the reason ride the ready event so gs-client can
+    # carry them into the pass result instead of returning a bare, green "completed".
+    no_decode_reason = getattr(ctx, "no_decode_reason", "")
+    if no_decode_reason:
+        log.error("RECORDER-ONLY pass: %s", no_decode_reason)
+
     await send_event(
         sockets.status_writer,
         {
             "event": "ready",
+            "decode_built": not no_decode_reason,
+            "no_decode_reason": no_decode_reason,
             # "frames_jsonl" is an explicit key in gs-client's spec_for_data_format
             # map ("frames" was unmapped label drift — it silently fell back to the
             # RAW_BITS spec). Informational here: this app never writes the data

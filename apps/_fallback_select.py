@@ -73,3 +73,39 @@ def channel_rate_for(sample_rate: float, symbol_rate_hz: float, sdr_rate: float)
     while decim > 1 and sdr_i % decim != 0:
         decim -= 1
     return sdr / decim if decim >= 1 else want
+
+
+def no_decode_reason(
+    *,
+    has_decode_consumer: bool,
+    mode: tuple[str, float] | None,
+    grsat_live: bool,
+    framing: str | None = None,
+) -> str:
+    """R2-02: why (if at all) this graph ended up with NO decoder.
+
+    A graph with no decode consumer is RECORDER-ONLY: it captures IQ and produces exactly
+    zero frames. That is a legitimate outcome — the .cf32 is decodable offline — but it must
+    never be reported as an ordinary successful decode pass. A green pass with no frames and
+    no explanation is indistinguishable from a bird that was simply silent.
+
+    Returns "" when a decoder exists. Pure (no GNU Radio) so it is testable off-bench; the
+    engine puts the result on its ``ready`` event and gs-client carries it into the terminal
+    PassResult.
+    """
+    if has_decode_consumer:
+        return ""
+    if not mode:
+        why = (
+            "no decoder built: the backend sent no usable demod params (transmitter has no "
+            "modulation + symbol rate — a null/zero baud yields none)"
+        )
+        if not grsat_live:
+            why += (
+                " and GS_GRSAT_LIVE is unset, so gr-satellites could not supply one either"
+            )
+        return why
+    return (
+        f"no decoder built: the demod chain for {mode[0]}@{mode[1]:.0f} "
+        f"(framing={framing or 'auto'}) failed to construct"
+    )
