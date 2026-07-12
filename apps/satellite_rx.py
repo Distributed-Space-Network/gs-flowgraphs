@@ -20,7 +20,6 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import logging
@@ -36,6 +35,7 @@ from _spawn_contract import (
     await_first_samples,
     build_argparser,
     connect_spawn_sockets,
+    frame_received_event,
     load_params,
     run_command_loop,
     send_event,
@@ -75,15 +75,15 @@ async def _emit_frame(
     sockets, frame: bytes, satellite: str, *, decoder: str = "gr-satellites", output_dir=None
 ) -> None:
     _append_frame_record(output_dir, frame, decoder)
-    await send_event(
-        sockets.status_writer,
-        {
-            "event": "frame_received",
-            "decoder": decoder,
-            "satellite": satellite,
-            "frame": {"bytes_b64": base64.b64encode(frame).decode("ascii"), "len": len(frame)},
-        },
-    )
+    # R-18: the shared builder carries frame.id + crc_ok — without them the
+    # orchestrator's parser defaulted crc_ok to False and every decoded frame
+    # was counted INVALID (never downlink life). Both decode paths here are
+    # validity-gated by construction (gr-satellites deframers CRC/FEC-check
+    # their protocols; our fallback demods are CRC-gated).
+    event = frame_received_event(frame, crc_ok=True)
+    event["decoder"] = decoder
+    event["satellite"] = satellite
+    await send_event(sockets.status_writer, event)
     # NOTE: we deliberately do NOT tee frames to the data socket. The decoded-frames product
     # is frames.jsonl (appended above; gs-client uploads it post-pass). Streaming frames to the
     # data socket would also tee them to raw_bits.bin, which then races frames.jsonl to the same

@@ -29,7 +29,6 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import logging
@@ -53,6 +52,7 @@ from _spawn_contract import (
     await_first_samples,
     build_argparser,
     connect_spawn_sockets,
+    frame_received_event,
     load_params,
     run_command_loop,
     send_event,
@@ -228,17 +228,12 @@ async def _emit_frame(sockets, body: bytes, *, framing: str = "ax25", output_dir
     if framing == "ax25" and not valid_ax25_address(body):
         return
     ui = ax25.decode_ui(body) if framing == "ax25" else None
-    event: dict[str, object] = {
-        "event": "frame_received",
-        "framing": framing,
-        "frame": {
-            "bytes_b64": base64.b64encode(body).decode("ascii"),
-            "len": len(body),
-            "crc_ok": True,
-        },
-    }
+    extra: dict[str, object] = {}
     if ui is not None:
-        event["frame"].update({"dest": ui.dest, "src": ui.src, "info_len": len(ui.info)})  # type: ignore[union-attr]
+        extra = {"dest": ui.dest, "src": ui.src, "info_len": len(ui.info)}
+    # R-18: the shared builder carries frame.id + crc_ok (both live paths here
+    # are CRC-gated) so the orchestrator's parser counts the frame valid.
+    event = frame_received_event(body, crc_ok=True, framing=framing, extra_frame_fields=extra)
     await send_event(sockets.status_writer, event)
     try:
         sockets.data_writer.write(body)

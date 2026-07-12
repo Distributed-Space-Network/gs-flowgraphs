@@ -45,6 +45,7 @@ from _soapy_tx import BurstResult
 from _spawn_contract import (
     build_argparser,
     connect_spawn_sockets,
+    frame_received_event,
     load_params,
     run_command_loop,
     send_event,
@@ -253,17 +254,11 @@ async def emit_frame(sockets, body: bytes) -> None:
     Both writes suppress a dead-peer error: a broken status/data socket must never propagate up and
     kill the RX loop (or, worse, leave the reader parked on a full queue → teardown deadlock)."""
     with contextlib.suppress(ConnectionResetError, BrokenPipeError):
+        # R-18: the shared builder carries frame.id + crc_ok (the chip-packet
+        # deframer is CRC-16 gated) so the orchestrator counts the frame valid.
         await send_event(
             sockets.status_writer,
-            {
-                "event": "frame_received",
-                "framing": "endurosat",
-                "frame": {
-                    "bytes_b64": base64.b64encode(body).decode("ascii"),
-                    "len": len(body),
-                    "crc_ok": True,
-                },
-            },
+            frame_received_event(body, crc_ok=True, framing="endurosat"),
         )
     with contextlib.suppress(ConnectionResetError, BrokenPipeError):
         sockets.data_writer.write(body)
@@ -272,10 +267,19 @@ async def emit_frame(sockets, body: bytes) -> None:
 
 async def emit_signal(sockets, rssi_dbm: float) -> None:
     # Suppress a dead status socket — a signal write must never kill the RX consumer loop.
+    # R-17: the level is UNCALIBRATED dBFS-style IQ power, and says so — the
+    # field name stays rssi_dbm for protocol shape, but source + calibrated
+    # tell the consumer exactly what it is. lock is never fabricated.
     with contextlib.suppress(ConnectionResetError, BrokenPipeError):
         await send_event(
             sockets.status_writer,
-            {"event": "signal", "rssi_dbm": round(rssi_dbm, 1), "lock": False},
+            {
+                "event": "signal",
+                "rssi_dbm": round(rssi_dbm, 1),
+                "lock": False,
+                "source": "iq-power",
+                "calibrated": False,
+            },
         )
 
 

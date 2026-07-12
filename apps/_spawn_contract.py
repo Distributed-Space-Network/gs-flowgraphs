@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
+import itertools
 import json
 import logging
 import queue
@@ -268,6 +270,41 @@ async def run_command_loop(
 
 
 # ----------------------------------------------------------------------
+# R-18: the ONE frame_received event builder
+# ----------------------------------------------------------------------
+
+_frame_ids = itertools.count()
+
+
+def frame_received_event(
+    body: bytes,
+    *,
+    crc_ok: bool,
+    framing: str = "",
+    frame_id: str = "",
+    extra_frame_fields: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Build a ``frame_received`` status event with the fields the
+    orchestrator's typed parser REQUIRES — ``frame.id`` and ``frame.crc_ok``.
+    R-18: apps that hand-rolled the event omitted them, so gs-client's parser
+    defaulted ``crc_ok`` to False and every valid frame was counted invalid
+    (and never registered as downlink life). ``frame_id`` defaults to a
+    process-unique sequential id."""
+    frame: dict[str, object] = {
+        "id": frame_id or f"frm-{next(_frame_ids)}",
+        "bytes_b64": base64.b64encode(body).decode("ascii"),
+        "len": len(body),
+        "crc_ok": bool(crc_ok),
+    }
+    if extra_frame_fields:
+        frame.update(extra_frame_fields)
+    event: dict[str, object] = {"event": "frame_received", "frame": frame}
+    if framing:
+        event["framing"] = framing
+    return event
+
+
+# ----------------------------------------------------------------------
 # R-11: first-sample proof + engine death watch
 # ----------------------------------------------------------------------
 
@@ -378,6 +415,7 @@ __all__ = [
     "await_first_samples",
     "build_argparser",
     "connect_spawn_sockets",
+    "frame_received_event",
     "load_params",
     "parse_tcp_url",
     "pump_data_queue",

@@ -49,7 +49,6 @@ import logging
 import math
 import queue
 import sys
-import time
 
 from _spawn_contract import (
     await_first_samples,
@@ -60,6 +59,7 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
+from _rateplan import fm_rx_plan
 from _recorder import PassRecorder, first_sample_probe
 from _soapy import (
     apply_corrections,
@@ -114,9 +114,15 @@ class _QueueSink(gr.sync_block):
         )
         self._q = target_queue
         self.dropped = 0
+        self.last_power = 0.0  # R-17: latest mean-square audio level (linear)
 
     def work(self, input_items, output_items):  # type: ignore[no-untyped-def]
         samples = input_items[0]  # numpy float32 array
+        # R-17: the only LIVE measurement this chain has — post-demod audio
+        # power. The signal task reports it as an uncalibrated level; nothing
+        # else is fabricated.
+        if len(samples):
+            self.last_power = float((samples * samples).mean())
         try:
             self._q.put_nowait(samples.tobytes())
         except queue.Full:
@@ -138,12 +144,14 @@ class FlowgraphContext:
         recorder: object = None,
         lo_offset_hz: float = 0.0,
         sdr_applied: dict | None = None,
+        audio_sink: object = None,
     ) -> None:
         self.tb = tb
         self.src = src
         self.recorder = recorder  # pre-demod IQ capture (PassRecorder) or None
         self.lo_offset_hz = lo_offset_hz  # LO offset the Doppler retune must preserve
         self.sdr_applied = dict(sdr_applied or {})  # R-21: what configure/corrections applied
+        self.audio_sink = audio_sink  # R-17: live audio-level source for signal events
 
 
 def _retune_locked(
@@ -223,10 +231,11 @@ def build_top_block(
     # The channel stream enters at args.sample_rate (the post-decimator channel rate, e.g.
     # 48 kHz). ``decim_to_if`` is 1 when that's already <= the IF rate, so compute the
     # ACTUAL rate after the channel filter and drive the demod + audio stages from it.
-    # (The old code hard-coded _IF_RATE_HZ=192 kHz, which inverted the gain + audio rate
-    # whenever sample_rate < 192 kHz — i.e. always, at a 48 kHz channel.)
-    decim_to_if = max(1, int(args.sample_rate) // _IF_RATE_HZ)
-    if_rate = float(args.sample_rate) / decim_to_if
+    # R-19: the WHOLE plan is validated — a rate whose chain cannot produce
+    # EXACTLY 48 kHz audio (1 MHz → 50 kHz mislabeled as 48 k) raises here and
+    # the spawn fails closed instead of shipping a mislabeled audio product.
+    decim_to_if, if_rate_i, audio_decim = fm_rx_plan(args.sample_rate)
+    if_rate = float(if_rate_i)
     chan = gr_filter.fir_filter_ccf(decim_to_if, chan_taps)
 
     # ----------------------------------------------------- NBFM demod
@@ -237,7 +246,7 @@ def build_top_block(
     demod = analog.quadrature_demod_cf(quad_gain)
 
     # ----------------------------------------------------- audio decimator
-    audio_decim = max(1, int(if_rate) // _AUDIO_RATE_HZ)
+    # audio_decim comes from the validated fm_rx_plan above (R-19).
     audio_taps = gr_filter.firdes.low_pass(
         gain=1.0,
         sampling_freq=if_rate,
@@ -252,7 +261,8 @@ def build_top_block(
     deemph = analog.fm_deemph(if_rate / audio_decim, tau=deemph_tau_s)
 
     # ----------------------------------------------------- queue sink
-    sink = _QueueSink(audio_queue)
+    audio_sink = _QueueSink(audio_queue)
+    sink = audio_sink
 
     # ----------------------------------------------------- connect
     # Decimate to the channel rate ONCE; the demod chain and the recorder both tap it, so
@@ -266,7 +276,8 @@ def build_top_block(
     # Pre-demod IQ capture at the CHANNEL rate (the decimator output), not wideband.
     recorder = PassRecorder.maybe_start(args, tb, chan_src, sample_rate_hz=float(args.sample_rate))
     return FlowgraphContext(
-        tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz, sdr_applied=sdr_applied
+        tb=tb, src=src, recorder=recorder, lo_offset_hz=lo_offset_hz,
+        sdr_applied=sdr_applied, audio_sink=audio_sink,
     )
 
 
@@ -288,7 +299,17 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         log.info("loaded waveform_parameters: %s", sorted(params))
 
     data_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=_DATA_QUEUE_MAXSIZE)
-    ctx = build_top_block(args, data_queue, params=params)
+    try:
+        ctx = build_top_block(args, data_queue, params=params)
+    except ValueError as e:
+        # R-19: an invalid rate plan (chain can't produce exactly 48 kHz
+        # audio) fails the spawn closed with an explicit error event.
+        log.error("rate plan rejected: %s", e)
+        await send_event(
+            sockets.status_writer,
+            {"event": "error", "code": "rate-plan-invalid", "detail": str(e)},
+        )
+        return 1
     tb = ctx.tb
     src = ctx.src
     lo_offset_hz = ctx.lo_offset_hz  # preserved across Doppler retunes (_on_set_doppler)
@@ -384,19 +405,23 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
 
     # --------------------------------------------------- signal-event task
     async def _emit_signal_events() -> None:
+        # R-17: NO fabricated telemetry. The chain's only live measurement is
+        # post-demod audio power (uncalibrated); it is reported with explicit
+        # source/calibration flags. ``lock`` is NEVER claimed — the NBFM chain
+        # has no carrier-lock estimator, and a fabricated lock previously fed
+        # the orchestrator's downlink-life gate.
         while not stop_requested.is_set():
             await asyncio.sleep(_SIGNAL_PERIOD_S)
-            # Real signal stats would come from a probe block; first
-            # cut emits a synthesised reasonable value. Plumbing the
-            # probe is a Phase 7 follow-up.
-            now = time.time()
+            power = float(getattr(ctx.audio_sink, "last_power", 0.0))
+            level_db = 10.0 * math.log10(power) if power > 0.0 else -120.0
             await send_event(
                 sockets.status_writer,
                 {
                     "event": "signal",
-                    "rssi_dbm": -80.0 + math.sin(now) * 5.0,
-                    "snr_db": 12.0,
-                    "lock": True,
+                    "rssi_dbm": round(level_db, 1),
+                    "lock": False,
+                    "source": "audio-power",
+                    "calibrated": False,
                 },
             )
 
