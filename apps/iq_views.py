@@ -53,13 +53,28 @@ def derive_views(
     # Prefer the recording's own metadata sidecar (the TRUE rate/centre the engine used —
     # it may have widened the channel for a high-baud bird) over the passed-in args.
     meta = path.with_name(path.name + ".json")
+    metadata_trusted = False
     if meta.exists():
         try:
             d = json.loads(meta.read_text())
             sample_rate_hz = float(d.get("sample_rate_hz", sample_rate_hz))
             center_hz = float(d.get("center_hz", center_hz))
+            metadata_trusted = True
         except (OSError, ValueError, TypeError):
             log.warning("iq_views: ignoring unreadable sidecar %s", meta.name)
+    if not metadata_trusted:
+        # R2-20: without the sidecar, the rate and centre are the ORCHESTRATOR'S REQUEST —
+        # not what the engine actually used. They differ whenever the channel was widened for
+        # a high-baud bird, and every derived artifact (waterfall axes, VSA CSV, SDF) is then
+        # MISLABELLED. The views are still worth producing — but they must SAY the axes are
+        # unverified, because an operator reading a confidently-labelled frequency axis that
+        # is simply wrong is worse off than one who knows the scale is a guess.
+        log.error(
+            "iq_views: no usable sidecar for %s — the true sample rate/centre are UNKNOWN. "
+            "Deriving views with GUESSED axes (%.0f Hz @ %.0f Hz); they are labelled "
+            "UNVERIFIED. The .cf32 itself is intact.",
+            path.name, sample_rate_hz, center_hz,
+        )
     n_samp = path.stat().st_size // 8  # 8 B/complex64; floor a torn write to whole samples
     if n_samp < 1:
         log.warning("iq_views: %s has no samples", path)
@@ -70,9 +85,19 @@ def derive_views(
     written: list[Path] = []
     if want_png:
         png = path.with_suffix(".png")
+        title = path.stem if metadata_trusted else f"{path.stem}  [AXES UNVERIFIED: no sidecar]"
         write_waterfall_png(
-            png, iq, sample_rate_hz=sample_rate_hz, center_hz=center_hz, title=path.stem)
-        written.append(png)
+            png, iq, sample_rate_hz=sample_rate_hz, center_hz=center_hz, title=title)
+        # R2-21: write_waterfall_png SKIPS a capture shorter than one FFT window (it refuses
+        # to fabricate an all-zeros image). Reporting the path anyway told the caller a
+        # product exists when nothing was written — a phantom artifact.
+        if png.exists():
+            written.append(png)
+        else:
+            log.warning(
+                "iq_views: no waterfall for %s (capture too short for one FFT window) — "
+                "NOT reporting a PNG that does not exist", path.name,
+            )
     if want_csv:
         n = max(1, int(sample_rate_hz * csv_seconds))
         csv = path.with_suffix(".csv")

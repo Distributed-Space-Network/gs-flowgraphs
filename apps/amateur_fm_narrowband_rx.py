@@ -452,11 +452,36 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
     }
     engine_down = {"done": False}
 
+    async def _report_audio_loss() -> None:
+        """R2-16: dropped audio must reach the PASS RESULT, not just the station journal.
+
+        The queue-overflow counter was rate-limit-logged (round 2) but never left the
+        process: gs-client, the backend and the customer all saw an ordinary successful
+        pass whose product was silently missing audio. An `error` event degrades the pass
+        with the count, so the record says what was lost."""
+        sink = getattr(ctx, "audio_sink", None)
+        dropped = int(getattr(sink, "dropped", 0) or 0)
+        if dropped <= 0:
+            return
+        with contextlib.suppress(Exception):
+            await send_event(
+                sockets.status_writer,
+                {
+                    "event": "error",
+                    "code": "audio-dropped",
+                    "detail": (
+                        f"{dropped} audio samples were DROPPED on queue overflow — the "
+                        f"product is missing audio (the consumer could not keep up)"
+                    ),
+                },
+            )
+
     async def _shutdown_engine() -> None:
         """Idempotent: stop the graph, tear down the data pump."""
         if engine_down["done"]:
             return
         engine_down["done"] = True
+        await _report_audio_loss()
         stop_requested.set()
         if started.is_set():
             try:

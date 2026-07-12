@@ -155,7 +155,11 @@ async def amain(args) -> int:
         return 1
     # First-sample proof off the recorder's unbuffered cf32 (grows the moment
     # the SDR delivers). No recorder → proof unavailable, reported as such.
-    probe = first_sample_probe(getattr(ctx, "recorder", None))
+    # R2-15: the proof must not depend on the RECORDING feature flag — fall back to the GR
+    # source's own item count, so a deaf radio is caught even with recording off.
+    probe = first_sample_probe(
+        getattr(ctx, "recorder", None), source=getattr(ctx, "src", None)
+    )
     first: bool | None = None
     if probe is not None:
         first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)

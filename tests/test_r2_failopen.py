@@ -178,3 +178,105 @@ class TestDroppedAudioIsVisible:
         src = (_APPS / "amateur_fm_narrowband_rx.py").read_text(encoding="utf-8")
         assert "audio queue FULL" in src
         assert "_DROP_LOG_EVERY" in src, "rate-limited, so an overflow cannot flood the journal"
+
+
+class TestTheDeafRadioProofDoesNotDependOnRecording:
+    """R2-15: the first-sample proof was derived ONLY from the recorder's cf32, so it was
+    unavailable whenever IQ recording was disabled — and the RX apps then skipped the check
+    and declared `ready` with no evidence at all. A deaf radio was undetectable on exactly
+    the passes that keep no recording. The proof must not depend on an unrelated flag."""
+
+    def test_a_recorder_still_provides_the_proof(self, tmp_path) -> None:
+        from _recorder import first_sample_probe
+
+        iq = tmp_path / "p.cf32"
+        iq.write_bytes(b"\x00" * 16)
+
+        class _Rec:
+            iq_path = iq
+
+        probe = first_sample_probe(_Rec())
+        assert callable(probe)
+        assert probe() > 0
+
+    def test_without_a_recorder_the_gr_source_provides_it(self) -> None:
+        from _recorder import first_sample_probe
+
+        class _Src:
+            def __init__(self) -> None:
+                self.n = 0
+
+            def nitems_written(self, _port: int) -> int:
+                return self.n
+
+        src = _Src()
+        probe = first_sample_probe(None, source=src)
+        assert callable(probe), "recording off must NOT mean 'no proof'"
+        assert probe() == 0          # nothing delivered yet
+        src.n = 4096
+        assert probe() == 4096       # the SDR provably delivered
+
+    def test_a_probe_that_raises_is_not_fatal(self) -> None:
+        from _recorder import first_sample_probe
+
+        class _Bad:
+            def nitems_written(self, _port: int) -> int:
+                raise RuntimeError("block died")
+
+        probe = first_sample_probe(None, source=_Bad())
+        assert probe() == 0, "a probe must never kill the pass"
+
+    def test_the_rx_apps_pass_their_source(self) -> None:
+        for app in ("cubesat_gfsk_ax25_rx.py", "satellite_rx.py"):
+            src = (_APPS / app).read_text(encoding="utf-8")
+            assert 'source=getattr(ctx, "src", None)' in src, app
+
+
+class TestIqViewsDoesNotShipPhantomOrMislabelledProducts:
+    def test_a_png_that_was_never_written_is_not_reported(self, tmp_path) -> None:
+        """R2-21: write_waterfall_png SKIPS a capture shorter than one FFT window (it refuses
+        to fabricate an all-zeros image). Reporting the path anyway told the caller a product
+        existed when nothing was written."""
+        import json
+
+        from iq_views import derive_views
+
+        cf32 = tmp_path / "short.cf32"
+        cf32.write_bytes(b"\x00" * 8 * 64)          # 64 samples: far short of one FFT window
+        (tmp_path / "short.cf32.json").write_text(
+            json.dumps({"sample_rate_hz": 48000.0, "center_hz": 401e6}), encoding="utf-8"
+        )
+        written = derive_views(
+            cf32, center_hz=401e6, sample_rate_hz=48000.0, formats=("png",)
+        )
+        assert written == [], "reported a PNG that does not exist"
+        assert not (tmp_path / "short.png").exists()
+
+    def test_views_derived_without_a_sidecar_are_labelled_unverified(self, tmp_path) -> None:
+        """R2-20: without the sidecar the rate/centre are the orchestrator's REQUEST, not what
+        the engine used — every axis is a guess. The views are still worth having; presenting
+        their axes as fact is not."""
+        import numpy as np
+        from iq_views import derive_views
+
+        cf32 = tmp_path / "nosidecar.cf32"
+        iq = (np.random.default_rng(0).standard_normal(8192)
+              + 1j * np.random.default_rng(1).standard_normal(8192)).astype(np.complex64)
+        cf32.write_bytes(iq.tobytes())
+        written = derive_views(
+            cf32, center_hz=401e6, sample_rate_hz=48000.0, formats=("png",)
+        )
+        assert written, "the views are still produced — the data is useful"
+        # the honesty is in the title; the code path is pinned so it cannot be dropped
+        src = (_APPS / "iq_views.py").read_text(encoding="utf-8")
+        assert "AXES UNVERIFIED" in src
+
+
+class TestDroppedAudioReachesThePassResult:
+    def test_the_fm_app_emits_an_error_event_for_dropped_audio(self) -> None:
+        """R2-16: the counter was rate-limit-logged but never left the process — gs-client,
+        the backend and the customer all saw an ordinary successful pass whose product was
+        silently missing audio."""
+        src = (_APPS / "amateur_fm_narrowband_rx.py").read_text(encoding="utf-8")
+        assert '"code": "audio-dropped"' in src
+        assert "await _report_audio_loss()" in src

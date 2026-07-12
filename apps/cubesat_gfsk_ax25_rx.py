@@ -655,7 +655,11 @@ async def _run_gnuradio_engine(  # pragma: no cover (bench)
     # moment the SDR delivers), not process startup. No recorder → the proof is
     # reported unavailable (None), never fabricated.
     ctx.start()
-    probe = first_sample_probe(getattr(ctx, "recorder", None))
+    # R2-15: the proof must not depend on the RECORDING feature flag — fall back to the GR
+    # source's own item count, so a deaf radio is caught even with recording off.
+    probe = first_sample_probe(
+        getattr(ctx, "recorder", None), source=getattr(ctx, "src", None)
+    )
     first: bool | None = None
     if probe is not None:
         first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)

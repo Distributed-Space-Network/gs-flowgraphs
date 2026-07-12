@@ -381,15 +381,32 @@ class StreamRecorder:
             self._fh.close()
 
 
-def first_sample_probe(recorder) -> object:  # type: ignore[no-untyped-def]
-    """R-11: a first-sample-proof probe off a recorder's on-disk cf32 size (the
-    sinks are unbuffered, so bytes hit disk as soon as the SDR delivers). Works
-    for both :class:`PassRecorder` (GR native file sink) and
-    :class:`StreamRecorder` (dsp path). Returns a ``() -> int`` callable, or
-    ``None`` when recording is off — the caller then reports first-sample proof
-    as unavailable instead of fabricating one."""
+def first_sample_probe(recorder, *, source=None, counter=None) -> object:  # type: ignore[no-untyped-def]
+    """R-11: a first-sample proof — evidence the SDR actually DELIVERED a sample.
+
+    R2-15 (audit): this used to derive the proof ONLY from the recorder's on-disk cf32, so
+    it returned None whenever IQ recording was disabled — and the RX apps then skipped the
+    check entirely and declared `ready` with no evidence at all. A deaf radio was
+    undetectable on exactly the passes that keep no recording. The proof must not depend on
+    an unrelated feature flag.
+
+    Three sources, in order of preference:
+      * the recorder's unbuffered cf32 (bytes hit disk as soon as the SDR delivers);
+      * ``source`` — any GNU Radio block, via ``nitems_written(0)`` (the SDR source itself);
+      * ``counter`` — a ``() -> int`` the dsp engines increment as chunks arrive.
+    Returns a ``() -> int`` callable, or ``None`` only when NOTHING can prove it.
+    """
     iq_path = getattr(recorder, "iq_path", None)
     if iq_path is None:
+        if source is not None and hasattr(source, "nitems_written"):
+            def _gr_probe() -> int:
+                try:
+                    return int(source.nitems_written(0))
+                except Exception:  # noqa: BLE001 — a probe must never kill the pass
+                    return 0
+            return _gr_probe
+        if callable(counter):
+            return counter
         return None
 
     def _probe() -> int:
