@@ -191,14 +191,20 @@ def _probe_tx_device(args, params) -> dict:  # pragma: no cover (needs SoapySDR)
     is the orchestrator's safety FSM, never this app). Assumes this app owns
     the device at spawn, the same assumption ``_soapy_sink`` makes at transmit."""
     import SoapySDR
+    from _stream import hardware_rate_for, require_sample_rate
     from SoapySDR import SOAPY_SDR_TX
 
     dev = SoapySDR.Device(args.sdr_args)
     try:
         sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
-        dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
+        # R-14: probe at the SUPPORTED hardware rate (integer multiple of the
+        # modem rate) — probing the raw modem rate would fail on XTRX-class
+        # hardware even though the transmit path is fine.
+        hw_rate, _factor = hardware_rate_for(sample_rate, sdr_env()["capture_rate_hz"])
+        dev.setSampleRate(SOAPY_SDR_TX, 0, hw_rate)
+        require_sample_rate(dev, SOAPY_SDR_TX, 0, hw_rate)
         dev.setFrequency(SOAPY_SDR_TX, 0, float(args.center_freq_hz))
-        applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, sample_rate)
+        applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, hw_rate)
         actual = readback_soapy_settings(dev, channel=0, direction=SOAPY_SDR_TX)
         return {"applied": applied, "actual": actual}
     finally:
@@ -246,22 +252,29 @@ def _soapy_sink(  # pragma: no cover
     could spin forever or oversize a native driver write."""
     import SoapySDR
     from _soapy_tx import query_tx_mtu, write_burst
+    from _stream import hardware_rate_for, require_sample_rate, upsample_burst
     from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_TX
 
     log = logging.getLogger("cubesat_gfsk_ax25_tx")
     dev = SoapySDR.Device(args.sdr_args)
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
-    dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
+    # R-14: the DEVICE runs at a supported integer multiple of the modem rate
+    # (XTRX-class TX can't stream ~96 kHz); the burst is upsampled to match.
+    # The readback is validated — a silently-clamped rate garbles the burst.
+    hw_rate, factor = hardware_rate_for(sample_rate, sdr_env()["capture_rate_hz"])
+    dev.setSampleRate(SOAPY_SDR_TX, 0, hw_rate)
+    require_sample_rate(dev, SOAPY_SDR_TX, 0, hw_rate)
     dev.setFrequency(SOAPY_SDR_TX, 0, float(args.center_freq_hz))
-    applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, sample_rate)
-    log.info("TX sink configured: %s", applied)
+    applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, hw_rate)
+    log.info("TX sink configured (modem=%.0f hw=%.0f x%d): %s",
+             sample_rate, hw_rate, factor, applied)
     stream = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32)
     dev.activateStream(stream)
     try:
-        buf = iq.astype(np.complex64)
+        buf = upsample_burst(iq.astype(np.complex64), factor)
         # Deadline: the burst's real-time duration plus generous margin — a TX
         # that cannot drain a one-burst buffer inside this is wedged, not slow.
-        deadline_s = max(10.0, 3.0 * len(buf) / max(1.0, sample_rate))
+        deadline_s = max(10.0, 3.0 * len(buf) / max(1.0, hw_rate))
         result = write_burst(
             dev,
             stream,

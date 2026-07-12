@@ -42,10 +42,9 @@ import numpy as np
 from _fallback_select import symbol_rate_hz_of
 from _recorder import StreamRecorder, first_sample_probe
 from _soapy import (
-    capture_plan,
+    auto_lo_offset,
     merge_sdr_params,
     readback_soapy_settings,
-    resample_ratio,
     sdr_env,
     sdr_ready_fields,
 )
@@ -58,6 +57,13 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
     watch_engine_death,
+)
+from _stream import (
+    StreamingDecimator,
+    apply_nco_chunk,
+    hardware_rate_for,
+    make_backpressure_put,
+    require_sample_rate,
 )
 from framings import LIVE_FRAMINGS as _LIVE_FRAMINGS
 from framings import normalize_framing, valid_ax25_address
@@ -298,15 +304,6 @@ def _select_rx_antenna(dev, soapy_rx, ch, args, params, log) -> None:  # pragma:
     log.info("dsp SDR: RX antenna=%s (available=%s, requested port=%r)", chosen, available, port)
 
 
-def _resample_poly(x, up: int, down: int):  # pragma: no cover (needs scipy + hardware)
-    """Polyphase resample a complex64 chunk by ``up/down`` (capture rate → modem rate).
-    scipy handles the anti-alias filter; per-chunk boundary transients are negligible at
-    the large capture/modem ratio and the modem's sync tolerates them."""
-    from scipy.signal import resample_poly  # noqa: PLC0415
-
-    return resample_poly(x, up, down).astype(np.complex64)
-
-
 def _soapy_iq_chunks(args, params, report=None):  # pragma: no cover (needs hardware/SoapySDR)
     import SoapySDR  # lazy: only the dsp+hardware path needs it
     from SoapySDR import (
@@ -323,30 +320,31 @@ def _soapy_iq_chunks(args, params, report=None):  # pragma: no cover (needs hard
 
     params = merge_sdr_params(params)  # station GS_SDR_* antenna/gain/agc defaults
     env = sdr_env()
-    lo = env["lo_offset_hz"]
-    # Capture at the SDR's supported rate (XTRX floor ~2.1 Msps) and resample each
-    # chunk down to ``rate`` for the modem (the file-IQ path is already at ``rate``).
-    sdr_rate, decimate = capture_plan(env["capture_rate_hz"], rate)
-    up, down = resample_ratio(sdr_rate, rate) if decimate else (1, 1)
+    # R-14: the SDR runs at a SUPPORTED rate that is an INTEGER multiple of
+    # the modem rate (XTRX-class RX can't stream ~96 kHz directly); the
+    # stateful decimator below brings it down exactly. GS_SDR_CAPTURE_RATE=0
+    # keeps the modem rate (RTL-class hardware).
+    sdr_rate, factor = hardware_rate_for(rate, env["capture_rate_hz"])
+    decimate = factor > 1
+    # R-13: LO offset via TUNE-BELOW + a software NCO at the capture rate.
+    # The old driver RF/BB CORDIC split is a silent no-op on the XTRX — the
+    # BB half never applied and the carrier sat off-band. auto_lo_offset
+    # validates the configured offset fits the captured band (else on-center).
+    lo = auto_lo_offset(sdr_rate, rate, env["lo_offset_hz"])
 
     dev = SoapySDR.Device(args.sdr_args)
     dev.setSampleRate(SOAPY_SDR_RX, ch, sdr_rate)
+    # R-14 readback validation: a driver that silently clamps the rate
+    # desynchronizes the modem — fail closed at spawn (R-11 surfaces it).
+    require_sample_rate(dev, SOAPY_SDR_RX, ch, sdr_rate)
     # Widen the ANALOG RX filter to ~the capture rate so a large LO offset (the +lo carrier below)
     # isn't rolled off before the ADC — the XTRX analog floor is ~0.8 MHz; channel selectivity is
     # done in DSP. Guarded: a driver without a settable analog BW just ignores it.
     with contextlib.suppress(Exception):  # noqa: BLE001 — driver may lack a settable analog BW
         dev.setBandwidth(SOAPY_SDR_RX, ch, sdr_rate)
-    # LO offset: tune the analog LO off-carrier (RF) + the baseband CORDIC back (BB)
-    # so the DC spike sits at +lo, not on the signal. The dsp NCO handles Doppler at
-    # baseband, so the LO is set once here.
-    if lo:
-        try:
-            dev.setFrequency(SOAPY_SDR_RX, ch, "RF", freq + lo)
-            dev.setFrequency(SOAPY_SDR_RX, ch, "BB", -lo)
-        except Exception:  # noqa: BLE001 — driver without RF/BB split → direct tune
-            dev.setFrequency(SOAPY_SDR_RX, ch, freq)
-    else:
-        dev.setFrequency(SOAPY_SDR_RX, ch, freq)
+    # Tune PLAINLY to center - lo: the carrier lands at +lo at baseband and
+    # the software NCO in the read loop shifts it to DC (works on ANY driver).
+    dev.setFrequency(SOAPY_SDR_RX, ch, freq - lo)
     _select_rx_antenna(dev, SOAPY_SDR_RX, ch, args, params, log)
     if env["ppm"]:
         with contextlib.suppress(Exception):
@@ -406,6 +404,11 @@ def _soapy_iq_chunks(args, params, report=None):  # pragma: no cover (needs hard
     dev.activateStream(stream)
     buff = np.empty(_READ_CHUNK, dtype=np.complex64)
     total = reads = timeouts = overflows = errors = 0
+    # R-13: stateful across chunks — the LO NCO stays phase-continuous and the
+    # decimator carries its FIR state (the old per-chunk resample_poly reset
+    # the filter at every boundary).
+    decim = StreamingDecimator(factor)
+    lo_phase = 0.0
     try:
         while True:
             # 1 s timeout so a stalled SDR surfaces as logged timeouts, not a silent
@@ -418,10 +421,10 @@ def _soapy_iq_chunks(args, params, report=None):  # pragma: no cover (needs hard
                     log.info("dsp SDR: streaming — first %d samples received", sr.ret)
                 elif reads % 5000 == 0:
                     log.info("dsp SDR: %.2f Msamples read so far", total / 1e6)
-                if decimate:  # resample capture-rate chunk down to the modem rate
-                    yield _resample_poly(buff[: sr.ret], up, down)
-                else:
-                    yield buff[: sr.ret].copy()
+                chunk = buff[: sr.ret].copy()
+                if lo:  # shift the +lo carrier to DC BEFORE the decimator's LPF
+                    chunk, lo_phase = apply_nco_chunk(chunk, lo, sdr_rate, lo_phase)
+                yield decim.process(chunk) if decimate else chunk
             elif sr.ret == SOAPY_SDR_TIMEOUT:
                 timeouts += 1
                 if timeouts in (1, 10, 100) or timeouts % 1000 == 0:
@@ -469,6 +472,10 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
     # Pre-demod IQ capture: record the RAW chunk (before the Doppler NCO / demod).
     recorder = StreamRecorder.maybe_start(args, sample_rate_hz=sample_rate)
     sdr_report: dict[str, object] = {}
+    # R-13: backpressure put — a fast source (bench cf32 replay) can neither
+    # overflow the bounded queue nor lose the None terminator; interruptible
+    # on stop so teardown can't hang.
+    put = make_backpressure_put(queue, loop, stop_requested)
 
     def _reader() -> None:
         try:
@@ -478,13 +485,13 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                 arr = np.asarray(chunk, dtype=np.complex64)
                 if recorder is not None:
                     recorder.write(arr)
-                loop.call_soon_threadsafe(queue.put_nowait, arr)
+                put(arr)
         except Exception:
             log.exception("IQ source error")
         finally:
             if recorder is not None:
                 recorder.close()  # close the cf32; views derived post-pass by iq_views
-            loop.call_soon_threadsafe(queue.put_nowait, None)
+            put(None)
 
     # Daemon thread, NOT run_in_executor: a wedged SoapySDR readStream must not
     # block interpreter exit on the fail-closed path (executor threads are
@@ -567,20 +574,30 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                     await _emit_frame(sockets, body, framing=fname, output_dir=out_dir)
 
     decode_task = asyncio.create_task(_decode_loop(), name="decode-loop")
-    chunk: np.ndarray | None = first_chunk  # the proof chunk is data — decode it too
+    pending: np.ndarray | None = first_chunk  # the proof chunk is data — decode it too
     try:
         while True:
-            if chunk is None:
-                break
-            off = doppler["hz"]
-            if off:
-                n = np.arange(len(chunk))
-                ph = nco_phase - 2.0 * np.pi * off * n / sample_rate
-                chunk = (chunk * np.exp(1j * ph)).astype(np.complex64)
-                nco_phase = float(ph[-1]) if len(ph) else nco_phase
+            if pending is not None:
+                chunk, pending = pending, None
+            else:
+                # Stop-aware drain (R-13): the interruptible put may drop the
+                # None terminator at teardown (stop set + full queue), so a
+                # sentinel-only exit could block forever. The reader stops
+                # producing once stop is set → "stop and empty" is final.
+                if stop_requested.is_set() and queue.empty():
+                    break
+                try:
+                    got = await asyncio.wait_for(queue.get(), timeout=0.2)
+                except TimeoutError:
+                    continue
+                if got is None:
+                    break
+                chunk = got
+            # R-13: phase ADVANCES across chunks (the old carry repeated the
+            # last sample's phase, glitching the correction every boundary).
+            chunk, nco_phase = apply_nco_chunk(chunk, doppler["hz"], sample_rate, nco_phase)
             for _, dec in decoders:
                 dec.push(chunk)
-            chunk = await queue.get()
     finally:
         stop_requested.set()
         # AWAIT (never cancel) the decode task: a cancel could discard frames a

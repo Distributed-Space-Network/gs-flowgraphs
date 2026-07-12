@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import concurrent.futures
 import contextlib
 import logging
 import math
@@ -49,6 +48,14 @@ from _spawn_contract import (
     load_params,
     run_command_loop,
     send_event,
+)
+from _stream import (
+    StreamingDecimator,
+    apply_nco_chunk,
+    hardware_rate_for,
+    make_backpressure_put,
+    require_sample_rate,
+    upsample_burst,
 )
 
 from gfsk_ax25 import endurosat_link, gfsk
@@ -391,20 +398,9 @@ async def run_rx(
     nco_phase = 0.0
     last_signal = 0.0
 
-    def _put(item: np.ndarray | None) -> None:
-        # Backpressure: block the reader thread until the item is enqueued, so a fast source (a
-        # bench cf32 replay outpacing the consumer) can't overflow the bounded queue or lose the
-        # terminator. INTERRUPTIBLE: if the consumer stops draining (e.g. it died) we must not park
-        # here forever — poll stop_requested and bail (dropping the item) so teardown can't hang.
-        fut = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
-        while True:
-            try:
-                fut.result(timeout=0.1)
-                return
-            except concurrent.futures.TimeoutError:
-                if stop_requested.is_set():
-                    fut.cancel()  # tearing down and nobody is draining — abandon this put
-                    return
+    # Backpressure put, interruptible on stop — shared X-02 primitive (the
+    # cubesat dsp engine uses the same one; one implementation, one test).
+    _put = make_backpressure_put(queue, loop, stop_requested)
 
     def _reader() -> None:
         try:
@@ -459,12 +455,9 @@ async def run_rx(
                 continue
             if chunk is None:
                 break
-            off = doppler["hz"]
-            if off:
-                n = np.arange(len(chunk))
-                ph = nco_phase - 2.0 * np.pi * off * n / sample_rate
-                chunk = (chunk * np.exp(1j * ph)).astype(np.complex64)
-                nco_phase = float(ph[-1]) if len(ph) else nco_phase
+            # R-13: phase ADVANCES across chunks (the old ph[-1] carry
+            # repeated the last sample's phase at every boundary).
+            chunk, nco_phase = apply_nco_chunk(chunk, doppler["hz"], sample_rate, nco_phase)
             now = time.monotonic()
             if now - last_signal >= _SIGNAL_PERIOD_S:
                 last_signal = now
@@ -539,18 +532,29 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         self._dev = dev
         env = sdr_env()
         merged = merge_sdr_params(params)
+        # R-14: the DEVICE runs at a supported rate — the smallest INTEGER
+        # multiple of the modem rate above the hardware floor (XTRX-class
+        # can't stream ~96 kHz directly). RX decimates by the exact factor
+        # (stateful); TX bursts are upsampled by it before the write. The
+        # readback is validated: a silently-clamped rate desynchronizes the
+        # modem, so a mismatch fails the spawn closed (R-11).
+        hw_rate, factor = hardware_rate_for(rate, env["capture_rate_hz"])
+        self._hw_rate, self._factor = hw_rate, factor
+        self._decim = StreamingDecimator(factor)
         # RX on the downlink.
-        dev.setSampleRate(SOAPY_SDR_RX, 0, rate)
+        dev.setSampleRate(SOAPY_SDR_RX, 0, hw_rate)
+        require_sample_rate(dev, SOAPY_SDR_RX, 0, hw_rate)
         dev.setFrequency(SOAPY_SDR_RX, 0, float(args.center_freq_hz))
         with contextlib.suppress(Exception):
-            dev.setBandwidth(SOAPY_SDR_RX, 0, rate)
+            dev.setBandwidth(SOAPY_SDR_RX, 0, hw_rate)
         # TX on the uplink freq (split-freq). params['uplink_hz'] falls back to the RX centre.
         uplink_hz = float(params.get("uplink_hz", args.center_freq_hz) or args.center_freq_hz)
         self._uplink_hz = uplink_hz
-        dev.setSampleRate(SOAPY_SDR_TX, 0, rate)
+        dev.setSampleRate(SOAPY_SDR_TX, 0, hw_rate)
+        require_sample_rate(dev, SOAPY_SDR_TX, 0, hw_rate)
         dev.setFrequency(SOAPY_SDR_TX, 0, uplink_hz)
         with contextlib.suppress(Exception):
-            dev.setBandwidth(SOAPY_SDR_TX, 0, rate)
+            dev.setBandwidth(SOAPY_SDR_TX, 0, hw_rate)
 
         class _EP:
             def __init__(self, d: object, direction: int) -> None:
@@ -591,7 +595,10 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         # R-15: after a TX burst reactivates RX, samples before this monotonic
         # deadline are the front-end's settling transient and are discarded.
         self._rx_settle_until = 0.0
-        _log.info("bidir SoapySDR: rx=%.0f tx=%.0f rate=%.0f", args.center_freq_hz, uplink_hz, rate)
+        _log.info(
+            "bidir SoapySDR: rx=%.0f tx=%.0f modem=%.0f hw=%.0f (x%d)",
+            args.center_freq_hz, uplink_hz, rate, hw_rate, factor,
+        )
 
     def rx_chunks(self) -> Iterator[np.ndarray]:
         from SoapySDR import SOAPY_SDR_OVERFLOW, SOAPY_SDR_TIMEOUT
@@ -606,7 +613,11 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
             if sr.ret > 0:
                 if time.monotonic() < self._rx_settle_until:
                     continue  # R-15: post-reactivation settling transient — discard
-                yield buff[: sr.ret].copy()
+                # R-14: hardware-rate capture → modem-rate chunks (stateful,
+                # exact integer factor).
+                out = self._decim.process(buff[: sr.ret].copy())
+                if len(out):
+                    yield out
             elif sr.ret in (SOAPY_SDR_TIMEOUT, SOAPY_SDR_OVERFLOW):
                 continue
             else:
@@ -626,7 +637,9 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         zero-sample completion)."""
         from _soapy_tx import query_tx_mtu, write_burst
 
-        buf = np.asarray(iq, dtype=np.complex64)
+        # R-14: the modulator's modem-rate burst is interpolated to the
+        # device's supported hardware rate (exact integer factor).
+        buf = upsample_burst(np.asarray(iq, dtype=np.complex64), self._factor)
         self.tx_active.set()
         try:
             with self._lock:
@@ -639,7 +652,7 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                     # writer that cannot drain one burst in this is wedged; it
                     # must not hold the device lock through ~21 one-second
                     # timeouts (P0-07).
-                    deadline_s = max(5.0, 3.0 * len(buf) / max(1.0, self._rate))
+                    deadline_s = max(5.0, 3.0 * len(buf) / max(1.0, self._hw_rate))
                     result = write_burst(
                         self._dev,
                         tx,
