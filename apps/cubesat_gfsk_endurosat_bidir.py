@@ -406,6 +406,13 @@ async def run_rx(
     # cubesat dsp engine uses the same one; one implementation, one test).
     _put = make_backpressure_put(queue, loop, stop_requested)
 
+    # Audit round 2 (silent-success class): the reader used to swallow its own death —
+    # the except logged, and the finally pushed the SAME `None` terminator a clean EOF
+    # uses, so run_rx returned NORMALLY after the SDR failed. The pass then completed
+    # with zero frames and no error event: a dead radio was indistinguishable from a
+    # quiet sky. The failure is now captured and re-raised once the queue drains.
+    reader_error: list[BaseException] = []
+
     def _reader() -> None:
         try:
             for chunk in io.rx_chunks():
@@ -417,8 +424,9 @@ async def run_rx(
                 if recorder is not None:
                     recorder.write(arr)
                 _put(arr)
-        except Exception:
+        except Exception as e:
             _log.exception("bidir RX: IQ source error")
+            reader_error.append(e)
         finally:
             if recorder is not None:
                 recorder.close()

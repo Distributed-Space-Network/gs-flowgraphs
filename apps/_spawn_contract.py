@@ -228,6 +228,7 @@ async def run_command_loop(
     *,
     on_unknown: CommandHandler | None = None,
     terminal_cmds: frozenset[str] = frozenset({"stop"}),
+    status_writer: asyncio.StreamWriter | None = None,
 ) -> str:
     """Dispatch loop. Each command's ``cmd`` field selects a handler in
     ``handlers``; unknown ``cmd`` values fall through to ``on_unknown`` (or are
@@ -261,8 +262,24 @@ async def run_command_loop(
             continue
         try:
             await handler(cmd)
-        except Exception:
+        except Exception as e:
+            # Audit round 2 (silent-success class): this used to log and KEEP GOING,
+            # with no error event and no effect on the exit code. The TX apps do all
+            # of their transmitting inside these handlers — so a `transmit` that blew
+            # up was invisible to gs-client, and the pass completed as if it had
+            # radiated. An engine that cannot execute a command must SAY so.
             log.exception("control: handler for cmd=%r raised", name)
+            if status_writer is not None:
+                with contextlib.suppress(Exception):
+                    await send_event(
+                        status_writer,
+                        {
+                            "event": "error",
+                            "code": "handler-failed",
+                            "cmd": name,
+                            "detail": repr(e),
+                        },
+                    )
         if name in terminal_cmds:
             # Even a raising stop handler ends dispatch — the caller's cleanup
             # path owns the rest (P0-08).

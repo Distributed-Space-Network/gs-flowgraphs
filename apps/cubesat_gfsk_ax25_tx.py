@@ -333,10 +333,30 @@ async def amain(args) -> int:
         if engine == "gnuradio":  # pragma: no cover (bench)
             from gnuradio_gfsk import transmit_gnuradio
 
-            await asyncio.to_thread(transmit_gnuradio, args, params, profile)
+            # Audit round 2: this used to emit a HARDCODED
+            # {"samples": 0, "outcome": "complete"} whatever the engine did — a
+            # fabricated success for a burst that may have radiated nothing, and an
+            # engine exception was swallowed by the command loop on top. Report the
+            # REAL burst result, and fail loudly if the engine raises.
+            try:
+                burst = await asyncio.to_thread(transmit_gnuradio, args, params, profile)
+            except Exception as e:
+                logging.getLogger("cubesat_gfsk_ax25_tx").exception(
+                    "gnuradio TX engine failed"
+                )
+                await send_event(
+                    sockets.status_writer,
+                    {"event": "error", "code": "tx-engine-failed", "detail": repr(e)},
+                )
+                return
             await send_event(
                 sockets.status_writer,
-                {"event": "transmit_complete", "samples": 0, "outcome": "complete"},
+                {
+                    "event": "transmit_complete",
+                    "samples": int(getattr(burst, "accepted", 0)),
+                    "outcome": str(getattr(burst, "outcome", "error")),
+                    "detail": str(getattr(burst, "detail", "")),
+                },
             )
             return
         # R-16: transmit_started is emitted only when the stream provably

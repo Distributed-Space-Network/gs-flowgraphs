@@ -81,6 +81,7 @@ def no_decode_reason(
     mode: tuple[str, float] | None,
     grsat_live: bool,
     framing: str | None = None,
+    deframer_available: bool = True,
 ) -> str:
     """R2-02: why (if at all) this graph ended up with NO decoder.
 
@@ -94,7 +95,21 @@ def no_decode_reason(
     PassResult.
     """
     if has_decode_consumer:
-        return ""
+        if deframer_available:
+            return ""
+        # The demod built and the graph LOOKS healthy — it just cannot deframe what it
+        # demodulates. A backend framing outside our local vocabulary (AX.100, USP,
+        # Mobitex, NGHam, CCSDS Concatenated…) is decodable ONLY by gr-satellites, so
+        # with GS_GRSAT_LIVE unset every drain returns nothing, forever, and the engine
+        # still logs a success-shaped "our demod fsk@9600 …". Zero frames, no error.
+        return (
+            f"no deframer: the demod for {mode[0]}@{mode[1]:.0f} was built, but framing "
+            f"{framing!r} has no local deframer and gr-satellites is gated off "
+            f"(GS_GRSAT_LIVE unset) — NOTHING can turn these symbols into frames"
+            if mode else
+            f"no deframer: framing {framing!r} has no local deframer and gr-satellites "
+            f"is gated off (GS_GRSAT_LIVE unset)"
+        )
     if not mode:
         why = (
             "no decoder built: the backend sent no usable demod params (transmitter has no "

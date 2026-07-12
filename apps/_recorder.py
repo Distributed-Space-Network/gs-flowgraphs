@@ -21,7 +21,6 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
-import contextlib
 import datetime as _dt
 import json
 import logging
@@ -105,6 +104,9 @@ def write_vsa_csv(
         np.savetxt(f, np.column_stack((iq.real, iq.imag)), fmt="%.6e", delimiter=",")
 
 
+_log = logging.getLogger("gs_flowgraphs._recorder")
+
+
 # ---------------------------------------------------------------- waterfall PNG
 
 
@@ -112,7 +114,11 @@ def _spectrogram_db(iq: np.ndarray, *, nfft: int = 1024, max_rows: int = 1024) -
     """STFT magnitude in dB, shape (time, freq), DC-centered. Hops are sized so the
     whole capture fits in ≤ ``max_rows`` time slices (so the image stays bounded)."""
     if iq.size < nfft:
-        return np.zeros((1, nfft), dtype=np.float32)
+        # Audit round 2: this used to return a zeros row, which write_waterfall_png
+        # then normalized into a perfectly valid-looking uniform PNG — a fabricated
+        # spectrogram for a capture that is too short to have one. An empty array
+        # makes the caller skip the artifact instead of inventing it.
+        return np.zeros((0, nfft), dtype=np.float32)
     slices = max(1, (iq.size - nfft) // nfft + 1)
     hop = max(nfft, ((iq.size - nfft) // max_rows) + 1) if slices > max_rows else nfft
     win = np.hanning(nfft).astype(np.float32)
@@ -185,6 +191,17 @@ def write_waterfall_png(
     ``sample_rate_hz`` scales the frequency axis to kHz; without it the frequency axis is unlabeled
     (normalized)."""
     spec = _spectrogram_db(np.asarray(iq, dtype=np.complex64), nfft=nfft)
+    if spec.shape[0] == 0:
+        # Audit round 2: a capture shorter than one FFT window has no spectrogram. We
+        # used to fabricate one (a zeros row -> a uniform, perfectly plausible PNG).
+        # Skip the artifact and say why — an absent waterfall is honest; an invented
+        # one is a lie an operator will read as "the band was quiet".
+        _log.warning(
+            "capture is %d samples — shorter than one %d-point FFT window; NO waterfall "
+            "written (a synthetic all-zeros image would misrepresent the band as quiet)",
+            int(np.asarray(iq).size), nfft,
+        )
+        return
     duration_s = (float(len(iq)) / sample_rate_hz) if sample_rate_hz > 0 else 0.0
     try:
         _write_waterfall_matplotlib(
@@ -281,8 +298,19 @@ def write_cf32_sidecar(iq_path: Path, *, sample_rate_hz: float, center_hz: float
         "center_hz": float(center_hz),
         "format": "cf32le",
     }
-    with contextlib.suppress(OSError):
+    try:
         iq_path.with_name(iq_path.name + ".json").write_text(json.dumps(meta))
+    except OSError as e:
+        # Audit round 2: this was suppressed SILENTLY. The sidecar is the only record
+        # of the capture's TRUE rate/centre (they differ from the orchestrator's
+        # --sample-rate whenever the channel was widened), so without it every derived
+        # artifact — waterfall axes, post-pass decode, CFO search — is mislabelled and
+        # nothing says so.
+        _log.warning(
+            "IQ sidecar write FAILED for %s (%s) — the capture's true rate/centre is "
+            "now UNRECORDED; derived artifacts and post-pass decode may be mislabelled",
+            iq_path.name, e,
+        )
 
 
 class PassRecorder:

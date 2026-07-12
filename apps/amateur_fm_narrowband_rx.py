@@ -79,6 +79,11 @@ from gnuradio import analog, filter as gr_filter, gr, soapy
 
 VERSION = "0.1.0"
 
+# Log an audio-queue overflow on the first event and every Nth after — loud enough that
+# dropped audio is never invisible, bounded enough that a sustained overflow cannot flood
+# the journal (audit round 2).
+_DROP_LOG_EVERY = 100
+
 # Signal-event cadence (Document A telemetry default).
 _SIGNAL_PERIOD_S = 0.1
 
@@ -114,6 +119,7 @@ class _QueueSink(gr.sync_block):
         )
         self._q = target_queue
         self.dropped = 0
+        self._drop_events = 0
         self.last_power = 0.0  # R-17: latest mean-square audio level (linear)
 
     def work(self, input_items, output_items):  # type: ignore[no-untyped-def]
@@ -126,7 +132,19 @@ class _QueueSink(gr.sync_block):
         try:
             self._q.put_nowait(samples.tobytes())
         except queue.Full:
+            # Dropping is CORRECT here — blocking would starve the cf32 recorder through
+            # GR's fan-out. What was wrong (audit round 2) is that `dropped` was never
+            # logged, never emitted, never checked: audio vanished from the product and
+            # the pass reported a clean success. Rate-limited so a sustained overflow
+            # cannot itself flood the journal.
             self.dropped += len(samples)
+            self._drop_events += 1
+            if self._drop_events == 1 or self._drop_events % _DROP_LOG_EVERY == 0:
+                logging.getLogger("amateur_fm_narrowband_rx").warning(
+                    "audio queue FULL — dropped %d samples so far (%d overflow events): "
+                    "the consumer is not keeping up and this audio is NOT in the product",
+                    self.dropped, self._drop_events,
+                )
         return len(samples)
 
 

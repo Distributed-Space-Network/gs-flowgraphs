@@ -602,11 +602,19 @@ def build_satellites_rx(
     # `ready` event, so the pass result cannot read as a successful decode (a green pass
     # with zero frames and no explanation is indistinguishable from a bird that was silent).
     # The reason itself is computed by a PURE helper so it is testable without GNU Radio.
+    # A demod with NOTHING that can deframe it is decode-dead too: a backend framing
+    # outside our local vocabulary (AX.100 / USP / Mobitex / CCSDS Concatenated…) is
+    # deframable only by gr-satellites, so with it gated off every drain returns
+    # nothing while the graph looks perfectly healthy.
+    deframer_available = bool(grsat_deframers) or fg is not None or (
+        framings.normalize_framing(framing) is not None if framing else True
+    )
     reason = no_decode_reason(
         has_decode_consumer=decode_consumers,
         mode=mode,
         grsat_live=grsat_live,
         framing=framing,
+        deframer_available=deframer_available,
     )
     # Decoupled model: both decode libraries run off our one demod, so there are no valves to gate
     # (valve_ours/valve_grsat stay None → drain_frames just collects + dedups; the race_winner

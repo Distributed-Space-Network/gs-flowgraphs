@@ -352,8 +352,13 @@ def build_rx_top_block(
         lo_offset_hz=lo, rotator=rotator, sdr_rate_hz=sdr_rate, sdr_applied=applied)
 
 
-def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile) -> None:
-    """Build the AX.25 frame, GFSK-modulate via GNU Radio, and key it out the SDR."""
+def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile):
+    """Build the AX.25 frame, GFSK-modulate via GNU Radio, and key it out the SDR.
+
+    Returns a ``_soapy_tx.BurstResult``. It used to return None and the caller then
+    emitted a HARDCODED ``transmit_complete outcome="complete", samples=0`` — a
+    fabricated success, sitting directly under the comment forbidding exactly that
+    (R-16). A burst that radiated nothing must never report completion."""
     import base64
 
     sample_rate = float(args.sample_rate or 96_000)
@@ -387,6 +392,18 @@ def transmit_gnuradio(args, params: dict[str, object], profile: endurosat.LinkPr
     sink.set_bandwidth(0, sample_rate)
     tb.connect(src, mod, sink)
     tb.run()
+    # R-16 / audit round 2: report what was ACTUALLY pushed. `src` is the finite
+    # vector source feeding the modulator, so its item count is the burst we handed
+    # to the SDR; tb.run() returns only when the graph has drained it.
+    from _soapy_tx import BurstResult  # noqa: PLC0415 — bench-only import
+
+    total = int(getattr(src, "nitems_written", lambda _i: 0)(0))
+    return BurstResult(
+        accepted=total,
+        total=total,
+        outcome="complete" if total > 0 else "error",
+        detail="" if total > 0 else "GNU Radio TX graph pushed zero items",
+    )
 
 
 __all__ = ["build_rx_top_block", "transmit_gnuradio"]
