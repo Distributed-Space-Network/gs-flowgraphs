@@ -147,11 +147,19 @@ async def emit_burst(
             should_abort=should_abort,
         )
     except Exception as e:
+        # AUDIT ROUND 4 (P0): emitting `tx-failed` and RETURNING NORMALLY is not enough.
+        # The burst handler is the `start` command handler, so returning cleanly leaves the
+        # app alive and the pass running — while the PA/T-R chain is still energized
+        # (KEYED_READY with no accepted sample, or KEYED after one). RAISE, so the command
+        # loop's handler-failure path ends dispatch and the app exits nonzero: gs-client
+        # sees a crashed engine, forces the PA off, and fails the pass. The error event is
+        # still emitted first so the reason survives.
         logging.getLogger("cubesat_gfsk_ax25_tx").exception("TX burst failed")
-        await send_event(
-            status_writer, {"event": "error", "code": "tx-failed", "detail": repr(e)}
-        )
-        return
+        with contextlib.suppress(Exception):
+            await send_event(
+                status_writer, {"event": "error", "code": "tx-failed", "detail": repr(e)}
+            )
+        raise
     await send_event(
         status_writer,
         {

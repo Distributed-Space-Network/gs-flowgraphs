@@ -128,3 +128,74 @@ class TestTheEngineDeathWatcherIsWired:
         exception was swallowed by gather(return_exceptions=True)."""
         src = (_APPS / "cubesat_gfsk_endurosat_bidir.py").read_text(encoding="utf-8")
         assert "watch_engine_death(rx_task" in src
+
+
+class TestTheWatcherCannotSwallowAnEngineFailure:
+    """AUDIT ROUND 4. Raising was not enough: run_rx sets `stop_requested` in its own
+    finally BEFORE it raises, and watch_engine_death suppressed ANY exception whenever that
+    flag was set. So the EngineFailure was reported to nobody — no error event, no control
+    EOF, and the app exited 0. The guard swallowed the exact thing it exists to report."""
+
+    @staticmethod
+    def _watch(exc: BaseException | None, *, stopping: bool) -> tuple[list[dict], bool]:
+        import json
+
+        from _spawn_contract import watch_engine_death
+
+        class _W:
+            def __init__(self) -> None:
+                self.buf = b""
+
+            def write(self, data: bytes) -> None:
+                self.buf += data
+
+            async def drain(self) -> None:
+                return None
+
+        async def _run() -> tuple[list[dict], bool]:
+            async def _engine() -> None:
+                if exc is not None:
+                    raise exc
+
+            stop = asyncio.Event()
+            if stopping:
+                stop.set()
+            reader = asyncio.StreamReader()
+            writer = _W()
+            task = asyncio.create_task(_engine())
+            watch_engine_death(task, writer, reader, stop)  # type: ignore[arg-type]
+            await asyncio.gather(task, return_exceptions=True)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            events = [
+                json.loads(ln) for ln in writer.buf.decode().splitlines() if ln.strip()
+            ]
+            return events, reader.at_eof()
+
+        return asyncio.run(_run())
+
+    def test_an_engine_failure_during_teardown_is_still_reported(self) -> None:
+        """THE REPRO: stop_requested is set (the engine's own finally set it) AND the engine
+        died. It must still fail the pass."""
+        events, eof = self._watch(EngineFailure("the SDR died"), stopping=True)
+        assert any(e.get("event") == "error" for e in events), (
+            "the engine's death was swallowed because teardown had begun"
+        )
+        assert eof, "the control reader must get EOF so the app exits nonzero"
+
+    def test_an_engine_failure_while_running_is_reported(self) -> None:
+        events, eof = self._watch(EngineFailure("the SDR died"), stopping=False)
+        assert any(e.get("event") == "error" for e in events)
+        assert eof
+
+    def test_an_ordinary_exception_during_a_requested_stop_is_still_ignored(self) -> None:
+        """The guard's real purpose survives: teardown noise during a REQUESTED stop is not
+        a pass failure."""
+        events, eof = self._watch(RuntimeError("teardown noise"), stopping=True)
+        assert events == []
+        assert not eof
+
+    def test_a_clean_engine_exit_is_not_a_failure(self) -> None:
+        events, eof = self._watch(None, stopping=False)
+        assert events == []
+        assert not eof

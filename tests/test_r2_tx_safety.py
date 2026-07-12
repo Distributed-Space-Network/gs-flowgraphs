@@ -132,21 +132,51 @@ class TestTheBurstAnnouncesItself:
         assert done["outcome"] == "error"
 
 
-class TestAFailedBurstIsLoud:
-    def test_a_modulator_that_raises_emits_an_error_not_a_completion(
+class TestAFailedBurstTakesThePaDown:
+    """AUDIT ROUND 4 (P0): emitting `tx-failed` and RETURNING NORMALLY is not PA safety.
+    The burst runs inside the `start` command handler — returning cleanly leaves the app
+    alive and the pass running while the PA/T-R chain is still energized (KEYED_READY with
+    no accepted sample; KEYED after one). It must RAISE, so the command loop's
+    handler-failure path ends dispatch, the app exits nonzero, and gs-client forces the PA
+    off and fails the pass."""
+
+    def test_a_failed_burst_reports_and_then_RAISES(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        w = asyncio.run(
-            _run(
-                monkeypatch, accepted=0, total=0, engine="gnuradio",
-                modulate_raises=RuntimeError("GNU Radio blew up"),
-            )
-        )
+        w = _Writer()
+
+        async def _go() -> None:
+            mod = type(sys)("gnuradio_gfsk")
+
+            def _boom(*_a, **_k):
+                raise RuntimeError("GNU Radio blew up")
+
+            mod.modulate_gnuradio = _boom  # type: ignore[attr-defined]
+            monkeypatch.setitem(sys.modules, "gnuradio_gfsk", mod)
+            await tx.emit_burst(w, _Args(), {}, _profile(), "gnuradio")
+
+        with pytest.raises(RuntimeError, match="GNU Radio blew up"):
+            asyncio.run(_go())
+
         kinds = w.kinds()
-        assert "error" in kinds
+        assert "error" in kinds, "the reason must still reach gs-client before we die"
         assert "transmit_complete" not in kinds, "a failed burst must not report completion"
         err = next(e for e in w.events if e["event"] == "error")
         assert err["code"] == "tx-failed"
+
+    def test_a_sink_failure_also_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        w = _Writer()
+
+        def _boom_sink(*_a, **_k):
+            raise OSError("SoapySDR write failed")
+
+        monkeypatch.setattr(tx, "_sink_iq", _boom_sink)
+        monkeypatch.setattr(
+            tx, "_build_frame_iq", lambda *_a, **_k: np.ones(256, dtype=np.complex64)
+        )
+        with pytest.raises(OSError, match="SoapySDR write failed"):
+            asyncio.run(tx.emit_burst(w, _Args(), {}, _profile(), "dsp"))
+        assert any(e.get("code") == "tx-failed" for e in w.events)
 
 
 class TestBothEnginesShareTheOneSink:

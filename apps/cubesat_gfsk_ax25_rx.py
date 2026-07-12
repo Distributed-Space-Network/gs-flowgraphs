@@ -472,6 +472,12 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
     # on stop so teardown can't hang.
     put = make_backpressure_put(queue, loop, stop_requested)
 
+    # AUDIT ROUND 4: the reader used to convert a DEVICE FAILURE into the same `None`
+    # terminator a clean end-of-stream uses, so a dead SDR ended the pass normally — zero
+    # frames, no error, a completed pass. Capture it and re-raise once the queue has
+    # drained, so nothing already received is lost but the pass still FAILS.
+    reader_error: list[BaseException] = []
+
     def _reader() -> None:
         try:
             for chunk in _open_iq_source(args, params, sdr_report):
@@ -481,8 +487,9 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                 if recorder is not None:
                     recorder.write(arr)
                 put(arr)
-        except Exception:
+        except Exception as e:
             log.exception("IQ source error")
+            reader_error.append(e)
         finally:
             if recorder is not None:
                 recorder.close()  # close the cf32; views derived post-pass by iq_views
@@ -610,6 +617,14 @@ async def _run_dsp_engine(args, sockets, params, started, stop_requested, profil
                 leftovers = []
             for body in leftovers:
                 await _emit_frame(sockets, body, framing=fname, output_dir=out_dir)
+    # The reader's DEATH must not look like a clean end-of-stream (audit round 4). Raised
+    # after the queue drained and the leftovers were emitted, so nothing already received is
+    # lost — but the pass FAILS instead of completing with zero frames.
+    if reader_error:
+        raise EngineFailure(
+            f"RX: the IQ source DIED mid-pass — {reader_error[0]!r}. Frames received before "
+            f"the failure were emitted; the rest of the pass captured NOTHING."
+        ) from reader_error[0]
 
 
 # ----------------------------------------------------------------------

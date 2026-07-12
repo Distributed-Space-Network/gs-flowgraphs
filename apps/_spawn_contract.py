@@ -381,7 +381,11 @@ def watch_engine_death(
         if t.cancelled():
             return
         exc = t.exception()
-        if exc is None or stop_requested.is_set():
+        # AUDIT ROUND 4: an EngineFailure is the engine DYING — never a clean teardown. It
+        # must be reported even when stop_requested is set, because the engine's own
+        # teardown sets that flag before it raises (which is exactly how this guard came to
+        # swallow a dead SDR: exception raised, flag set, nothing reported).
+        if exc is None or (stop_requested.is_set() and not isinstance(exc, EngineFailure)):
             return
         log.error("engine task died: %r — failing the pass (R-11)", exc)
 
