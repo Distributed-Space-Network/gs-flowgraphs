@@ -64,6 +64,7 @@ install(
     apps/_doppler.py                 # flowgraph-owned Doppler poll (docs/12), imported by satellite_rx
     apps/_recorder.py                # pre-demod IQ capture (cf32/CSV/PNG), imported by the RX engines
     apps/_fallback_select.py         # fallback demod selection (imported by gnuradio_satellites)
+    apps/_uplink_frame.py            # R2-43: THE payload+framing selector, shared by BOTH TX engines
     apps/modem.py                    # modem registry: modulation -> demod chain (docs/08)
     apps/framings.py                 # framing registry: framing -> deframe (docs/08)
     apps/fec.py                      # FEC registry: randomizer/CRC/ASM/RS + bench codecs (docs/08)

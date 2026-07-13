@@ -43,7 +43,7 @@ from _soapy import (
 from gnuradio import analog, blocks, digital, gr
 from gnuradio import filter as gr_filter
 
-from gfsk_ax25 import ax25, endurosat, framing
+from gfsk_ax25 import endurosat
 
 _log = logging.getLogger("gnuradio_gfsk")
 
@@ -350,42 +350,42 @@ def build_rx_top_block(
         lo_offset_hz=lo, rotator=rotator, sdr_rate_hz=sdr_rate, sdr_applied=applied)
 
 
-def modulate_gnuradio(args, params: dict[str, object], profile: endurosat.LinkProfile):
-    """GFSK-modulate the uplink frame with GNU Radio and RETURN the baseband IQ.
+def modulate_gnuradio(frame):
+    """GFSK-modulate an ALREADY-FRAMED uplink with GNU Radio and RETURN the baseband IQ.
 
-    It does NOT touch the SDR. The previous ``transmit_gnuradio`` opened its own soapy
-    sink and ran its own graph, which made it a SECOND transmit path that bypassed every
-    invariant the shared one enforces: it never emitted ``transmit_started`` (so safety
-    stayed in KEYED_READY and the orchestrator's immediate de-key — which only fires from
-    KEYED — never ran, leaving the PA energized and T/R on TX until LOS), it counted
-    SOURCE items instead of samples the SDR accepted, it skipped the shared payload
-    selection, and it never validated the hardware rate. That is a TX-safety defect, not
-    a reporting one.
+    It does NOT touch the SDR, and — since R2-43 — it does not decide WHAT to transmit either.
 
-    Now there is ONE transmit path. This function is the modulator; the caller feeds its
-    IQ to ``_sink_iq`` exactly like the dsp engine, so MTU handling, rate validation,
-    first-accept proof and the accepted-sample count are identical for both engines.
+    It used to. It resolved the payload from ``uplink_b64`` and nowhere else (so a file-sourced
+    uplink silently became an EMPTY frame), and it always built an AX.25 UI frame — even when the
+    pass asked for ``framing=endurosat``, a pair the waveform schema ADVERTISES. Flying that pair
+    keyed the PA and radiated a well-formed, correctly-modulated AX.25 frame at a satellite that
+    speaks EnduroSat chip packets. It reported success.
+
+    Now it receives an :class:`_uplink_frame.UplinkFrame` — bits, plus the symbol rate / modulation
+    index / BT that the chosen framing implies — built by the same code the dsp engine uses. The two
+    engines cannot disagree about the frame, because only one of them knows what a frame is.
+
+    (The earlier ``transmit_gnuradio`` also opened its own SDR sink, which made it a second transmit
+    path that never emitted ``transmit_started`` — safety stayed in KEYED_READY, the orchestrator's
+    immediate de-key only fires from KEYED, and the PA stayed energized until LOS. That is why this
+    is a modulator and the caller owns the sink.)
     """
-    import base64  # noqa: PLC0415
-
-    sample_rate = float(args.sample_rate or 96_000)
-    sps = int(round(sample_rate / profile.symbol_rate_hz))
-    payload = b""
-    b64 = params.get("uplink_b64")
-    if isinstance(b64, str) and b64:
-        payload = base64.b64decode(b64)
-    body = ax25.encode_ui(
-        dest=str(params.get("dest", "CQ")),
-        src=str(params.get("src", "DSN")),
-        info=payload[: endurosat.AX25_INFO_MAX_BYTES],
-    )
-    bits = framing.encode(body, scramble=profile.scramble, nrzi=profile.nrzi)
-    sensitivity = math.pi * profile.mod_index / sps  # rad/sample at full deflection
-    tb = gr.top_block("cubesat_gfsk_ax25_mod_gr")
+    sps = int(round(frame.sps))
+    if abs(frame.sps - sps) > 1e-9:
+        msg = (
+            f"sample_rate/symbol_rate must be an integer (got {frame.sps:.4f} sps for "
+            f"{frame.sample_rate_hz:.0f}/{frame.symbol_rate_hz:.0f}) — refusing to key the PA with "
+            f"a resampled frame"
+        )
+        raise ValueError(msg)
+    sensitivity = math.pi * frame.mod_index / sps  # rad/sample at full deflection
+    tb = gr.top_block("cubesat_gfsk_mod_gr")
     # gfsk_mod defaults to do_unpack=True: it expects PACKED bytes and unpacks internally.
     # Feeding unpacked 0/1 bits would make each bit 8 symbols (8x-slow, garbled waveform).
-    src = blocks.vector_source_b(np.packbits(bits.astype(np.uint8)).tolist(), repeat=False)
-    mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=profile.bt)
+    src = blocks.vector_source_b(
+        np.packbits(np.asarray(frame.bits, dtype=np.uint8)).tolist(), repeat=False
+    )
+    mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=frame.bt)
     snk = blocks.vector_sink_c()
     tb.connect(src, mod, snk)
     tb.run()

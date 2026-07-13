@@ -20,7 +20,6 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import logging
 import os
@@ -28,7 +27,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from _fallback_select import symbol_rate_hz_of
 from _soapy import (
     apply_corrections,
     configure_soapy_source,
@@ -44,10 +42,13 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
+from _uplink_frame import UplinkFrame, build_uplink_frame, select_framing
 
-from gfsk_ax25 import ax25, endurosat, endurosat_link
+from gfsk_ax25 import endurosat, gfsk
 
 VERSION = "0.1.0"
+log = logging.getLogger("cubesat_gfsk_ax25_tx")
+
 _DEFAULT_SAMPLE_RATE = 96_000
 
 
@@ -63,46 +64,41 @@ def _select_engine(args, params: dict[str, object]) -> str:
 
 def _select_framing(params: dict[str, object]) -> str:
     """ax25 (default) | endurosat (chip-packet). For endurosat the uplink payload
-    is the already-built (encrypted AirMAC) frame, sent verbatim in the packet."""
-    framing = (
-        os.environ.get("GS_FLOWGRAPH_FRAMING", "")
-        or (str(params.get("framing", "")) if isinstance(params, dict) else "")
-        or "ax25"
-    ).lower()
-    return framing if framing in ("ax25", "endurosat") else "ax25"
+    is the already-built (encrypted AirMAC) frame, sent verbatim in the packet.
+
+    R2-43: the CHOICE lives here, but the framing itself lives in _uplink_frame, which BOTH engines
+    go through. The gnuradio engine used to build its own frame and always chose AX.25."""
+    return select_framing(params, env=os.environ.get("GS_FLOWGRAPH_FRAMING", ""))
 
 
-def _uplink_payload(args, params: dict[str, object]) -> bytes:
-    b64 = params.get("uplink_b64")
-    if isinstance(b64, str) and b64:
-        return base64.b64decode(b64)
-    for candidate in (params.get("uplink_file"), Path(args.output_dir or ".") / "uplink.bin"):
-        if candidate and Path(candidate).exists():
-            return Path(candidate).read_bytes()
-    return b""
+def _build_frame(args, params: dict[str, object], profile) -> UplinkFrame:
+    """The one framed uplink both engines modulate. See apps/_uplink_frame.py."""
+    frame = build_uplink_frame(args, params, profile, framing_name=_select_framing(params))
+    log.info(
+        "uplink frame: framing=%s payload=%dB from %s | %d bits @ %.0f sym/s (h=%.2f bt=%.2f)",
+        frame.framing, frame.payload_len, frame.payload_source,
+        frame.bits.size, frame.symbol_rate_hz, frame.mod_index, frame.bt,
+    )
+    if frame.payload_len == 0:
+        log.warning(
+            "uplink payload is EMPTY (no uplink_b64, no uplink_file, no uplink.bin) — the burst "
+            "would key the PA to transmit a frame with no content"
+        )
+    return frame
 
 
 def _build_frame_iq(args, params: dict[str, object], profile) -> np.ndarray:
-    payload = _uplink_payload(args, params)
-    sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
-    if _select_framing(params) == "endurosat":
-        # Uplink payload is the already-built (encrypted AirMAC) frame; wrap it in
-        # the EnduroSat chip packet (preamble + sync + len + CRC-16) at 9600 sym/s
-        # (endurosat_link defaults), honouring params overrides if present.
-        sym_hz = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
-        return endurosat_link.transmit(
-            payload[: endurosat_link.MAX_PAYLOAD],
-            sample_rate,
-            symbol_rate_hz=sym_hz,
-            mod_index=float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
-            bt=float(params.get("bt", endurosat_link.DEFAULT_BT)),
-        )
-    body = ax25.encode_ui(
-        dest=str(params.get("dest", "CQ")),
-        src=str(params.get("src", "DSN")),
-        info=payload[: endurosat.AX25_INFO_MAX_BYTES],
+    """dsp engine: modulate the SHARED frame's bits. Nothing here decides what to transmit."""
+    frame = _build_frame(args, params, profile)
+    return gfsk.modulate(
+        frame.bits,
+        gfsk.GfskParams(
+            sample_rate_hz=frame.sample_rate_hz,
+            symbol_rate_hz=frame.symbol_rate_hz,
+            mod_index=frame.mod_index,
+            bt=frame.bt,
+        ),
     )
-    return endurosat.transmit(body, sample_rate, profile=profile)
 
 
 async def emit_burst(
@@ -138,7 +134,10 @@ async def emit_burst(
         if engine == "gnuradio":  # pragma: no cover (bench: needs GNU Radio)
             from gnuradio_gfsk import modulate_gnuradio  # noqa: PLC0415
 
-            iq = await asyncio.to_thread(modulate_gnuradio, args, params, profile)
+            # R2-43: the engine gets the SHARED frame. It no longer resolves the payload (it knew
+            # about only one of the three sources) and it no longer chooses the framing (it always
+            # chose AX.25, even for an EnduroSat uplink). It modulates. That is all it does.
+            iq = await asyncio.to_thread(modulate_gnuradio, _build_frame(args, params, profile))
         else:
             iq = _build_frame_iq(args, params, profile)
         result = await asyncio.to_thread(
