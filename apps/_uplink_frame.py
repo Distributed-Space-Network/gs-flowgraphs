@@ -91,10 +91,51 @@ def resolve_payload(args, params: dict[str, object]) -> tuple[bytes, str]:
     return b"", "NONE"
 
 
+# The labels the BACKEND and the SatNOGS/transmitter catalogues actually emit, mapped onto the two
+# framings we implement. R2-43 (round 5): selection matched the exact strings "ax25"/"endurosat" and
+# SILENTLY fell back to AX.25 for everything else — so a pass whose framing said "AirMAC" (the
+# customer's own label for the EnduroSat session layer), or "EnduroSat AirMAC", or anything
+# mis-cased, transmitted an AX.25 frame at an EnduroSat bird and reported success. A fallback is
+# fine for an ABSENT framing. For a framing that was explicitly REQUESTED and is not understood, a
+# fallback is a wrong-protocol transmission dressed up as a default.
+_FRAMING_ALIASES: dict[str, str] = {
+    "ax25": "ax25",
+    "ax.25": "ax25",
+    "ax_25": "ax25",
+    "endurosat": "endurosat",
+    "endurosat_link": "endurosat",
+    "endurosat-link": "endurosat",
+    "airmac": "endurosat",  # AirMAC rides INSIDE the EnduroSat chip packet, opaquely
+    "endurosat airmac": "endurosat",
+    "endurosat_airmac": "endurosat",
+    "endurosat-airmac": "endurosat",
+}
+
+
+class UnknownFraming(ValueError):
+    """An explicitly-requested framing we do not implement. NEVER silently downgraded."""
+
+
+def normalize_framing(label: str) -> str:
+    """A backend/catalogue framing label -> one of FRAMINGS. Raises on an unknown EXPLICIT label."""
+    key = " ".join(str(label).strip().lower().split())
+    if key in _FRAMING_ALIASES:
+        return _FRAMING_ALIASES[key]
+    msg = (
+        f"unknown framing {label!r} — refusing to fall back to AX.25. Transmitting the wrong link "
+        f"layer at a spacecraft is worse than transmitting nothing. Known: "
+        f"{sorted(set(_FRAMING_ALIASES))}"
+    )
+    raise UnknownFraming(msg)
+
+
 def select_framing(params: dict[str, object], *, env: str = "") -> str:
+    """The framing for this pass. ABSENT -> ax25 (the app's documented default). PRESENT but
+    unknown -> raise, because the caller asked for something specific and we cannot do it."""
     chosen = env or (str(params.get("framing", "")) if isinstance(params, dict) else "")
-    f = (chosen or "ax25").lower()
-    return f if f in FRAMINGS else "ax25"
+    if not chosen.strip():
+        return "ax25"
+    return normalize_framing(chosen)
 
 
 def build_uplink_frame(

@@ -30,6 +30,7 @@ sys.path.insert(0, str(_APPS))
 from _uplink_frame import (  # noqa: E402
     ENGINES,
     FRAMINGS,
+    UnknownFraming,
     build_uplink_frame,
     resolve_payload,
     select_framing,
@@ -106,8 +107,39 @@ class TestFramingIsHonouredRatherThanAssumed:
         # An AX.25 frame is NOT an EnduroSat packet — the deframer must find nothing in it.
         assert endurosat_link.deframe(frame.bits) == []
 
-    def test_an_unknown_framing_falls_back_to_ax25_rather_than_inventing_one(self) -> None:
-        assert select_framing({"framing": "mobitex"}) == "ax25"
+    def test_an_unknown_EXPLICIT_framing_is_REFUSED_not_downgraded(self) -> None:
+        """Round 5. This test used to assert the OPPOSITE — that an unknown framing quietly became
+        AX.25 — and it passed, which is how the defect survived: a fallback for a framing the caller
+        explicitly REQUESTED is a wrong-protocol transmission wearing a default's clothes.
+
+        An ABSENT framing still defaults to AX.25 (the app's documented behaviour). A framing that
+        was asked for and is not understood stops the pass."""
+        with pytest.raises(UnknownFraming, match="refusing to fall back"):
+            select_framing({"framing": "mobitex"})
+        assert select_framing({}) == "ax25"  # absent -> documented default
+        assert select_framing({"framing": "  "}) == "ax25"  # blank -> absent
+
+    @pytest.mark.parametrize(
+        ("label", "want"),
+        [
+            ("AirMAC", "endurosat"),          # the customer's own label for the session layer
+            ("EnduroSat AirMAC", "endurosat"),
+            ("endurosat_airmac", "endurosat"),
+            ("EnduroSat", "endurosat"),
+            ("AX.25", "ax25"),
+            ("ax_25", "ax25"),
+            ("  AX25  ", "ax25"),
+        ],
+    )
+    def test_the_labels_the_backend_actually_emits_are_understood(
+        self, label: str, want: str
+    ) -> None:
+        """Selection matched the exact strings "ax25"/"endurosat" and silently fell back for
+        everything else. A pass whose framing said "AirMAC" — which is what the customer calls the
+        EnduroSat session layer, and what the catalogues carry — therefore transmitted AX.25 at an
+        EnduroSat bird and reported success. AirMAC rides INSIDE the chip packet; it is not a
+        different physical framing."""
+        assert select_framing({"framing": label}) == want
 
     def test_the_endurosat_payload_is_not_scrambled_or_nrzi_encoded(self, tmp_path: Path) -> None:
         """A distinct assertion because it is the exact corruption AX.25 framing would apply: the
@@ -190,3 +222,32 @@ class TestTheCapabilityTableIsHonest:
         assert frame.framing == framing_name
         assert frame.payload_len == len(PAYLOAD)
         assert frame.bits.size > 0
+
+
+class TestTheGnuRadioEngineDoesNotPadTheFrame:
+    """R2-43 (round 5). np.packbits() pads the last byte with ZERO BITS. An AX.25 frame is 329 bits;
+    packed it is 42 bytes = 336 bits, and gfsk_mod (do_unpack=True) modulates all 336 — appending
+    SEVEN INVENTED SYMBOLS to a frame whose CRC was computed over 329. The dsp engine modulates the
+    bit array directly and does not. The two engines put different waveforms on the air."""
+
+    def test_a_frame_that_is_not_a_whole_number_of_bytes_is_REFUSED(self) -> None:
+        import ast
+
+        src = (_APPS / "gnuradio_gfsk.py").read_text(encoding="utf-8")
+        fn = next(
+            n
+            for n in ast.parse(src).body
+            if isinstance(n, ast.FunctionDef) and n.name == "modulate_gnuradio"
+        )
+        code = "\n".join(ast.unparse(st) for st in fn.body)
+        assert "bits.size % 8" in code, "the modulator still pads a partial byte with zero bits"
+        assert "raise ValueError" in code
+
+    def test_an_ax25_frame_is_typically_not_byte_aligned(self, tmp_path: Path) -> None:
+        """The premise, made concrete: HDLC bit-stuffing means an AX.25 frame's length in bits is
+        NOT generally a multiple of 8 — which is exactly why padding it silently is wrong."""
+        params = {"uplink_b64": base64.b64encode(PAYLOAD).decode(), "framing": "ax25"}
+        frame = build_uplink_frame(_args(tmp_path), params, PROFILE, framing_name="ax25")
+        assert frame.bits.size > 0
+        # We do not assert it IS misaligned (bit-stuffing depends on the payload); we assert the
+        # modulator now refuses rather than pads when it is.

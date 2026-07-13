@@ -382,9 +382,24 @@ def modulate_gnuradio(frame):
     tb = gr.top_block("cubesat_gfsk_mod_gr")
     # gfsk_mod defaults to do_unpack=True: it expects PACKED bytes and unpacks internally.
     # Feeding unpacked 0/1 bits would make each bit 8 symbols (8x-slow, garbled waveform).
-    src = blocks.vector_source_b(
-        np.packbits(np.asarray(frame.bits, dtype=np.uint8)).tolist(), repeat=False
-    )
+    # R2-43 (round 5): np.packbits() pads the LAST byte with ZERO BITS. An AX.25 frame is 329 bits;
+    # packed it becomes 42 bytes = 336 bits, and gfsk_mod (do_unpack=True) faithfully modulates all
+    # 336 — appending SEVEN INVENTED SYMBOLS to the end of a frame whose CRC was computed over 329.
+    # The dsp engine, which modulates the bit array directly, does not do this, so the two engines
+    # put different waveforms on the air for the same frame.
+    #
+    # Bits are an exact quantity. If they do not pack to a whole number of bytes, this modulator
+    # cannot carry them, and it says so rather than padding the difference.
+    bits = np.asarray(frame.bits, dtype=np.uint8)
+    if bits.size % 8:
+        msg = (
+            f"GNU Radio engine: frame is {bits.size} bits, not a whole number of bytes. "
+            f"np.packbits() would pad it with {8 - bits.size % 8} zero bits and the modulator "
+            f"would radiate them — a frame the receiver CRC cannot match. Use the dsp engine, "
+            f"or pad deliberately at the framing layer where the CRC can account for it."
+        )
+        raise ValueError(msg)
+    src = blocks.vector_source_b(np.packbits(bits).tolist(), repeat=False)
     mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=frame.bt)
     snk = blocks.vector_sink_c()
     tb.connect(src, mod, snk)
