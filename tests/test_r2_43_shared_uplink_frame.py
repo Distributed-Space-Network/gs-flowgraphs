@@ -225,12 +225,15 @@ class TestTheCapabilityTableIsHonest:
 
 
 class TestTheGnuRadioEngineDoesNotPadTheFrame:
-    """R2-43 (round 5). np.packbits() pads the last byte with ZERO BITS. An AX.25 frame is 329 bits;
-    packed it is 42 bytes = 336 bits, and gfsk_mod (do_unpack=True) modulates all 336 — appending
-    SEVEN INVENTED SYMBOLS to a frame whose CRC was computed over 329. The dsp engine modulates the
-    bit array directly and does not. The two engines put different waveforms on the air."""
+    """Round 7: the engine no longer PACKS at all, so there is nothing to pad.
 
-    def test_a_frame_that_is_not_a_whole_number_of_bytes_is_REFUSED(self) -> None:
+    np.packbits() pads the last byte with zero bits, so the modulator radiated up to seven
+    invented symbols the FCS did not cover. Round 6 padded the bitstream with flag bits at the
+    framing layer — but AFTER scrambling and NRZI, so it was not encoded idle fill at all, just
+    raw bits wearing a flag's clothes. The answer is not to pack: one byte per bit,
+    do_unpack=False, exact bit count, no padding anywhere."""
+
+    def test_the_engine_feeds_UNPACKED_bits(self) -> None:
         import ast
 
         src = (_APPS / "gnuradio_gfsk.py").read_text(encoding="utf-8")
@@ -240,14 +243,90 @@ class TestTheGnuRadioEngineDoesNotPadTheFrame:
             if isinstance(n, ast.FunctionDef) and n.name == "modulate_gnuradio"
         )
         code = "\n".join(ast.unparse(st) for st in fn.body)
-        assert "bits.size % 8" in code, "the modulator still pads a partial byte with zero bits"
-        assert "raise ValueError" in code
+        assert "packbits" not in code, "the engine still PACKS bits (and pads the last byte)"
+        assert "do_unpack=False" in code, "gfsk_mod would unpack bytes we never packed"
 
-    def test_an_ax25_frame_is_typically_not_byte_aligned(self, tmp_path: Path) -> None:
-        """The premise, made concrete: HDLC bit-stuffing means an AX.25 frame's length in bits is
-        NOT generally a multiple of 8 — which is exactly why padding it silently is wrong."""
+    def test_the_framing_layer_no_longer_pads(self) -> None:
+        src = (_APPS / "_uplink_frame.py").read_text(encoding="utf-8")
+        assert "_byte_align" not in src
+
+
+class TestNothingIsSilentlyTruncatedOrDowngraded:
+    def test_an_oversized_endurosat_payload_is_REFUSED(self, tmp_path: Path) -> None:
+        """It was TRUNCATED and radiated as a successful command. A truncated command is a
+        DIFFERENT command: the spacecraft executes whatever the first 128 bytes happen to mean."""
+        from _uplink_frame import PayloadRejected
+
+        big = base64.b64encode(b"A" * 300).decode()
+        with pytest.raises(PayloadRejected, match="REFUSING"):
+            build_uplink_frame(
+                _args(tmp_path),
+                {"uplink_b64": big, "framing": "endurosat"},
+                PROFILE,
+                framing_name="endurosat",
+            )
+
+    def test_an_oversized_ax25_payload_is_REFUSED(self, tmp_path: Path) -> None:
+        from _uplink_frame import PayloadRejected
+
+        big = base64.b64encode(b"A" * 300).decode()
+        with pytest.raises(PayloadRejected, match="REFUSING"):
+            build_uplink_frame(
+                _args(tmp_path),
+                {"uplink_b64": big, "framing": "ax25"},
+                PROFILE,
+                framing_name="ax25",
+            )
+
+    def test_an_EMPTY_endurosat_payload_is_REFUSED(self, tmp_path: Path) -> None:
+        """An empty chip packet does not deframe at the far end. It is a PA key with no effect."""
+        from _uplink_frame import PayloadRejected
+
+        with pytest.raises(PayloadRejected, match="EMPTY"):
+            build_uplink_frame(
+                _args(tmp_path), {"framing": "endurosat"}, PROFILE, framing_name="endurosat"
+            )
+
+    def test_params_win_over_the_environment(self) -> None:
+        """GS_FLOWGRAPH_FRAMING silently overrode the framing gs-client had VALIDATED and written
+        into params.json — turning a configured EnduroSat uplink back into AX.25."""
+        assert select_framing({"framing": "endurosat"}, env="ax25") == "endurosat"
+        assert select_framing({}, env="endurosat") == "endurosat"
+
+
+class TestPreflightRunsBeforeThePaIsKeyed:
+    def test_a_rate_that_cannot_modulate_is_caught_BEFORE_ready(self, tmp_path: Path) -> None:
+        """THE COUNTEREXAMPLE. The canonical AX.25 TX waveform shipped at 96 kHz against
+        12480 sym/s = 7.692 samples/symbol. Both engines require an integer sps, so it could NEVER
+        have transmitted — and it found that out inside the modulator, after `ready`, with the T/R
+        relay thrown and the PA keyed."""
+        from types import SimpleNamespace
+
+        from _uplink_frame import RateUnusable, preflight
+
+        args = SimpleNamespace(sample_rate=96_000.0, output_dir=str(tmp_path))
         params = {"uplink_b64": base64.b64encode(PAYLOAD).decode(), "framing": "ax25"}
-        frame = build_uplink_frame(_args(tmp_path), params, PROFILE, framing_name="ax25")
-        assert frame.bits.size > 0
-        # We do not assert it IS misaligned (bit-stuffing depends on the payload); we assert the
-        # modulator now refuses rather than pads when it is.
+        with pytest.raises(RateUnusable, match="integer"):
+            preflight(args, params, PROFILE, engine="dsp", framing_name="ax25")
+
+    def test_124800_works_for_BOTH_advertised_framings(self, tmp_path: Path) -> None:
+        """124800/12480 = 10 (ax25); 124800/9600 = 13 (endurosat). One rate, both framings."""
+        from types import SimpleNamespace
+
+        from _uplink_frame import preflight
+
+        args = SimpleNamespace(sample_rate=124_800.0, output_dir=str(tmp_path))
+        for framing_name in ("ax25", "endurosat"):
+            params = {"uplink_b64": base64.b64encode(PAYLOAD).decode(), "framing": framing_name}
+            frame = preflight(args, params, PROFILE, engine="dsp", framing_name=framing_name)
+            assert float(frame.sps).is_integer()
+
+    def test_an_unknown_engine_is_REFUSED_not_downgraded_to_dsp(self, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from _uplink_frame import UnknownEngine, preflight
+
+        args = SimpleNamespace(sample_rate=124_800.0, output_dir=str(tmp_path))
+        params = {"uplink_b64": base64.b64encode(PAYLOAD).decode(), "framing": "ax25"}
+        with pytest.raises(UnknownEngine, match="refusing to fall back"):
+            preflight(args, params, PROFILE, engine="gnuradio3", framing_name="ax25")

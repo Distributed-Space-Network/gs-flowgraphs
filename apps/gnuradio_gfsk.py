@@ -382,24 +382,24 @@ def modulate_gnuradio(frame):
     tb = gr.top_block("cubesat_gfsk_mod_gr")
     # gfsk_mod defaults to do_unpack=True: it expects PACKED bytes and unpacks internally.
     # Feeding unpacked 0/1 bits would make each bit 8 symbols (8x-slow, garbled waveform).
-    # R2-43. np.packbits() pads the LAST byte with ZERO BITS, and gfsk_mod (do_unpack=True) would
-    # faithfully modulate them — inventing symbols on the end of a frame whose FCS does not cover
-    # them. The FIX IS UPSTREAM: _uplink_frame byte-aligns every frame with HDLC idle flag bits,
-    # which sit outside the frame delimiters and which the receiver discards. Both engines therefore
-    # modulate the SAME bitstream.
+    # Round 7: feed UNPACKED bits with do_unpack=False.
     #
-    # This assertion is the backstop. Refusing here (round 5) was safe but made half the advertised
-    # capability table — gnuradio+ax25 — unflyable, which is its own kind of lie.
+    # gfsk_mod defaults to do_unpack=True, which expects PACKED bytes — and np.packbits() pads the
+    # last byte with ZERO BITS, so the modulator radiated up to seven invented symbols on the end of
+    # a frame whose FCS did not cover them. Round 6 "fixed" that by padding the bitstream with flag
+    # bits at the framing layer, but that padding was appended AFTER scrambling and NRZI, so it was
+    # not encoded idle fill at all — just raw bits wearing a flag's clothes.
+    #
+    # The real answer is not to pack at all. One byte per bit, do_unpack=False, exact bit count, no
+    # padding anywhere, and the two engines modulate the identical bitstream.
     bits = np.asarray(frame.bits, dtype=np.uint8)
-    if bits.size % 8:
-        msg = (
-            f"GNU Radio engine: frame is {bits.size} bits, not a whole number of bytes — "
-            f"_uplink_frame should have byte-aligned it. Refusing to let np.packbits() invent "
-            f"{8 - bits.size % 8} symbols the receiver FCS cannot match."
-        )
+    if bits.size == 0:
+        msg = "GNU Radio engine: empty frame — refusing to key the PA"
         raise ValueError(msg)
-    src = blocks.vector_source_b(np.packbits(bits).tolist(), repeat=False)
-    mod = digital.gfsk_mod(samples_per_symbol=sps, sensitivity=sensitivity, bt=frame.bt)
+    src = blocks.vector_source_b(bits.tolist(), repeat=False)
+    mod = digital.gfsk_mod(
+        samples_per_symbol=sps, sensitivity=sensitivity, bt=frame.bt, do_unpack=False
+    )
     snk = blocks.vector_sink_c()
     tb.connect(src, mod, snk)
     tb.run()

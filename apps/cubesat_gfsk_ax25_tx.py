@@ -42,7 +42,14 @@ from _spawn_contract import (
     run_command_loop,
     send_event,
 )
-from _uplink_frame import UplinkFrame, build_uplink_frame, select_framing
+from _uplink_frame import (
+    ENGINES,
+    UnknownEngine,
+    UplinkFrame,
+    build_uplink_frame,
+    preflight,
+    select_framing,
+)
 
 from gfsk_ax25 import endurosat, gfsk
 
@@ -53,13 +60,27 @@ _DEFAULT_SAMPLE_RATE = 96_000
 
 
 def _select_engine(args, params: dict[str, object]) -> str:
-    engine = (
+    """The TX engine. ABSENT -> dsp (the documented default). PRESENT but unknown -> RAISE.
+
+    Round 7: an unknown engine silently became `dsp`, and the ENVIRONMENT outranked params.json — so
+    a typo, or a stale GS_FLOWGRAPH_ENGINE in someone's shell, quietly changed which modulator keyed
+    the PA. params.json is the station's VALIDATED configuration and it wins."""
+    from_params = str(params.get("engine", "")) if isinstance(params, dict) else ""
+    chosen = (
         (getattr(args, "engine", "") or "")
+        or from_params
         or os.environ.get("GS_FLOWGRAPH_ENGINE", "")
-        or (str(params.get("engine", "")) if isinstance(params, dict) else "")
-        or "dsp"
-    ).lower()
-    return engine if engine in ("dsp", "gnuradio") else "dsp"
+    ).strip().lower()
+    if not chosen:
+        return "dsp"
+    if chosen not in ENGINES:
+        msg = (
+            f"unknown engine {chosen!r} — refusing to fall back to dsp. A "
+            f"silent fallback means the "
+            f"PA is keyed by a modulator nobody asked for. Known: {sorted(ENGINES)}"
+        )
+        raise UnknownEngine(msg)
+    return chosen
 
 
 def _select_framing(params: dict[str, object]) -> str:
@@ -379,6 +400,30 @@ async def amain(args) -> int:
     tx_ok, tx_fields = await asyncio.to_thread(_tx_spawn_probe, args, params)
     if not tx_ok:
         await send_event(sockets.status_writer, {"event": "error", **tx_fields})
+        await sockets.aclose()
+        return 1
+
+    # Round 7: PREFLIGHT THE ENTIRE TRANSMISSION BEFORE `ready`.
+    #
+    # The engine, the framing, the payload length and — above all — the sample-rate/symbol-rate
+    # ratio were only ever discovered by the MODULATOR, which runs after `ready`, after the T/R
+    # relay
+    # has been thrown and after the PA has been keyed. The canonical AX.25 TX waveform shipped at
+    # 96 kHz against 12480 sym/s (7.69 samples/symbol): it could never have transmitted, and it
+    # would
+    # have found that out with the PA hot.
+    #
+    # Build the real frame here. If anything about it is unflyable, fail the spawn.
+    try:
+        await asyncio.to_thread(
+            preflight, args, params, profile, engine=engine, framing_name=_select_framing(params)
+        )
+    except ValueError as e:
+        log.error("TX preflight FAILED — refusing to declare ready: %s", e)
+        await send_event(
+            sockets.status_writer,
+            {"event": "error", "code": "tx-preflight-failed", "detail": str(e)},
+        )
         await sockets.aclose()
         return 1
 
