@@ -138,6 +138,32 @@ def select_framing(params: dict[str, object], *, env: str = "") -> str:
     return normalize_framing(chosen)
 
 
+def _byte_align(bits: np.ndarray) -> np.ndarray:
+    """Pad an HDLC bitstream to a whole number of bytes with IDLE FLAG BITS.
+
+    R2-43 (round 6). HDLC bit-stuffing means an AX.25 frame is not generally a multiple of 8 bits —
+    a typical UI frame is 329. The GNU Radio engine packs bits into bytes (gfsk_mod wants packed
+    input), and np.packbits() pads the last byte with ZEROS: seven invented symbols on the end of a
+    frame whose FCS covers 329 bits. Refusing the frame outright was correct but useless: the
+    waveform schema ADVERTISES gnuradio+ax25, so refusing it made half the advertised table
+    unflyable.
+
+    The right place to pad is HERE, at the framing layer, where the padding is MEANINGFUL. The
+    closing flag has already been emitted, so everything after it is inter-frame fill, and HDLC's
+    own idle pattern is a repeated flag (0x7E). We extend with those flag bits: they sit OUTSIDE the
+    frame delimiters, the receiver discards them as idle, and the FCS — computed over the frame
+    contents, not the fill — is untouched.
+
+    Both engines get the same byte-aligned bitstream, so both put the SAME waveform on the air."""
+    bits = np.asarray(bits, dtype=np.uint8)
+    remainder = bits.size % 8
+    if remainder == 0:
+        return bits
+    flag = np.array([0, 1, 1, 1, 1, 1, 1, 0], dtype=np.uint8)  # 0x7E, MSB-first
+    pad = np.resize(flag, 8 - remainder)  # idle fill, taken from the flag pattern
+    return np.concatenate([bits, pad])
+
+
 def build_uplink_frame(
     args, params: dict[str, object], profile: endurosat.LinkProfile, *, framing_name: str
 ) -> UplinkFrame:
@@ -181,7 +207,7 @@ def build_uplink_frame(
         info=clipped,
     )
     return UplinkFrame(
-        bits=framing.encode(body, scramble=profile.scramble, nrzi=profile.nrzi),
+        bits=_byte_align(framing.encode(body, scramble=profile.scramble, nrzi=profile.nrzi)),
         sample_rate_hz=sample_rate,
         symbol_rate_hz=profile.symbol_rate_hz,
         mod_index=profile.mod_index,

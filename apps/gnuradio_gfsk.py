@@ -382,21 +382,20 @@ def modulate_gnuradio(frame):
     tb = gr.top_block("cubesat_gfsk_mod_gr")
     # gfsk_mod defaults to do_unpack=True: it expects PACKED bytes and unpacks internally.
     # Feeding unpacked 0/1 bits would make each bit 8 symbols (8x-slow, garbled waveform).
-    # R2-43 (round 5): np.packbits() pads the LAST byte with ZERO BITS. An AX.25 frame is 329 bits;
-    # packed it becomes 42 bytes = 336 bits, and gfsk_mod (do_unpack=True) faithfully modulates all
-    # 336 — appending SEVEN INVENTED SYMBOLS to the end of a frame whose CRC was computed over 329.
-    # The dsp engine, which modulates the bit array directly, does not do this, so the two engines
-    # put different waveforms on the air for the same frame.
+    # R2-43. np.packbits() pads the LAST byte with ZERO BITS, and gfsk_mod (do_unpack=True) would
+    # faithfully modulate them — inventing symbols on the end of a frame whose FCS does not cover
+    # them. The FIX IS UPSTREAM: _uplink_frame byte-aligns every frame with HDLC idle flag bits,
+    # which sit outside the frame delimiters and which the receiver discards. Both engines therefore
+    # modulate the SAME bitstream.
     #
-    # Bits are an exact quantity. If they do not pack to a whole number of bytes, this modulator
-    # cannot carry them, and it says so rather than padding the difference.
+    # This assertion is the backstop. Refusing here (round 5) was safe but made half the advertised
+    # capability table — gnuradio+ax25 — unflyable, which is its own kind of lie.
     bits = np.asarray(frame.bits, dtype=np.uint8)
     if bits.size % 8:
         msg = (
-            f"GNU Radio engine: frame is {bits.size} bits, not a whole number of bytes. "
-            f"np.packbits() would pad it with {8 - bits.size % 8} zero bits and the modulator "
-            f"would radiate them — a frame the receiver CRC cannot match. Use the dsp engine, "
-            f"or pad deliberately at the framing layer where the CRC can account for it."
+            f"GNU Radio engine: frame is {bits.size} bits, not a whole number of bytes — "
+            f"_uplink_frame should have byte-aligned it. Refusing to let np.packbits() invent "
+            f"{8 - bits.size % 8} symbols the receiver FCS cannot match."
         )
         raise ValueError(msg)
     src = blocks.vector_source_b(np.packbits(bits).tolist(), repeat=False)
