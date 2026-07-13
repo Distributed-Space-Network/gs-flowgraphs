@@ -330,3 +330,80 @@ class TestPreflightRunsBeforeThePaIsKeyed:
         params = {"uplink_b64": base64.b64encode(PAYLOAD).decode(), "framing": "ax25"}
         with pytest.raises(UnknownEngine, match="refusing to fall back"):
             preflight(args, params, PROFILE, engine="gnuradio3", framing_name="ax25")
+
+
+class TestRound8ModulationParametersAreFiniteAndBounded:
+    """bt=0 raised ZeroDivisionError inside the Gaussian filter; bt/mod_index of NaN or Inf sailed
+    through and produced non-finite IQ the SDR would happily accept. All of it AFTER `ready`, with
+    the T/R relay thrown and the PA keyed."""
+
+    @pytest.mark.parametrize(
+        ("key", "bad"),
+        [
+            ("bt", 0.0),
+            ("bt", float("nan")),
+            ("bt", float("inf")),
+            ("mod_index", float("nan")),
+            ("mod_index", float("inf")),
+            ("mod_index", 0.0),
+        ],
+    )
+    def test_a_number_that_cannot_be_modulated_stops_the_pass_on_the_ground(
+        self, tmp_path: Path, key: str, bad: float
+    ) -> None:
+        from types import SimpleNamespace
+
+        from _uplink_frame import ModulationUnusable, preflight
+
+        args = SimpleNamespace(sample_rate=124_800.0, output_dir=str(tmp_path))
+        params = {
+            "uplink_b64": base64.b64encode(PAYLOAD).decode(),
+            "framing": "endurosat",
+            key: bad,
+        }
+        with pytest.raises(ModulationUnusable):
+            preflight(args, params, PROFILE, engine="dsp", framing_name="endurosat")
+
+    def test_the_healthy_defaults_still_pass(self, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from _uplink_frame import preflight
+
+        args = SimpleNamespace(sample_rate=124_800.0, output_dir=str(tmp_path))
+        params = {"uplink_b64": base64.b64encode(PAYLOAD).decode(), "framing": "endurosat"}
+        assert preflight(args, params, PROFILE, engine="dsp", framing_name="endurosat")
+
+
+class TestRound8PreflightBuildsTheRealIq:
+    """The engine was imported only INSIDE the burst, after `ready`. On a host without GNU Radio:
+
+        ready(engine=gnuradio) -> started -> tx-failed -> ModuleNotFoundError
+
+    with the relay thrown and the PA keyed for a modulator that does not exist. And the preflighted
+    frame was DISCARDED and rebuilt after keying, so a file payload could change in between."""
+
+    def test_preflight_imports_the_engine_and_modulates(self) -> None:
+        import ast
+
+        src = (_APPS / "cubesat_gfsk_ax25_tx.py").read_text(encoding="utf-8")
+        fn = next(
+            n
+            for n in ast.parse(src).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_preflight_and_build_iq"
+        )
+        code = "\n".join(ast.unparse(st) for st in fn.body)
+        assert "modulate_gnuradio" in code, "preflight does not load the gnuradio engine"
+        assert "gfsk.modulate" in code, "preflight does not modulate on the dsp path"
+        assert "isfinite" in code, "preflight does not check the IQ is finite"
+
+    def test_the_burst_uses_the_prevalidated_iq(self) -> None:
+        src = (_APPS / "cubesat_gfsk_ax25_tx.py").read_text(encoding="utf-8")
+        assert "iq=prevalidated_iq" in src, "the burst rebuilds the frame it was supposed to reuse"
+        assert "tx-engine-unavailable" in src, "a missing engine still fails AFTER ready"
+
+    def test_a_missing_engine_fails_the_SPAWN_not_the_burst(self) -> None:
+        """The error code exists and is emitted before `ready` — the spawn returns non-zero."""
+        src = (_APPS / "cubesat_gfsk_ax25_tx.py").read_text(encoding="utf-8")
+        before_ready = src[: src.index('"event": "ready"')]
+        assert "tx-preflight-failed" in before_ready
+        assert "tx-engine-unavailable" in before_ready

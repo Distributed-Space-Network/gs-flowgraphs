@@ -122,8 +122,44 @@ def _build_frame_iq(args, params: dict[str, object], profile) -> np.ndarray:
     )
 
 
+def _preflight_and_build_iq(args, params: dict[str, object], profile, engine: str):
+    """Validate EVERYTHING and produce the FINAL IQ — before `ready`, before the PA.
+
+    Round 8. This is the difference between "the numbers look fine" and "we can actually transmit":
+    it IMPORTS the selected engine (so a missing GNU Radio fails the spawn instead of the burst) and
+    it MODULATES (so a payload cannot change between validation and transmission — the frame used
+    on air is this frame, not a rebuilt one)."""
+    frame = preflight(args, params, profile, engine=engine, framing_name=_select_framing(params))
+    if engine == "gnuradio":
+        from gnuradio_gfsk import modulate_gnuradio  # noqa: PLC0415 — the point IS to import it now
+
+        iq = modulate_gnuradio(frame)
+    else:
+        iq = gfsk.modulate(
+            frame.bits,
+            gfsk.GfskParams(
+                sample_rate_hz=frame.sample_rate_hz,
+                symbol_rate_hz=frame.symbol_rate_hz,
+                mod_index=frame.mod_index,
+                bt=frame.bt,
+            ),
+        )
+    if iq.size == 0:
+        msg = "the modulator produced ZERO samples — refusing to key the PA"
+        raise ValueError(msg)
+    if not np.all(np.isfinite(iq.view(np.float32))):
+        msg = "the modulator produced NON-FINITE IQ (NaN/Inf) — refusing to key the PA"
+        raise ValueError(msg)
+    log.info(
+        "TX preflight: %s engine produced %d IQ samples — cached for the burst",
+        engine, iq.size,
+    )
+    return iq
+
+
 async def emit_burst(
-    status_writer, args, params: dict[str, object], profile, engine: str, *, should_abort=None
+    status_writer, args, params: dict[str, object], profile, engine: str, *,
+    should_abort=None, iq=None,
 ) -> None:
     """Modulate, key the burst through the ONE validated sink, and report it honestly.
 
@@ -152,7 +188,13 @@ async def emit_burst(
         )
 
     try:
-        if engine == "gnuradio":  # pragma: no cover (bench: needs GNU Radio)
+        # ROUND 8: use the IQ that PREFLIGHT built and validated. Rebuilding it here meant the frame
+        # on air was not the frame that was checked — a file payload could change or vanish in
+        # between, and the modulator's own failures (missing engine, bt=0, non-finite params) landed
+        # after `ready`, with the PA keyed.
+        if iq is not None:
+            pass
+        elif engine == "gnuradio":  # pragma: no cover (bench: needs GNU Radio)
             from gnuradio_gfsk import modulate_gnuradio  # noqa: PLC0415
 
             # R2-43: the engine gets the SHARED frame. It no longer resolves the payload (it knew
@@ -414,15 +456,33 @@ async def amain(args) -> int:
     # have found that out with the PA hot.
     #
     # Build the real frame here. If anything about it is unflyable, fail the spawn.
+    #
+    # ROUND 8: preflight must LOAD THE ENGINE and BUILD THE IQ, not merely check numbers.
+    #
+    #   * GNU Radio was imported only inside the burst path, AFTER `ready`. On a host without it the
+    #     sequence was: ready(engine=gnuradio) -> started -> ModuleNotFoundError -> tx-failed, with
+    #     the T/R relay thrown and the PA keyed for a modulator that does not exist.
+    #   * the preflighted frame was then DISCARDED and rebuilt after keying, so a file payload could
+    #     change or vanish between validation and transmission.
+    #
+    # Build the actual IQ here, once, and hand THAT to the burst.
     try:
-        await asyncio.to_thread(
-            preflight, args, params, profile, engine=engine, framing_name=_select_framing(params)
+        prevalidated_iq = await asyncio.to_thread(
+            _preflight_and_build_iq, args, params, profile, engine
         )
     except ValueError as e:
         log.error("TX preflight FAILED — refusing to declare ready: %s", e)
         await send_event(
             sockets.status_writer,
             {"event": "error", "code": "tx-preflight-failed", "detail": str(e)},
+        )
+        await sockets.aclose()
+        return 1
+    except ImportError as e:
+        log.error("TX preflight: engine %r is NOT AVAILABLE on this host: %s", engine, e)
+        await send_event(
+            sockets.status_writer,
+            {"event": "error", "code": "tx-engine-unavailable", "detail": str(e)},
         )
         await sockets.aclose()
         return 1
@@ -443,6 +503,7 @@ async def amain(args) -> int:
         await emit_burst(
             sockets.status_writer, args, params, profile, engine,
             should_abort=stop_requested.is_set,
+            iq=prevalidated_iq,  # ROUND 8: the frame we CHECKED is the frame we transmit
         )
 
     stop_reason = {"value": "command"}

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,6 +129,10 @@ class RateUnusable(ValueError):
     """The sample rate is not an integer multiple of the framing's symbol rate."""
 
 
+class ModulationUnusable(ValueError):
+    """A modulation parameter is non-finite or out of range (bt=0, NaN, Inf...)."""
+
+
 def preflight(
     args, params: dict[str, object], profile, *, engine: str, framing_name: str
 ) -> UplinkFrame:
@@ -147,7 +152,31 @@ def preflight(
     if engine not in ENGINES:
         msg = f"unknown engine {engine!r} — refusing to fall back to dsp. Known: {sorted(ENGINES)}"
         raise UnknownEngine(msg)
+
     frame = build_uplink_frame(args, params, profile, framing_name=framing_name)
+
+    # ROUND 8: every modulation number must be FINITE and BOUNDED.
+    #
+    # bt = 0 raised ZeroDivisionError inside the Gaussian filter; bt/mod_index of NaN or Inf sailed
+    # through and produced non-finite IQ that the SDR would happily accept. All of it AFTER `ready`,
+    # with the T/R relay thrown and the PA keyed. A number that cannot be modulated must stop the
+    # pass on the ground.
+    for name, value, lo, hi in (
+        ("symbol_rate_hz", frame.symbol_rate_hz, 1.0, 10e6),
+        ("sample_rate_hz", frame.sample_rate_hz, 1.0, 100e6),
+        ("mod_index", frame.mod_index, 1e-3, 10.0),
+        ("bt", frame.bt, 1e-3, 10.0),
+    ):
+        if not math.isfinite(value):
+            msg = f"{name} is {value!r} — not finite. Refusing to key a PA on a number like that."
+            raise ModulationUnusable(msg)
+        if not (lo <= value <= hi):
+            msg = (
+                f"{name} = {value!r} is outside the usable range [{lo}, {hi}]. Refusing to key the "
+                f"PA — bt=0 divides by zero inside the Gaussian filter, and out-of-range values "
+                f"produce a waveform no receiver can demodulate."
+            )
+            raise ModulationUnusable(msg)
     sps = frame.sps
     if abs(sps - round(sps)) > 1e-9 or round(sps) < 2:
         msg = (
@@ -269,6 +298,7 @@ def build_uplink_frame(
 
 __all__ = [
     "ENGINES",
+    "ModulationUnusable",
     "FRAMINGS",
     "UplinkFrame",
     "build_uplink_frame",
