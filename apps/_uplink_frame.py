@@ -38,6 +38,14 @@ from gfsk_ax25 import ax25, endurosat, endurosat_link, framing
 log = logging.getLogger(__name__)
 
 ENGINES = ("dsp", "gnuradio")
+
+# ROUND 9: hard ceilings on what a single burst may ask the machine for. gfsk.modulate() expands
+# every bit into `sps` samples via np.repeat; with nothing bounding sps or the bit count, a bad
+# sample-rate/symbol-rate pair asks numpy for hundreds of gigabytes and the station dies mid-pass
+# with the PA keyed.
+_MAX_SPS = 1024                     # a 9600-baud link at 100 Msps is ~10k — far past anything real
+_MAX_IQ_SAMPLES = 200_000_000       # 200 M complex64 = 1.6 GB, ~100 s at 2 Msps. Nothing legitimate
+                                    # comes close; a single EnduroSat burst is ~30k samples.
 FRAMINGS = ("ax25", "endurosat")
 
 
@@ -162,8 +170,10 @@ def preflight(
     # with the T/R relay thrown and the PA keyed. A number that cannot be modulated must stop the
     # pass on the ground.
     for name, value, lo, hi in (
-        ("symbol_rate_hz", frame.symbol_rate_hz, 1.0, 10e6),
-        ("sample_rate_hz", frame.sample_rate_hz, 1.0, 100e6),
+        # ROUND 9: protocol-specific floors. A 10-baud symbol rate is not a slow link, it is a
+        # nonsense one — the REST backend accepted baud=10 into the live bidirectional waveform.
+        ("symbol_rate_hz", frame.symbol_rate_hz, 1200.0, 10e6),
+        ("sample_rate_hz", frame.sample_rate_hz, 1200.0, 100e6),
         ("mod_index", frame.mod_index, 1e-3, 10.0),
         ("bt", frame.bt, 1e-3, 10.0),
     ):
@@ -187,6 +197,32 @@ def preflight(
             f"sps at 12480 and 13 sps at 9600)."
         )
         raise RateUnusable(msg)
+    # ROUND 9: BOUND THE ALLOCATION.
+    #
+    # gfsk.modulate() does np.repeat(symbols, sps) — so samples-per-symbol and the bit count
+    # together
+    # decide how much memory this asks for. Nothing bounded either. A large sample_rate against a
+    # small symbol rate gives an enormous sps, and np.repeat cheerfully attempts to allocate
+    # hundreds
+    # of gigabytes: the station dies, mid-pass, with the PA keyed.
+    sps_i = round(frame.sps)
+    if sps_i > _MAX_SPS:
+        msg = (
+            f"samples-per-symbol is {sps_i} (sample_rate {frame.sample_rate_hz:.0f} / symbol_rate "
+            f"{frame.symbol_rate_hz:.0f}); the ceiling is {_MAX_SPS}. Refusing: np.repeat "
+            f"would allocate an absurd buffer and kill the station mid-pass."
+        )
+        raise ModulationUnusable(msg)
+    total_samples = int(frame.bits.size) * sps_i
+    if total_samples > _MAX_IQ_SAMPLES:
+        msg = (
+            f"this burst would be {total_samples:,} IQ samples "
+            f"({total_samples * 8 / 1e6:.0f} MB of complex64) and last "
+            f"{total_samples / frame.sample_rate_hz:.1f} s. The ceiling is {_MAX_IQ_SAMPLES:,} "
+            f"samples. Refusing to key a PA for a transmission that size."
+        )
+        raise ModulationUnusable(msg)
+
     log.info(
         "TX preflight OK: engine=%s framing=%s payload=%dB from %s | %d bits @ %.0f sym/s, %d sps",
         engine, frame.framing, frame.payload_len, frame.payload_source,
