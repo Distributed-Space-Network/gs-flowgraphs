@@ -105,14 +105,18 @@ class _FakeSockets:
 
 
 def test_tx_controller_threads_should_abort_to_the_burst(tmp_path: Path) -> None:
-    # End to end through _TxController.transmit: with the app's stop already
-    # requested, the burst is cancelled and transmit_complete says so —
-    # truthful events (R-16), zero samples, outcome cancelled.
+    # End to end through the round-10 two-step handshake: the burst is STAGED while the station is
+    # still cold, and only then keyed + sent. With the app's stop already requested, the burst is
+    # cancelled and transmit_complete says so — truthful events (R-16), zero samples, cancelled.
     io = bidir.FileBidirIo(None, str(tmp_path / "uplink.cf32"))
-    tx = bidir._TxController(io, should_abort=lambda: True)
+    tx = bidir._TxController(io, sample_rate=96_000.0, should_abort=lambda: True)
     socks = _FakeSockets()
 
-    accepted = asyncio.run(tx.transmit(socks, b"payload", 96_000.0, {}))  # 10 sps @9k6
+    async def _stage_then_burst() -> int:
+        assert await tx.prepare(socks, "f1", b"payload", 96_000.0, {})  # 10 sps @9k6
+        return await tx.transmit(socks, "f1")
+
+    accepted = asyncio.run(_stage_then_burst())
     assert accepted == 0
     events = [
         json.loads(line)

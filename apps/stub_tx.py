@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import sys
@@ -159,12 +160,18 @@ async def amain(args: argparse.Namespace) -> int:
             "sample_rate": args.sample_rate,
             "stub_version": VERSION,
             "params_loaded": sorted(received_params),
+            # ROUND 11: this stub supports the pre-key burst handshake. The orchestrator's dynamic
+            # uplink path REFUSES to key an engine that does not advertise this.
+            "tx_prepare_required": True,
         },
     )
 
     started = False
     transmit_announced = False
     bg_tasks: list[asyncio.Task[None]] = []
+    # ROUND 11: the pre-key staged burst — {frame_id: (bytes, sha256)}. Filled by prepare_transmit
+    # (station cold), consumed by transmit_frame (PA keyed).
+    staged: dict[str, tuple[int, str]] = {}
 
     async def _periodic_frame() -> None:
         i = 0
@@ -219,6 +226,34 @@ async def amain(args: argparse.Namespace) -> int:
                             _periodic_frame(), name="stub_tx-periodic-frame",
                         ),
                     )
+            elif name == "prepare_transmit":
+                # ROUND 11 — PRE-KEY. Read + digest the staged payload while the station is cold and
+                # answer tx_prepared / tx_prepare_failed. The orchestrator keys only on tx_prepared,
+                # and verifies the digest matches the bytes it staged.
+                fid_obj = cmd.get("frame_id", "")
+                fid = fid_obj if isinstance(fid_obj, str) else ""
+                pf_obj = cmd.get("payload_file")
+                if isinstance(pf_obj, str) and pf_obj:
+                    try:
+                        payload = Path(pf_obj).read_bytes()
+                    except OSError as e:
+                        await _send_line(status_writer, {
+                            "event": "tx_prepare_failed", "frame_id": fid,
+                            "code": "payload-unreadable", "detail": str(e),
+                        })
+                        continue
+                    sha = hashlib.sha256(payload).hexdigest()
+                    staged[fid] = (len(payload), sha)
+                    await _send_line(status_writer, {
+                        "event": "tx_prepared", "frame_id": fid,
+                        "samples": max(1, len(payload)), "payload_bytes": len(payload),
+                        "payload_sha256": sha,
+                    })
+                else:
+                    await _send_line(status_writer, {
+                        "event": "tx_prepare_failed", "frame_id": fid,
+                        "code": "no-payload", "detail": "prepare_transmit without a payload_file",
+                    })
             elif name == "transmit_frame":
                 # Two variants per Document A A.7.3:
                 #   - ``bytes_b64``: inline payload (small frames)
@@ -290,10 +325,8 @@ async def amain(args: argparse.Namespace) -> int:
         del transmit_announced
         await _cancel_bg()
         for w in (status_writer, data_writer):
-            try:
+            with contextlib.suppress(Exception):
                 w.close()
-            except Exception:
-                pass
     return 0
 
 

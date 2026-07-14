@@ -3,9 +3,23 @@
 
 ONE process owns the XTRX for the whole pass. It runs a **continuous RX demod** on the downlink
 (emitting one ``frame_received`` per decoded EnduroSat chip packet, plus periodic ``signal`` RSSI),
-and on a ``transmit_frame`` / ``transmit_payload_file`` control command it **bursts** the uplink on
-the TX stream (emitting ``transmit_started`` → ``transmit_complete``). Uplink and downlink are
-different frequencies; the single antenna is half-duplex behind a T/R switch.
+and on command it **bursts** the uplink on the TX stream. Uplink and downlink are different
+frequencies; the single antenna is half-duplex behind a T/R switch.
+
+**The uplink is a TWO-STEP HANDSHAKE, and the split is a safety boundary (round 10):**
+
+1. ``prepare_transmit`` — PRE-KEY, station safe, antenna on the LNA, PA cold. The payload is
+   resolved (read off disk), validated against hard bounds, and fully modulated into cached
+   baseband IQ. Answers ``tx_prepared`` (licence to key) or ``tx_prepare_failed`` (do NOT key).
+2. ``transmit_frame`` — POST-KEY, PA hot. Rotates the cached IQ by the current Doppler and pushes
+   it. Builds NOTHING. An unstaged frame is REFUSED, not built.
+
+That split exists because the old single-step flow did the disk read, the framing, the GFSK
+modulation and the ``np.repeat`` allocation *after* the orchestrator had already keyed the PA and
+thrown the antenna onto it. A bad payload — an oversize blob, a nonsense baud from the backend —
+was therefore discovered with the station radiating, and was recovered by a FORCED DISARM: the
+emergency path, entered on a routine bad input. Now every step that can fail happens while the
+station is cold, and the only DSP left inside the keyed window is a fixed-size rotation.
 
 Division of responsibility (Document A / docs/13):
 * The **orchestrator** drives the T/R antenna switch (via the safety FSM) and decides when + how
@@ -29,17 +43,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import logging
 import math
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
-from _fallback_select import symbol_rate_hz_of
+from _fallback_select import SYMBOL_RATE_KEYS, symbol_rate_hz_of
 from _recorder import StreamRecorder
 from _soapy_tx import BurstResult
 from _spawn_contract import (
@@ -72,7 +88,37 @@ _READ_CHUNK = 4096
 # are the front-end's settling transient and are discarded, not decoded.
 _RX_SETTLE_S = 0.05
 _UPLINK_MAX_BYTES = 65_536  # sanity cap on a raw uplink train (~54 s @ 9600); guards against GB IQ
+# ROUND 10 — the allocation ceilings the standalone TX app already had and this one did not.
+# gfsk.modulate() does np.repeat(symbols, sps): sps and the total sample count are what actually
+# decide how much memory a burst asks for. A 64 kB payload is only "small" at a sane sps.
+_MAX_SPS = 1024
+# ~1.6 GB of complex64 — far past any real burst, short of an OOM kill:
+_MAX_IQ_SAMPLES = 200_000_000
+_MIN_SYMBOL_RATE_HZ = 1200.0  # protocol floor; the REST backend has offered baud=10
+_MAX_SYMBOL_RATE_HZ = 10_000_000.0
+_MAX_SAMPLE_RATE_HZ = 100_000_000.0
+# ROUND 11 (P0-5) — THE RF DURATION BOUND. The round-10 caps bound the MODEM-rate IQ, but the burst
+# is UPSAMPLED to the hardware rate AFTER the PA is keyed, and the RF DURATION = payload_bits / baud
+# is independent of the sample rate. A 64 kB payload at the 1200-baud floor is 437 SECONDS of RF —
+# past gs-client's burst-completion timeout, so gs-client gives up while the PA keeps radiating for
+# 6 more minutes, and the post-key upsample allocates ~7 GB. Capping the DURATION is the
+# load-bearing check: it bounds air time and, at any sane rate, the allocation with it.
+#
+# ROUND 11 (re-check, D5): this is the ENGINE'S hard ceiling — no burst longer than this is ever
+# built. The ONE SHARED DEADLINE is then established at run time: tx_prepared reports the actual
+# burst duration, and the orchestrator sizes its completion wait to that reported duration (not a
+# second hardcoded constant). So the engine's cap and the orchestrator's wait cannot drift apart.
+_MAX_BURST_SECONDS = 30.0
 _log = logging.getLogger("cubesat_gfsk_endurosat_bidir")
+
+
+class UplinkRejected(ValueError):
+    """The staged uplink cannot be flown. Raised ONLY on the pre-key path, never while keyed."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
 
 
 # ----------------------------------------------------------------------
@@ -102,6 +148,107 @@ def resolve_sample_rate(args, params: dict[str, object]) -> float:
     sym = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
     sps = max(1, round(requested / sym))
     return float(sps) * sym  # exact integer samples/symbol
+
+
+def validate_uplink(payload: bytes, sample_rate: float, params: dict[str, object]) -> int:
+    """Prove this burst is FLYABLE, and return the exact IQ sample count it will allocate.
+
+    ROUND 10. Every check here used to be absent from the bidirectional path — the app's only guard
+    was the 64 kB byte cap, and the REAL cost of a burst is not its byte count but ``sps`` and the
+    total sample count, because ``gfsk.modulate`` does ``np.repeat(symbols, sps)``. A 9600-baud
+    payload at a 100 MHz sample rate is 10416 sps; a 64 kB payload then asks numpy for ~43 GB. The
+    old code discovered that INSIDE the keyed window, where the failure is a forced disarm.
+
+    This runs BEFORE the PA is keyed and raises UplinkRejected, which the caller turns into a
+    ``tx_prepare_failed`` event. Nothing here touches hardware.
+    """
+    if not payload:
+        raise UplinkRejected("empty-payload", "the uplink payload is empty — nothing to transmit")
+    if len(payload) > _UPLINK_MAX_BYTES:
+        raise UplinkRejected(
+            "payload-too-large",
+            f"uplink payload {len(payload)} B exceeds the {_UPLINK_MAX_BYTES} B cap",
+        )
+
+    # ROUND 11 (P1): REJECT an explicit garbage baud, do not silently coerce it. symbol_rate_hz_of
+    # treats a present-but-invalid baud (NaN, Inf, <=0) as "absent" and falls back to the 9600
+    # default — which is right for a DEMOD that must keep going, but wrong for a TX COMMAND: a
+    # station told to transmit at baud=NaN must be REFUSED, not quietly retuned. The rest of the DSP
+    # sees only the coerced value, so the check has to happen here against the raw command.
+    for key in SYMBOL_RATE_KEYS:
+        if key in params:
+            try:
+                raw = float(params[key])  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise UplinkRejected(
+                    "symbol-rate-unusable", f"the commanded {key}={params[key]!r} is not a number"
+                ) from None
+            if not (math.isfinite(raw) and raw > 0.0):
+                raise UplinkRejected(
+                    "symbol-rate-unusable",
+                    f"the commanded {key}={params[key]!r} is not a usable baud",
+                )
+            break
+
+    kw = _decoder_kwargs(params)
+    sym = float(kw["symbol_rate_hz"])
+    mod_index = float(kw["mod_index"])
+    bt = float(kw["bt"])
+
+    for name, value in (("symbol_rate", sym), ("sample_rate", sample_rate),
+                        ("mod_index", mod_index), ("bt", bt)):
+        if not math.isfinite(value):
+            raise UplinkRejected("non-finite-parameter", f"{name} is not finite: {value!r}")
+
+    if not _MIN_SYMBOL_RATE_HZ <= sym <= _MAX_SYMBOL_RATE_HZ:
+        raise UplinkRejected(
+            "symbol-rate-unusable",
+            f"symbol rate {sym} Hz is outside [{_MIN_SYMBOL_RATE_HZ}, {_MAX_SYMBOL_RATE_HZ}]",
+        )
+    if not 0.0 < sample_rate <= _MAX_SAMPLE_RATE_HZ:
+        raise UplinkRejected(
+            "sample-rate-unusable",
+            f"sample rate {sample_rate} Hz is outside (0, {_MAX_SAMPLE_RATE_HZ}]",
+        )
+    if not 0.0 < mod_index <= 10.0:
+        raise UplinkRejected("modulation-unusable", f"mod_index {mod_index} is outside (0, 10]")
+    if not 0.0 < bt <= 10.0:
+        raise UplinkRejected("modulation-unusable", f"bt {bt} is outside (0, 10]")
+
+    ratio = sample_rate / sym
+    sps = int(round(ratio))
+    if sps < 1 or abs(ratio - sps) > 1e-9:
+        raise UplinkRejected(
+            "non-integer-sps",
+            f"sample_rate/symbol_rate = {ratio!r} is not an integer samples/symbol",
+        )
+    if sps > _MAX_SPS:
+        raise UplinkRejected(
+            "sps-too-large", f"samples/symbol {sps} exceeds the {_MAX_SPS} cap"
+        )
+
+    # ROUND 11 (P0-5): THE RF DURATION BOUND, checked BEFORE keying. This is independent of the
+    # sample rate — duration = payload_bits / baud — and it is the real cap on air time and on the
+    # post-key hardware-rate upsample. A burst that passes the sps/sample caps can still be minutes
+    # of RF at a low baud; this refuses it while the station is still cold.
+    duration_s = (len(payload) * 8) / sym
+    if duration_s > _MAX_BURST_SECONDS:
+        raise UplinkRejected(
+            "burst-too-long",
+            f"this burst is {duration_s:.1f} s of RF at {sym:.0f} baud, past the "
+            f"{_MAX_BURST_SECONDS:.0f} s cap — it would outlast the orchestrator's completion "
+            f"deadline and radiate unattended",
+        )
+
+    # The modulator emits one symbol per BIT (2-GFSK), each repeated sps times.
+    samples = len(payload) * 8 * sps
+    if samples > _MAX_IQ_SAMPLES:
+        raise UplinkRejected(
+            "iq-too-large",
+            f"this burst would allocate {samples} IQ samples "
+            f"(~{samples * 8 / 1e9:.1f} GB), past the {_MAX_IQ_SAMPLES} cap",
+        )
+    return samples
 
 
 def build_uplink_iq(payload: bytes, sample_rate: float, params: dict[str, object]) -> np.ndarray:
@@ -148,16 +295,31 @@ def tx_doppler_hz(doppler_downlink_hz: float, downlink_hz: float, uplink_hz: flo
     return -doppler_downlink_hz * (uplink_hz / downlink_hz)
 
 
+_NCO_CHUNK = 1 << 20  # 1 Mi samples: the working set of the rotation, independent of burst length
+
+
 def apply_nco(iq: np.ndarray, freq_hz: float, sample_rate: float) -> np.ndarray:
     """Frequency-shift a complex baseband array by ``freq_hz`` (a positive value shifts up). Used to
     layer the uplink Doppler pre-compensation onto the raw modulated burst, keeping
-    ``build_uplink_iq`` a pure verbatim modulator."""
-    if not freq_hz or sample_rate <= 0.0:
-        return np.asarray(iq, dtype=np.complex64)
+    ``build_uplink_iq`` a pure verbatim modulator.
+
+    ROUND 10 — CHUNKED, because this is the ONE piece of DSP that runs INSIDE the keyed window.
+    ``np.exp(1j*ph)`` produces a complex128 temporary, so the naive whole-array form held ~7x the
+    burst's complex64 size at peak — for a max-size burst that is several GB, transiently, with
+    the PA hot. Rotating a fixed-size chunk at a time bounds the working set to ``_NCO_CHUNK``
+    regardless of burst length. The per-chunk arithmetic is byte-for-byte the whole-array
+    computation this replaced — same operation order, same float64 phase on the GLOBAL sample
+    index (float32 phase would lose precision as the index grows), so the seam cannot glitch."""
     buf = np.asarray(iq, dtype=np.complex64)
-    n = np.arange(len(buf))
-    ph = 2.0 * np.pi * freq_hz * n / sample_rate
-    return (buf * np.exp(1j * ph)).astype(np.complex64)
+    if not freq_hz or sample_rate <= 0.0:
+        return buf
+    out = np.empty_like(buf)
+    for start in range(0, len(buf), _NCO_CHUNK):
+        stop = min(start + _NCO_CHUNK, len(buf))
+        n = np.arange(start, stop, dtype=np.float64)
+        ph = 2.0 * np.pi * float(freq_hz) * n / float(sample_rate)
+        out[start:stop] = (buf[start:stop] * np.exp(1j * ph)).astype(np.complex64)
+    return out
 
 
 def demod_capture(iq: np.ndarray, sample_rate: float, params: dict[str, object]) -> list[bytes]:
@@ -297,22 +459,54 @@ def _rssi_dbm(chunk: np.ndarray) -> float:
 # ----------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _StagedBurst:
+    """A validated, fully-built BASEBAND burst, waiting for the key.
+
+    The NCO is deliberately NOT applied here. Doppler pre-compensation must reflect the satellite's
+    velocity at the moment the RF actually leaves the antenna, not at stage time, so the rotation is
+    applied at burst time — it is O(n) on an already-bounded array, allocates one buffer of known
+    size, and cannot fail on payload content. Everything that CAN fail (disk read, framing,
+    modulation, the np.repeat allocation) is done here, before anything is energized.
+    """
+
+    frame_id: str
+    payload_sha256: str
+    iq: np.ndarray
+
+
 class _TxController:
-    """Builds + bursts one EnduroSat uplink packet on a worker thread (never blocking the event
-    loop), bracketed by ``transmit_started`` / ``transmit_complete``. ``tx_active`` lets a shared
-    device park RX for the whole build+burst window. Serialized so overlapping transmit commands
-    can't interleave bursts."""
+    """Stages, then bursts one EnduroSat uplink packet.
+
+    ROUND 10 — THE INVARIANT: **no uplink IQ is ever built while the PA is keyed.**
+
+    The old flow was: gs-client keys the PA (orchestrator prepare_to_key) → sends transmit_frame →
+    THIS class read the payload file off disk, framed it, ran the GFSK modulator and the np.repeat
+    allocation, and only then pushed samples. Every one of those steps can fail or block, and all of
+    them ran with the antenna on the PA and the PA energized. A bad payload was recovered by a
+    FORCED DISARM — the emergency path, reached on a routine bad input.
+
+    Now the orchestrator must ``prepare_transmit`` first: that validates and BUILDS the burst while
+    the station is still safe, and acknowledges ``tx_prepared``. Only then does it key and send
+    ``transmit_frame``, which transmits the CACHED samples. If nothing is staged, transmit REFUSES —
+    it does not fall back to building, because that fallback is exactly the hazard.
+    """
 
     def __init__(
         self,
         io: BidirIo,
         *,
+        sample_rate: float,
         doppler: dict[str, float] | None = None,
         downlink_hz: float = 0.0,
         uplink_hz: float = 0.0,
         should_abort: Callable[[], bool] | None = None,
     ) -> None:
         self._io = io
+        # One XTRX, one rate, snapped at startup. The staged IQ and the burst MUST be built and
+        # rotated at the same rate; making it an attribute rather than a per-command argument is
+        # what makes that structural instead of a convention.
+        self._sample_rate = float(sample_rate)
         self._lock = asyncio.Lock()
         self.tx_active = threading.Event()
         # Polled between burst chunks: a pass stop cancels an in-flight burst
@@ -323,27 +517,126 @@ class _TxController:
         self._doppler = doppler if doppler is not None else {"hz": 0.0}
         self._downlink_hz = downlink_hz
         self._uplink_hz = uplink_hz
+        # The one staged burst, built pre-key. Guarded by _lock together with the burst itself, so a
+        # stage can never land between a transmit's staged-lookup and its send.
+        self._staged: _StagedBurst | None = None
 
-    def _build_tx_iq(
-        self, payload: bytes, sample_rate: float, params: dict[str, object]
-    ) -> np.ndarray:
-        """Raw verbatim modulation + uplink Doppler pre-compensation (runs on a worker thread)."""
-        iq = build_uplink_iq(payload, sample_rate, params)
-        tx_dop = tx_doppler_hz(self._doppler["hz"], self._downlink_hz, self._uplink_hz)
-        return apply_nco(iq, tx_dop, sample_rate)
+    # -- pre-key -------------------------------------------------------------------------------
 
-    async def transmit(
-        self, sockets, payload: bytes, sample_rate: float, params: dict[str, object]
-    ) -> int:
-        """R-16: ``transmit_started`` fires only when the sink ACCEPTS its first
-        sample (bridged threadsafe from the burst worker), never on command
-        receipt/IQ build; ``transmit_complete`` ALWAYS fires and carries the
-        accepted count plus an explicit bounded outcome — a build/burst failure
-        is outcome="error", not a nominal zero-sample success. Exceptions are
-        logged, not propagated, so the orchestrator's half-duplex loop never
-        stalls on them."""
+    async def prepare(
+        self,
+        sockets,
+        frame_id: str,
+        payload: bytes,
+        sample_rate: float,
+        params: dict[str, object],
+    ) -> bool:
+        """Validate + BUILD the burst while the station is still SAFE, and acknowledge it.
+
+        Emits ``tx_prepared`` (the orchestrator's licence to key) or ``tx_prepare_failed`` (the
+        orchestrator must NOT key). Never raises: a rejected uplink is a routine outcome that must
+        leave the app alive and the station unkeyed, not kill the control loop.
+        """
+        async with self._lock:
+            # A failed stage must not leave a PREVIOUS burst armed — the orchestrator would then key
+            # for frame B and radiate frame A. Drop it before we try.
+            self._staged = None
+            try:
+                samples = await asyncio.to_thread(
+                    validate_uplink, payload, sample_rate, params
+                )
+                iq = await asyncio.to_thread(build_uplink_iq, payload, sample_rate, params)
+            except UplinkRejected as e:
+                _log.error("bidir TX: uplink REJECTED pre-key (%s): %s", e.code, e.detail)
+                await send_event(
+                    sockets.status_writer,
+                    {
+                        "event": "tx_prepare_failed",
+                        "frame_id": frame_id,
+                        "code": e.code,
+                        "detail": e.detail,
+                    },
+                )
+                return False
+            except Exception as e:  # noqa: BLE001 — a build failure must not kill the app
+                _log.exception("bidir TX: uplink build failed pre-key")
+                await send_event(
+                    sockets.status_writer,
+                    {
+                        "event": "tx_prepare_failed",
+                        "frame_id": frame_id,
+                        "code": "build-failed",
+                        "detail": repr(e),
+                    },
+                )
+                return False
+
+            self._staged = _StagedBurst(
+                frame_id=frame_id,
+                payload_sha256=hashlib.sha256(payload).hexdigest(),
+                iq=iq,
+            )
+            # ROUND 11 (re-check, D5): report the RF DURATION of the burst, so the orchestrator can
+            # size its completion deadline to THIS burst instead of a second, independent constant.
+            # One authoritative number: the engine builds the burst and says how long it will take;
+            # the orchestrator waits that long (plus margin). duration = modem samples / modem
+            # rate (== payload_bits/baud; upsampling changes the sample count, not the RF time).
+            duration_s = (iq.size / sample_rate) if sample_rate > 0 else 0.0
+            await send_event(
+                sockets.status_writer,
+                {
+                    "event": "tx_prepared",
+                    "frame_id": frame_id,
+                    "samples": int(iq.size),
+                    "predicted_samples": int(samples),
+                    "payload_bytes": len(payload),
+                    "payload_sha256": self._staged.payload_sha256,
+                    "sample_rate": int(sample_rate),
+                    "duration_s": round(duration_s, 3),
+                },
+            )
+            return True
+
+    # -- post-key ------------------------------------------------------------------------------
+
+    async def transmit(self, sockets, frame_id: str) -> int:
+        """Burst the ALREADY-BUILT samples. The PA is keyed when this runs.
+
+        R-16: ``transmit_started`` fires only when the sink ACCEPTS its first sample (bridged
+        threadsafe from the burst worker); ``transmit_complete`` ALWAYS fires and carries the
+        accepted count plus an explicit bounded outcome. Exceptions are logged, not propagated, so
+        the orchestrator's half-duplex loop never stalls on them.
+
+        ROUND 10: if no matching burst was staged, this REFUSES. It does not build one. Building
+        here is the hazard the handshake exists to remove, so the fallback would reintroduce it on
+        exactly the path (a missed/failed prepare) where it is most likely to fire.
+        """
         async with self._lock:
             loop = asyncio.get_running_loop()
+
+            staged = self._staged
+            # One-shot: consume the stage whatever happens, so a stale burst can never be re-flown
+            # against a later, different frame_id.
+            self._staged = None
+
+            if staged is None or staged.frame_id != frame_id:
+                have = "nothing" if staged is None else f"frame {staged.frame_id!r}"
+                detail = (
+                    f"no staged IQ for frame {frame_id!r} (staged: {have}) — the PA is KEYED and "
+                    f"this app will NOT build a burst while keyed; prepare_transmit first"
+                )
+                _log.error("bidir TX: %s", detail)
+                await send_event(
+                    sockets.status_writer,
+                    {
+                        "event": "transmit_complete",
+                        "frame_id": frame_id,
+                        "samples": 0,
+                        "outcome": "error",
+                        "detail": detail,
+                    },
+                )
+                return 0
 
             def _first_accept() -> None:
                 loop.call_soon_threadsafe(
@@ -357,7 +650,12 @@ class _TxController:
             detail = ""
             self.tx_active.set()
             try:
-                iq = await asyncio.to_thread(self._build_tx_iq, payload, sample_rate, params)
+                # The ONLY DSP left inside the keyed window: rotate the pre-built baseband by the
+                # CURRENT Doppler. O(n) on a bounded array, with a working set bounded to _NCO_CHUNK
+                # (apply_nco is chunked), and it cannot fail on payload content — that was all
+                # settled at stage time.
+                tx_dop = tx_doppler_hz(self._doppler["hz"], self._downlink_hz, self._uplink_hz)
+                iq = await asyncio.to_thread(apply_nco, staged.iq, tx_dop, self._sample_rate)
                 result = await asyncio.to_thread(
                     lambda: self._io.transmit_burst(
                         iq, on_first_accept=_first_accept, should_abort=self._should_abort
@@ -367,7 +665,7 @@ class _TxController:
                 outcome = result.outcome
                 detail = result.detail
             except Exception as e:  # noqa: BLE001 — must still emit transmit_complete
-                _log.exception("bidir TX: uplink build/send failed")
+                _log.exception("bidir TX: uplink send failed")
                 detail = repr(e)
             finally:
                 self.tx_active.clear()
@@ -375,12 +673,17 @@ class _TxController:
                     sockets.status_writer,
                     {
                         "event": "transmit_complete",
+                        "frame_id": frame_id,
                         "samples": accepted,
                         "outcome": outcome,
                         "detail": detail,
                     },
                 )
             return accepted
+
+    @property
+    def has_staged_burst(self) -> bool:
+        return self._staged is not None
 
 
 async def run_rx(
@@ -728,8 +1031,8 @@ async def amain(args) -> int:
     downlink_hz = float(args.center_freq_hz or 0.0)
     uplink_hz = float(params.get("uplink_hz", downlink_hz) or downlink_hz)
     tx = _TxController(
-        io, doppler=doppler, downlink_hz=downlink_hz, uplink_hz=uplink_hz,
-        should_abort=stop_requested.is_set,
+        io, sample_rate=sample_rate, doppler=doppler, downlink_hz=downlink_hz,
+        uplink_hz=uplink_hz, should_abort=stop_requested.is_set,
     )
     # If the device exposes a shared tx_active flag (SoapySDR path), let the TX controller drive it
     # so the RX generator parks during a burst.
@@ -748,6 +1051,12 @@ async def amain(args) -> int:
             "framing": "endurosat",
             "direction": "bidirectional",
             "flowgraph_version": VERSION,
+            # ROUND 10: `ready` means the DOWNLINK is live. It does NOT mean any uplink is flyable —
+            # nothing has been framed or modulated at this point, and it cannot be, because the
+            # payload arrives per-burst. This flag is how the app says so out loud: the orchestrator
+            # must `prepare_transmit` and receive `tx_prepared` BEFORE it keys the PA. An
+            # orchestrator that ignores it and keys anyway gets a refusal, not a burst.
+            "tx_prepare_required": True,
         },
     )
 
@@ -765,15 +1074,59 @@ async def amain(args) -> int:
         if isinstance(off, (int, float)) and not isinstance(off, bool):
             doppler["hz"] = float(off)
 
-    async def _on_transmit(cmd: dict[str, object]) -> None:
-        # Handles both "transmit_frame" (inline bytes_b64) and "transmit_payload_file" (a file). The
-        # current orchestrator sends "transmit_frame" for BOTH (ControlWriter.transmit_payload_file
-        # writes cmd="transmit_frame" with a payload_file field); the second key is future-proofing.
-        payload = _uplink_payload_from_cmd(cmd, args, params)
-        if not payload:
-            _log.warning("bidir TX: transmit command with no payload; ignoring")
+    async def _on_prepare_transmit(cmd: dict[str, object]) -> None:
+        """PRE-KEY. Resolve the payload, validate it, build the IQ, cache it, acknowledge.
+
+        This is the only place the uplink is read from disk, framed and modulated — and it runs with
+        the antenna on the LNA and the PA cold. A rejection here costs a `tx_prepare_failed` event
+        and nothing else: no relay moves, no PA is energized, no forced disarm.
+        """
+        frame_id = str(cmd.get("frame_id", "") or "")
+        try:
+            payload = _uplink_payload_from_cmd(cmd, args, params)
+        except Exception as e:  # noqa: BLE001 — a bad path/blob is a rejection, not a crash
+            _log.exception("bidir TX: could not resolve the uplink payload")
+            await send_event(
+                sockets.status_writer,
+                {
+                    "event": "tx_prepare_failed",
+                    "frame_id": frame_id,
+                    "code": "payload-unresolvable",
+                    "detail": repr(e),
+                },
+            )
             return
-        await tx.transmit(sockets, payload, sample_rate, params)  # build+burst, bracketed by events
+        await tx.prepare(sockets, frame_id, payload, sample_rate, params)
+
+    tx_tasks: list[asyncio.Task[None]] = []
+
+    async def _on_transmit(cmd: dict[str, object]) -> None:
+        # POST-KEY. Handles both "transmit_frame" (inline bytes_b64) and "transmit_payload_file".
+        # The orchestrator sends "transmit_frame" for BOTH (ControlWriter.transmit_payload_file
+        # writes cmd="transmit_frame" with a payload_file field); the 2nd key is future-proofing.
+        #
+        # ROUND 10: this NO LONGER resolves or builds anything. The PA is keyed when it runs, and
+        # the payload was staged and proven flyable before the key. An unstaged frame is refused.
+        #
+        # ROUND 11 (P0-4): the burst runs as a BACKGROUND TASK, not awaited inline. run_command_loop
+        # dispatches handlers serially — if this awaited the whole burst (seconds to minutes of RF),
+        # the loop could not read the NEXT command, so a `stop` on the control socket would not be
+        # dequeued and `stop_requested` would not be set until the burst had already finished. The
+        # abort is fully wired (write_burst polls should_abort between chunks); it was simply
+        # unreachable. Spawning frees the loop, so `stop` lands and aborts the
+        # burst mid-flight. `_TxController._lock` still serializes overlapping bursts; `tx.transmit`
+        # swallows its own errors and always emits transmit_complete, so the task never escapes an
+        # exception (a done-callback logs the impossible case).
+        frame_id = str(cmd.get("frame_id", "") or "")
+        task = asyncio.create_task(tx.transmit(sockets, frame_id), name=f"bidir-tx-{frame_id}")
+        tx_tasks.append(task)
+        task.add_done_callback(_on_tx_task_done)
+
+    def _on_tx_task_done(task: asyncio.Task[None]) -> None:
+        with contextlib.suppress(ValueError):
+            tx_tasks.remove(task)
+        if not task.cancelled() and task.exception() is not None:
+            _log.error("bidir TX: burst task raised (unexpected): %r", task.exception())
 
     rx_task = asyncio.create_task(
         run_rx(args, sockets, params, io, stop_requested=stop_requested, doppler=doppler, tx=tx),
@@ -787,13 +1140,17 @@ async def amain(args) -> int:
         "start": _on_start,
         "stop": _on_stop,
         "set_doppler": _on_set_doppler,
+        "prepare_transmit": _on_prepare_transmit,
         "transmit_frame": _on_transmit,
         "transmit_payload_file": _on_transmit,
     }
     async def _shutdown_engine() -> None:
-        """Idempotent engine teardown: settle the RX task, close the device."""
+        """Idempotent engine teardown: settle the RX task and any in-flight TX burst, close the
+        device. ROUND 11 (P0-4): a stop that arrives mid-burst sets stop_requested, which the burst
+        polls and aborts on; we then await the burst task here so its transmit_complete is emitted
+        and the device is not closed out from under it."""
         stop_requested.set()
-        await asyncio.gather(rx_task, return_exceptions=True)
+        await asyncio.gather(rx_task, *tx_tasks, return_exceptions=True)
         with contextlib.suppress(Exception):
             io.close()
 

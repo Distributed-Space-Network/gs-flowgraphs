@@ -11,6 +11,7 @@ License: GPLv3 (see ../COPYING).
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 # Samples/symbol the channel must give the demods. symbol_sync needs sps>1; ~4 is a
@@ -32,7 +33,14 @@ def symbol_rate_hz_of(params: dict[str, Any] | None, default: float = 0.0) -> fl
     (:data:`SYMBOL_RATE_KEYS`), or ``default`` when none is present/usable. Baud and
     ``symbol_rate_hz`` are interchangeable, so the demod never fails just because the rate arrived
     under a different key. A present-but-invalid or non-positive value is skipped (0 baud is not a
-    rate) so a later alias — or ``default`` — still applies. Pure: no GNU Radio, unit-testable."""
+    rate) so a later alias — or ``default`` — still applies. Pure: no GNU Radio, unit-testable.
+
+    ROUND 10 — NON-FINITE IS NOT "USABLE". The test was ``v > 0``, and ``inf > 0`` is True, so an
+    infinite baud was returned as a perfectly good symbol rate. (NaN happened to fall through to the
+    default only because ``nan > 0`` is False — right answer, wrong reason.) This helper feeds EVERY
+    app, RX and TX: an infinite rate divides into a zero-sample IQ, or a zero-sps demod, far from
+    here and with nothing to point at. The rate comes from the backend's transmitter catalogue,
+    which is not ours and has already offered baud=10, so it gets checked here."""
     p = params or {}
     for key in SYMBOL_RATE_KEYS:
         if key in p:
@@ -40,7 +48,7 @@ def symbol_rate_hz_of(params: dict[str, Any] | None, default: float = 0.0) -> fl
                 v = float(p[key])
             except (TypeError, ValueError):
                 continue
-            if v > 0:
+            if math.isfinite(v) and v > 0:
                 return v
     return float(default)
 

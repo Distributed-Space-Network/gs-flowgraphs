@@ -183,31 +183,97 @@ def test_resolve_sample_rate_snaps_to_integer_sps():
     assert len(bidir.build_uplink_iq(b"cmd", r, {})) > 0
 
 
-def test_tx_controller_emits_started_and_complete(tmp_path):
+async def _prepare_then_transmit(tx, socks, frame_id, payload, params=None):
+    """The real orchestrator sequence: stage while cold, THEN key, THEN burst the cached IQ."""
+    ok = await tx.prepare(socks, frame_id, payload, tx._sample_rate, params or {})
+    if not ok:
+        return 0
+    return await tx.transmit(socks, frame_id)
+
+
+def test_tx_controller_stages_then_bursts(tmp_path):
     socks = _FakeSockets()
     io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
-    tx = bidir._TxController(io)
-    sent = asyncio.run(tx.transmit(socks, b"uplink", _SR, {}))
+    tx = bidir._TxController(io, sample_rate=_SR)
+    sent = asyncio.run(_prepare_then_transmit(tx, socks, "f1", b"uplink"))
     evs = _events(socks)
-    assert [e["event"] for e in evs] == ["transmit_started", "transmit_complete"]
-    assert evs[1]["samples"] == sent == len(bidir.build_uplink_iq(b"uplink", _SR, {}))
+    # tx_prepared is emitted PRE-KEY: it is the orchestrator's licence to energize the PA.
+    assert [e["event"] for e in evs] == ["tx_prepared", "transmit_started", "transmit_complete"]
+    assert evs[0]["frame_id"] == "f1"
+    assert evs[0]["samples"] == len(bidir.build_uplink_iq(b"uplink", _SR, {}))
+    assert evs[0]["payload_bytes"] == len(b"uplink")
+    assert evs[2]["samples"] == sent == len(bidir.build_uplink_iq(b"uplink", _SR, {}))
     assert not tx.tx_active.is_set()  # cleared after the burst
+    assert not tx.has_staged_burst  # one-shot: consumed
 
 
-def test_tx_controller_still_emits_complete_when_build_fails():
-    # MED regression: a build/burst failure must STILL emit transmit_complete, or the
-    # orchestrator's half-duplex loop hangs waiting for it. R-16: transmit_started
-    # must NOT fire (no sample was ever accepted) and the completion carries an
-    # explicit error outcome — never a nominal zero-sample success.
+def test_transmit_REFUSES_to_build_while_keyed(tmp_path):
+    """THE INVARIANT. transmit() runs with the PA hot. If nothing was staged it must REFUSE — not
+    quietly build the burst, which is the exact hazard the handshake removes."""
     socks = _FakeSockets()
-    tx = bidir._TxController(bidir.FileBidirIo(None, None))
-    sent = asyncio.run(tx.transmit(socks, b"payload", 100_000.0, {}))  # 10.42 sps → raises
+    io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
+    tx = bidir._TxController(io, sample_rate=_SR)
+
+    sent = asyncio.run(tx.transmit(socks, "never-staged"))  # no prepare!
+
     evs = _events(socks)
     assert [e["event"] for e in evs] == ["transmit_complete"]
     assert evs[0]["samples"] == sent == 0
     assert evs[0]["outcome"] == "error"
-    assert evs[0]["detail"]  # the failure reason travels with the event
+    assert "will NOT build a burst while keyed" in evs[0]["detail"]
+    assert not (tmp_path / "tx.cf32").exists()  # nothing went on the air
     assert not tx.tx_active.is_set()
+
+
+def test_a_staged_burst_is_not_flown_against_a_DIFFERENT_frame(tmp_path):
+    """A stale stage must never be radiated under a later frame's id — that would transmit frame A
+    while the orchestrator, the audit log and the operator all believe frame B went out."""
+    socks = _FakeSockets()
+    io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
+    tx = bidir._TxController(io, sample_rate=_SR)
+
+    asyncio.run(tx.prepare(socks, "frame-A", b"payload-A", _SR, {}))
+    sent = asyncio.run(tx.transmit(socks, "frame-B"))  # the orchestrator keyed for B
+
+    evs = _events(socks)
+    assert sent == 0
+    assert evs[-1]["event"] == "transmit_complete"
+    assert evs[-1]["outcome"] == "error"
+    assert "frame-A" in evs[-1]["detail"]  # names what WAS staged
+    assert not (tmp_path / "tx.cf32").exists()
+
+
+def test_a_FAILED_stage_disarms_a_previously_staged_burst(tmp_path):
+    """If frame B fails to stage, frame A's IQ must not survive in the cache — otherwise the
+    orchestrator, told 'B failed', might still key for a retry and radiate A."""
+    socks = _FakeSockets()
+    io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
+    tx = bidir._TxController(io, sample_rate=_SR)
+
+    assert asyncio.run(tx.prepare(socks, "frame-A", b"payload-A", _SR, {})) is True
+    assert tx.has_staged_burst
+    assert asyncio.run(tx.prepare(socks, "frame-B", b"", _SR, {})) is False  # empty → rejected
+    assert not tx.has_staged_burst, "the rejected stage left frame A armed in the cache"
+
+
+def test_an_unflyable_burst_is_rejected_BEFORE_the_key():
+    """ROUND 10. This used to be 'a build failure still emits transmit_complete' — true, but it
+    described a build failing with the PA already hot, recovered by a forced disarm. Now the same
+    unflyable burst (100 kHz / 9600 baud = 10.42 sps, non-integer) is caught at STAGE time, and the
+    orchestrator never keys at all."""
+    socks = _FakeSockets()
+    tx = bidir._TxController(bidir.FileBidirIo(None, None), sample_rate=100_000.0)
+
+    ok = asyncio.run(tx.prepare(socks, "f1", b"payload", 100_000.0, {}))
+
+    assert ok is False
+    evs = _events(socks)
+    assert [e["event"] for e in evs] == ["tx_prepare_failed"]
+    assert evs[0]["code"] == "non-integer-sps"
+    assert evs[0]["detail"]  # the reason travels with the event
+    assert evs[0]["frame_id"] == "f1"
+    assert not tx.has_staged_burst
+    assert not tx.tx_active.is_set()  # nothing was ever keyed
 
 
 # --------------------------------------------------------------------------- RX demod loop
@@ -221,7 +287,7 @@ def test_run_rx_emits_frame_from_downlink_file(tmp_path):
     io = bidir.FileBidirIo(str(cap), None)
     socks = _FakeSockets()
     stop = asyncio.Event()
-    tx = bidir._TxController(io)
+    tx = bidir._TxController(io, sample_rate=_SR)
     asyncio.run(
         bidir.run_rx(
             _rx_args(tmp_path), socks, {}, io, stop_requested=stop, doppler={"hz": 0.0}, tx=tx
@@ -250,7 +316,7 @@ def test_run_rx_survives_dead_status_socket(tmp_path):
     socks.status_writer = _DeadWriter()
     socks.data_writer = _DeadWriter()
     stop = asyncio.Event()
-    tx = bidir._TxController(io)
+    tx = bidir._TxController(io, sample_rate=_SR)
 
     async def _run() -> None:
         await asyncio.wait_for(
@@ -280,7 +346,7 @@ def test_run_rx_terminates_on_stop_with_unbounded_source(tmp_path):
     io = _InfiniteIo()
     socks = _FakeSockets()
     stop = asyncio.Event()
-    tx = bidir._TxController(io)
+    tx = bidir._TxController(io, sample_rate=_SR)
 
     async def _run() -> None:
         task = asyncio.create_task(
@@ -299,7 +365,7 @@ def test_run_rx_no_downlink_completes_clean(tmp_path):
     io = bidir.FileBidirIo(None, None)
     socks = _FakeSockets()
     stop = asyncio.Event()
-    tx = bidir._TxController(io)
+    tx = bidir._TxController(io, sample_rate=_SR)
     asyncio.run(
         bidir.run_rx(
             _rx_args(tmp_path), socks, {}, io, stop_requested=stop, doppler={"hz": 0.0}, tx=tx
@@ -318,7 +384,7 @@ def test_run_rx_skips_rx_while_tx_active(tmp_path):
     io = bidir.FileBidirIo(str(cap), None)
     socks = _FakeSockets()
     stop = asyncio.Event()
-    tx = bidir._TxController(io)
+    tx = bidir._TxController(io, sample_rate=_SR)
     tx.tx_active.set()  # simulate an in-flight burst for the whole run
     asyncio.run(
         bidir.run_rx(
@@ -372,10 +438,11 @@ def test_tx_controller_applies_doppler_precomp(tmp_path):
     doppler = {"hz": 8000.0}
     io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
     tx = bidir._TxController(
-        io, doppler=doppler, downlink_hz=401_500_000.0, uplink_hz=449_900_000.0
+        io, sample_rate=_SR, doppler=doppler, downlink_hz=401_500_000.0,
+        uplink_hz=449_900_000.0,
     )
     socks = _FakeSockets()
-    asyncio.run(tx.transmit(socks, b"uplink-cmd", _SR, {}))
+    asyncio.run(_prepare_then_transmit(tx, socks, "f1", b"uplink-cmd"))
     raw = bidir.build_uplink_iq(b"uplink-cmd", _SR, {})
     expected = bidir.apply_nco(
         raw, bidir.tx_doppler_hz(8000.0, 401_500_000.0, 449_900_000.0), _SR
@@ -389,8 +456,8 @@ def test_tx_controller_applies_doppler_precomp(tmp_path):
 def test_tx_controller_no_doppler_is_verbatim(tmp_path):
     # Default controller (no doppler dict / no freqs) transmits the raw verbatim IQ unchanged.
     io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
-    tx = bidir._TxController(io)
-    asyncio.run(tx.transmit(_FakeSockets(), b"uplink-cmd", _SR, {}))
+    tx = bidir._TxController(io, sample_rate=_SR)
+    asyncio.run(_prepare_then_transmit(tx, _FakeSockets(), "f1", b"uplink-cmd"))
     on_air = np.frombuffer((tmp_path / "tx.cf32").read_bytes(), dtype=np.complex64)
     raw = bidir.build_uplink_iq(b"uplink-cmd", _SR, {}).astype(np.complex64)
     assert np.array_equal(on_air, raw)
@@ -399,3 +466,251 @@ def test_tx_controller_no_doppler_is_verbatim(tmp_path):
 def test_version(capsys):
     assert bidir.main(["--version"]) == 0
     assert "0." in capsys.readouterr().out
+
+
+# --------------------------------------------------------------- ROUND 10: the uplink is BOUNDED
+#
+# The bidirectional path had ONE guard: a 64 kB byte cap. But bytes are not what a burst costs —
+# gfsk.modulate() does np.repeat(symbols, sps), so sps and the total sample count decide the
+# allocation. And none of these parameters are ours: symbol_rate comes from the backend's
+# transmitter catalogue, which has offered baud=10.
+
+
+def test_a_sane_burst_survives_validation():
+    samples = bidir.validate_uplink(b"hello", _SR, {})
+    assert samples == len(b"hello") * 8 * int(_SR // 9600)
+    assert len(bidir.build_uplink_iq(b"hello", _SR, {})) == samples
+
+
+def test_an_empty_payload_is_rejected():
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"", _SR, {})
+    assert e.value.code == "empty-payload"
+
+
+def test_an_oversize_payload_is_rejected():
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"x" * (bidir._UPLINK_MAX_BYTES + 1), _SR, {})
+    assert e.value.code == "payload-too-large"
+
+
+def test_the_np_repeat_ALLOCATION_BOMB_is_refused():
+    """A 64 kB payload is 'small'. At 9600 baud and a 100 MHz sample rate it is 10416 sps, and
+    np.repeat then asks numpy for ~43 GB — inside the keyed window, on the old code. The byte cap
+    does not see this at all; only an sps/sample-count bound does."""
+    payload = b"x" * bidir._UPLINK_MAX_BYTES
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(payload, 96_000_000.0, {})  # 10_000 sps
+    assert e.value.code == "sps-too-large"
+
+
+def test_a_burst_past_the_sample_ceiling_is_refused():
+    """Under the sps cap AND under the duration cap, but past the total-sample cap. 25000 B at 9600
+    baud = 20.8 s (< 30 s) and, at the 1024 sps ceiling, 25000*8*1024 = 204.8M samples (> 200M)."""
+    payload = b"x" * 25_000
+    sr = 9600.0 * bidir._MAX_SPS  # exactly at the sps cap
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(payload, sr, {})
+    assert e.value.code == "iq-too-large"
+
+
+@pytest.mark.parametrize("baud", [10, 1, 0.5, 1199])
+def test_a_sub_protocol_baud_is_refused(baud):
+    """The REST backend's transmitter catalogue has offered baud=10. At 10 baud a 1 kB payload is a
+    13-minute transmission — with the PA keyed the whole time."""
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"cmd", _SR, {"baud": baud})
+    assert e.value.code in ("symbol-rate-unusable", "non-integer-sps")
+
+
+@pytest.mark.parametrize(
+    ("params", "rate"),
+    [
+        ({"mod_index": float("nan")}, _SR),
+        ({"bt": float("inf")}, _SR),
+        ({}, float("inf")),
+        ({}, float("nan")),
+    ],
+)
+def test_non_finite_parameters_are_refused(params, rate):
+    """NaN/inf propagate silently through the DSP and produce an all-NaN burst — which the SDR will
+    happily key up and transmit as noise across the band."""
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"cmd", rate, params)
+    assert e.value.code in ("non-finite-parameter", "symbol-rate-unusable", "sample-rate-unusable")
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_the_RX_demod_falls_back_on_a_non_finite_baud(bad):
+    """ROUND 10: symbol_rate_hz_of() gated on ``v > 0``, and ``inf > 0`` is True — so an infinite
+    baud was handed back as a usable symbol rate. It now demands a FINITE rate. For the DEMOD path
+    (RX), a garbage rate falls back to the catalogue default rather than poisoning the DSP — the
+    receiver must keep going."""
+    assert bidir._decoder_kwargs({"baud": bad})["symbol_rate_hz"] == 9600.0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), 0.0, -1.0, "garbage", None])
+def test_a_garbage_TX_baud_is_REJECTED_not_coerced(bad):
+    """ROUND 11 (P1). A garbage baud in a TX COMMAND is a different thing from a garbage baud on the
+    RX demod. The RX demod falls back and keeps receiving; a STATION TOLD TO TRANSMIT at baud=NaN
+    must be REFUSED, not quietly retuned to 9600 and keyed. The round-10 fallback was correct for RX
+    and wrong here."""
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"cmd", _SR, {"baud": bad})
+    assert e.value.code == "symbol-rate-unusable"
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, 20.0])
+def test_an_unusable_mod_index_is_refused(bad):
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"cmd", _SR, {"mod_index": bad})
+    assert e.value.code == "modulation-unusable"
+
+
+def test_the_app_ADVERTISES_that_it_requires_the_handshake():
+    """`ready` means the DOWNLINK is live; it never meant an uplink was flyable. The app must say so
+    out loud, or an orchestrator will go on keying first and asking later."""
+    import inspect
+
+    src = inspect.getsource(bidir.amain)
+    assert '"tx_prepare_required": True' in src
+    assert '"event": "ready"' in src
+
+
+def test_prepare_transmit_is_a_REGISTERED_command():
+    import inspect
+
+    src = inspect.getsource(bidir.amain)
+    assert '"prepare_transmit": _on_prepare_transmit' in src
+
+
+def test_apply_nco_is_identical_across_the_chunk_boundary():
+    """ROUND 10: apply_nco is chunked (bounded working set inside the keyed window). The output must
+    be bit-for-bit what the whole-array float64-phase computation produced — a burst that straddles
+    _NCO_CHUNK must not glitch at the seam."""
+    rng = np.random.default_rng(0)
+    n = bidir._NCO_CHUNK + 12345  # straddles exactly one chunk boundary
+    iq = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+    freq, sr = 8000.0, 124800.0
+
+    got = bidir.apply_nco(iq, freq, sr)
+
+    # The reference: the exact whole-array form apply_nco replaced.
+    ph = 2.0 * np.pi * freq * np.arange(n) / sr
+    expected = (iq * np.exp(1j * ph)).astype(np.complex64)
+
+    assert got.dtype == np.complex64
+    assert np.array_equal(got, expected), "the chunked NCO differs from the whole-array computation"
+
+
+# --------------------------------------------------------- ROUND 11 (P0-5): the RF DURATION bound
+
+
+def test_a_multi_minute_burst_is_REFUSED_before_keying():
+    """THE POST-KEY RADIATION HAZARD. The round-10 caps bound the MODEM IQ, but RF duration =
+    payload_bits / baud is independent of the sample rate, and the burst is upsampled to the
+    hardware rate AFTER the PA is keyed. A 64 kB payload at the 1200-baud floor is ~437 s of RF —
+    past gs-client's 60 s completion timeout, so gs-client gives up while the PA keeps radiating for
+    6 more minutes and the post-key upsample allocates ~7 GB. It must be refused while cold."""
+    # 64 kB at 1200 baud, at a sample rate that keeps sps in-bounds (1200*80 = 96000).
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(b"x" * 65_536, 96_000.0, {"baud": 1200})
+    assert e.value.code == "burst-too-long"
+
+
+def test_a_short_burst_within_the_duration_cap_is_accepted():
+    # ~1024 bytes at 9600 baud = 0.85 s of RF — well inside the cap.
+    samples = bidir.validate_uplink(b"x" * 1024, _SR, {})
+    assert samples > 0
+    # And the duration bound matches payload_bits / baud.
+    assert bidir._MAX_BURST_SECONDS > (1024 * 8) / 9600.0
+
+
+def test_the_duration_bound_is_independent_of_sample_rate():
+    """The same payload+baud is the same air time at ANY sample rate — the bound must not be dodged
+    by lowering the sample rate."""
+    payload = b"x" * 8000  # 8000*8 / 1200 = 53.3 s > 30 s cap, regardless of sample rate
+    for sr in (96_000.0, 12_000.0, 2_400_000.0):
+        # keep sps integer: sr must be a multiple of 1200
+        if sr % 1200 != 0:
+            continue
+        with pytest.raises(bidir.UplinkRejected) as e:
+            bidir.validate_uplink(payload, sr, {"baud": 1200})
+        assert e.value.code in ("burst-too-long", "sps-too-large")
+
+
+# ------------------------------------------------- ROUND 11 (P0-4): stop aborts an in-flight burst
+
+
+def test_stop_during_a_burst_is_processed_and_aborts_it():
+    """THE DEFECT. run_command_loop dispatches serially: if the transmit handler AWAITED the whole
+    burst (up to minutes of RF), the loop could not read the next command, so a `stop` on the
+    control socket was never dequeued and stop_requested was never set — the abort machinery, wired
+    and polling, was unreachable. Round 11 spawns the burst as a task; the loop stays free, reads
+    `stop`, sets the flag, and the burst polls it and cancels mid-flight."""
+    import cubesat_gfsk_endurosat_bidir as b
+    from _spawn_contract import run_command_loop
+
+    async def _run() -> tuple[str, list[dict]]:
+        stop_requested = asyncio.Event()
+
+        class _BlockingIo:
+            """transmit_burst blocks — as a real multi-second burst would — until should_abort()."""
+            def __init__(self) -> None:
+                self.tx_active = None
+                self.started = asyncio.Event()
+
+            def transmit_burst(self, iq, *, on_first_accept=None, should_abort=None):
+                import time as _t
+                self._loop_started = True
+                # Poll should_abort the way _soapy_tx.write_burst does between chunks.
+                for _ in range(500):
+                    if should_abort is not None and should_abort():
+                        return b.BurstResult(
+                            accepted=0, total=len(iq), outcome="cancelled", detail="stop")
+                    _t.sleep(0.005)
+                return b.BurstResult(
+                    accepted=len(iq), total=len(iq), outcome="complete", detail="")
+
+            def close(self) -> None: ...
+
+        io = _BlockingIo()
+        tx = b._TxController(io, sample_rate=_SR, should_abort=stop_requested.is_set)
+        socks = _FakeSockets()
+        socks.control_reader = None  # unused by these handlers
+
+        tx_tasks: list[asyncio.Task] = []
+
+        async def _on_prepare(cmd):
+            await tx.prepare(socks, str(cmd.get("frame_id", "")), b"hello", _SR, {})
+
+        async def _on_transmit(cmd):  # mirrors amain: SPAWN, do not await
+            t = asyncio.create_task(tx.transmit(socks, str(cmd.get("frame_id", ""))))
+            tx_tasks.append(t)
+
+        async def _on_stop(_cmd):
+            stop_requested.set()
+
+        handlers = {"prepare_transmit": _on_prepare, "transmit_frame": _on_transmit,
+                    "stop": _on_stop}
+
+        reader = asyncio.StreamReader()
+        for obj in ({"cmd": "prepare_transmit", "frame_id": "f1"},
+                    {"cmd": "transmit_frame", "frame_id": "f1"},
+                    {"cmd": "stop", "reason": "operator"}):
+            reader.feed_data((json.dumps(obj) + "\n").encode())
+        reader.feed_eof()
+
+        reason = await asyncio.wait_for(
+            run_command_loop(reader, handlers, socks.status_writer), timeout=5.0
+        )
+        # The loop returned on 'stop' WITHOUT waiting the full burst — proof it was not blocked.
+        await asyncio.wait_for(asyncio.gather(*tx_tasks, return_exceptions=True), timeout=5.0)
+        return reason, _events(socks)
+
+    reason, evs = asyncio.run(_run())
+    assert reason == "stop"
+    complete = [e for e in evs if e["event"] == "transmit_complete"]
+    assert complete and complete[-1]["outcome"] == "cancelled", (
+        f"the in-flight burst was not aborted by stop: {evs}"
+    )
