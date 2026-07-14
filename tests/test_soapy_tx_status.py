@@ -62,8 +62,10 @@ class _Dev:
     def getStreamMTU(self, _stream) -> int:
         return self._mtu
 
-    def writeStream(self, _stream, buffs, num_elems, flags, *rest):
-        del buffs, flags, rest
+    def writeStream(self, _stream, buffs, num_elems, *extra):
+        # New call shape: exactly (stream, buffs, num_elems) — no flags/END_BURST.
+        assert extra == (), "writeStream must be called with exactly three arguments"
+        del buffs
         return _Result(int(num_elems))
 
     def readStreamStatus(self, _stream, *args, **kwargs):
@@ -110,6 +112,14 @@ class TestDiscardIsNotSuccess:
         result = write_burst(dev, object(), _buf(2000), mtu=1000)
         assert result.complete and result.outcome == "complete"
 
+    def test_unexpected_negative_status_downgrades_to_discarded(self):
+        # (3g) an UNEXPECTED negative status ret (not TIMEOUT/NOT_SUPPORTED, not a named
+        # discard) is treated as a discard, not silently swallowed.
+        dev = _Dev(mtu=1000, status=[-99])
+        result = write_burst(dev, object(), _buf(1500), mtu=1000)
+        assert result.outcome == "discarded"
+        assert "unexpected negative" in result.detail
+
     def test_benign_event_then_timeout_stays_complete(self):
         # A benign status event (ret==0, no bad flag) followed by TIMEOUT is clean.
         dev = _Dev(mtu=1000, status=[(0, 0), SOAPY_TIMEOUT])
@@ -128,8 +138,8 @@ class TestDiscardIsNotSuccess:
             def getStreamMTU(self, _s):
                 return 1000
 
-            def writeStream(self, _s, buffs, num_elems, flags, *rest):
-                del buffs, flags, rest
+            def writeStream(self, _s, buffs, num_elems, *extra):
+                del buffs, extra
                 return _Result(int(num_elems))
 
         result = write_burst(_NoStatusDev(), object(), _buf(1000), mtu=1000)

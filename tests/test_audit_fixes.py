@@ -16,6 +16,7 @@ import cubesat_gfsk_ax25_tx as txapp
 import framings
 import numpy as np
 import pytest
+from _soapy_tx import TxGainConfigError
 
 from gfsk_ax25 import ax25
 from gfsk_ax25 import framing as ax25_framing
@@ -156,57 +157,75 @@ def _clear_sdr_env(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_tx_sink_never_left_at_zero_gain(monkeypatch):
-    # The deaf-TX fix itself: with no params and no env, the sink must still get the sane
-    # manual default gain (the 0 dB default radiates nothing), TX-direction-addressed.
+def test_tx_sink_without_named_pad_is_a_config_error(monkeypatch):
+    # (3c) rewrite: TX drive is a REQUIRED named per-element gain (PAD). With nothing
+    # TX-specific configured the sink REFUSES (config error) — it never falls back to the
+    # XTRX-unsafe overall setGain overload nor transmits deaf.
     _clear_sdr_env(monkeypatch)
     dev = _FakeSoapyDevice()
-    applied = txapp.configure_tx_sink(dev, _TX, None, 96_000.0)
-    assert ("setGain", _TX, 0, 30.0) in dev.calls
-    assert applied["gain_db"] == 30.0 and applied.get("gain_default") is True
+    with pytest.raises(TxGainConfigError):
+        txapp.configure_tx_sink(dev, _TX, None, 96_000.0)
+
+
+def test_tx_sink_overall_gain_only_is_a_config_error(monkeypatch):
+    # (3c) an explicit overall sdr_tx_gain_db does NOT satisfy the requirement and is NEVER
+    # applied as an overall setGain — with no named element it is a config error.
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_TX_GAIN_DB", "20")
+    dev = _FakeSoapyDevice()
+    with pytest.raises(TxGainConfigError):
+        txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gain_db": 12.0}, 96_000.0)
+    assert not any(c[0] == "setGain" for c in dev.calls)  # never reached the overall overload
 
 
 def test_tx_sink_analog_bandwidth_is_sample_rate_not_channel(monkeypatch):
     # Station hardware rule (XTRX analog filter floor ~0.8 MHz): analog BW = the SAMPLE rate.
+    # A named PAD gain is present so configuration proceeds to the bandwidth setter.
     _clear_sdr_env(monkeypatch)
     dev = _FakeSoapyDevice()
-    txapp.configure_tx_sink(dev, _TX, {}, 2_048_000.0)
+    txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": 40}}, 2_048_000.0)
     assert ("setBandwidth", _TX, 0, 2_048_000.0) in dev.calls
 
 
 def test_tx_sink_merges_tx_env_and_per_pass_tx_params(monkeypatch):
-    # R-22: TX settings come from TX-explicit sources ONLY — per-pass sdr_tx_*
-    # wins over GS_SDR_TX_* env; ppm (direction-neutral) still applies TX-side.
+    # R-22: TX settings come from TX-explicit sources ONLY — per-pass sdr_tx_* wins over
+    # GS_SDR_TX_* env; ppm (direction-neutral) still applies TX-side. (3c) drive is the named
+    # PAD element; the overall setGain overload is never called.
     _clear_sdr_env(monkeypatch)
     monkeypatch.setenv("GS_SDR_TX_ANTENNA", "BAND1")
-    monkeypatch.setenv("GS_SDR_TX_GAIN_DB", "20")
+    monkeypatch.setenv("GS_SDR_TX_GAINS", "PAD=20")
     monkeypatch.setenv("GS_SDR_PPM", "-1.5")
     dev = _FakeSoapyDevice()
-    applied = txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gain_db": 12.0}, 96_000.0)
-    assert ("setAntenna", _TX, 0, "BAND1") in dev.calls
-    assert ("setGain", _TX, 0, 12.0) in dev.calls
-    assert ("setGain", _TX, 0, 20.0) not in dev.calls
+    applied = txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": 12.0}}, 96_000.0)
+    assert ("setAntenna", _TX, 0, "BAND1") in dev.calls  # env fills the antenna
+    assert ("setGain", _TX, 0, "PAD", 12.0) in dev.calls  # per-pass PAD wins over env PAD=20
+    assert not any(c[0] == "setGain" and len(c) == 4 for c in dev.calls)  # no overall setGain
     assert ("setFrequencyCorrection", _TX, 0, -1.5) in dev.calls
-    assert applied["gain_db"] == 12.0 and "gain_default" not in applied
+    assert applied.get("gains") == {"PAD": 12.0} and "gain_default" not in applied
 
 
 def test_tx_sink_never_receives_rx_oriented_names(monkeypatch):
-    # THE R-22 repro: station RX env (LNAW antenna, LNA/TIA/PGA staging) and
-    # generic per-pass RX keys must NOT reach a TX endpoint — on LMS7/XTRX
-    # setAntenna(TX, LNAW)/setGain(TX, "LNA", ..) raise and kill the pass.
+    # THE R-22 repro: station RX env (LNAW antenna, LNA/TIA/PGA staging) and generic per-pass RX
+    # keys must NOT reach a TX endpoint — on LMS7/XTRX setAntenna(TX, LNAW)/setGain(TX, "LNA", ..)
+    # raise and kill the pass. A TX-explicit named PAD is present so configuration proceeds.
     _clear_sdr_env(monkeypatch)
     monkeypatch.setenv("GS_SDR_ANTENNA", "LNAW")
     monkeypatch.setenv("GS_SDR_GAINS", "LNA=30,TIA=9,PGA=3")
     monkeypatch.setenv("GS_SDR_GAIN_DB", "45")
     dev = _FakeSoapyDevice()
     applied = txapp.configure_tx_sink(
-        dev, _TX, {"sdr_antenna": "LNAL", "sdr_gains": {"LNA": 10}, "sdr_gain_db": 45.0},
+        dev, _TX,
+        {"sdr_antenna": "LNAL", "sdr_gains": {"LNA": 10}, "sdr_gain_db": 45.0,
+         "sdr_tx_gains": {"PAD": 33.0}},
         96_000.0,
     )
+    # RX-oriented antenna + named RX gain elements never reach TX; only the TX PAD does.
     assert not any(c[0] == "setAntenna" for c in dev.calls)
-    assert not any(c[0] == "setGain" and isinstance(c[3], str) for c in dev.calls)
-    # ... and the deaf-TX default still applies instead (never 0 dB).
-    assert applied["gain_db"] == 30.0 and applied.get("gain_default") is True
+    assert not any(c[0] == "setGain" and c[3] in ("LNA", "TIA", "PGA") for c in dev.calls)
+    assert ("setGain", _TX, 0, "PAD", 33.0) in dev.calls
+    # ... and NO unsafe overall setGain (the RX-oriented gain_db=45 is dropped as an RX key).
+    assert not any(c[0] == "setGain" and len(c) == 4 for c in dev.calls)
+    assert applied.get("gains") == {"PAD": 33.0} and "gain_default" not in applied
 
 
 def test_tx_sink_per_element_gains(monkeypatch):
@@ -220,8 +239,11 @@ def test_tx_sink_per_element_gains(monkeypatch):
 def test_tx_sink_survives_driver_without_bandwidth_setter(monkeypatch):
     _clear_sdr_env(monkeypatch)
     dev = _FakeSoapyDevice(bandwidth_raises=True)
-    applied = txapp.configure_tx_sink(dev, _TX, None, 96_000.0)  # must not raise
-    assert applied["gain_db"] == 30.0
+    applied = txapp.configure_tx_sink(
+        dev, _TX, {"sdr_tx_gains": {"PAD": 40}}, 96_000.0
+    )  # must not raise
+    assert isinstance(applied, dict)
+    assert not any(c[0] == "setGain" and len(c) == 4 for c in dev.calls)  # no unsafe overall gain
 
 
 def test_soapy_sink_actually_calls_configure_tx_sink():

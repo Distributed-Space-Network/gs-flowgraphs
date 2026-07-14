@@ -126,22 +126,24 @@ def test_decoder_kwargs_symbol_rate_aliases():
 
 def test_file_bidir_io_rx_and_tx(tmp_path):
     rx = tmp_path / "rx.cf32"
-    tx = tmp_path / "tx.cf32"
+    tx = tmp_path / "tx.cs16"
     iq = _guard(bidir.build_uplink_iq(b"hello", _SR, {}))
     rx.write_bytes(iq.astype(np.complex64).tobytes())
     io = bidir.FileBidirIo(str(rx), str(tx))
     chunks = list(io.rx_chunks())
     assert sum(len(c) for c in chunks) == len(iq)
-    result = io.transmit_burst(bidir.build_uplink_iq(b"cmd", _SR, {}))
-    assert result.complete and result.accepted > 0
+    # (3a) transmit_burst now takes the FINAL flat CS16 buffer, built pre-key by the controller.
+    cs16 = bidir.to_cs16(bidir.build_uplink_iq(b"cmd", _SR, {}))
+    result = io.transmit_burst(cs16)
+    assert result.complete and result.accepted == cs16.size // 2
     assert io.sent_samples == result.accepted
-    assert tx.stat().st_size == result.accepted * 8  # complex64
+    assert tx.stat().st_size == result.accepted * 4  # flat CS16 = 2 int16 * 2 bytes / complex
 
 
 def test_file_bidir_io_no_rx_file_is_empty():
     io = bidir.FileBidirIo(None, None)
     assert list(io.rx_chunks()) == []
-    result = io.transmit_burst(np.zeros(10, np.complex64))  # discarded, still counted
+    result = io.transmit_burst(np.zeros(20, np.int16))  # 10 complex, discarded, still counted
     assert result.accepted == 10 and result.complete
 
 
@@ -433,10 +435,11 @@ def test_apply_nco_zero_offset_is_identity():
 
 
 def test_tx_controller_applies_doppler_precomp(tmp_path):
-    # With a live downlink Doppler + split frequencies, the transmitted burst is the verbatim IQ
-    # rotated by the uplink pre-comp — NOT the raw IQ. Same length, different samples.
+    # (3a) Doppler is now applied at STAGE time and the cache is the FINAL flat CS16 — so the
+    # transmitted burst is the raw IQ rotated by the uplink pre-comp, packed to CS16.
     doppler = {"hz": 8000.0}
-    io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
+    tx_path = tmp_path / "tx.cs16"
+    io = bidir.FileBidirIo(None, str(tx_path))
     tx = bidir._TxController(
         io, sample_rate=_SR, doppler=doppler, downlink_hz=401_500_000.0,
         uplink_hz=449_900_000.0,
@@ -444,23 +447,43 @@ def test_tx_controller_applies_doppler_precomp(tmp_path):
     socks = _FakeSockets()
     asyncio.run(_prepare_then_transmit(tx, socks, "f1", b"uplink-cmd"))
     raw = bidir.build_uplink_iq(b"uplink-cmd", _SR, {})
-    expected = bidir.apply_nco(
-        raw, bidir.tx_doppler_hz(8000.0, 401_500_000.0, 449_900_000.0), _SR
+    tx_dop = bidir.tx_doppler_hz(8000.0, 401_500_000.0, 449_900_000.0)
+    expected_cs16 = bidir.to_cs16(bidir.apply_nco(raw, tx_dop, _SR))
+    on_air = np.frombuffer(tx_path.read_bytes(), dtype=np.int16)
+    assert np.array_equal(on_air, expected_cs16)                 # Doppler applied, then packed
+    assert not np.array_equal(on_air, bidir.to_cs16(raw))        # NOT the un-shifted burst
+
+
+def test_build_final_cs16_rejects_a_non_finite_waveform(monkeypatch):
+    # (3g) non-finite IQ in the built (pre-key) waveform is a rejection, not a keyed failure.
+    tx = bidir._TxController(bidir.FileBidirIo(None, None), sample_rate=_SR)
+    monkeypatch.setattr(
+        bidir, "build_uplink_iq",
+        lambda *_a, **_k: np.full(64, np.nan + 0j, dtype=np.complex64),
     )
-    on_air = np.frombuffer((tmp_path / "tx.cf32").read_bytes(), dtype=np.complex64)
-    assert len(on_air) == len(raw)
-    assert not np.array_equal(on_air, raw.astype(np.complex64))  # Doppler was applied
-    assert np.allclose(on_air, expected, atol=1e-4)
+    with pytest.raises(bidir.UplinkRejected) as e:
+        tx._build_final_cs16(b"x", _SR, {}, 1)
+    assert e.value.code == "non-finite-waveform"
+
+
+def test_build_final_cs16_rejects_an_empty_waveform(monkeypatch):
+    # (3g) an empty built waveform is a rejection.
+    tx = bidir._TxController(bidir.FileBidirIo(None, None), sample_rate=_SR)
+    monkeypatch.setattr(bidir, "build_uplink_iq", lambda *_a, **_k: np.zeros(0, dtype=np.complex64))
+    with pytest.raises(bidir.UplinkRejected) as e:
+        tx._build_final_cs16(b"x", _SR, {}, 1)
+    assert e.value.code == "empty-waveform"
 
 
 def test_tx_controller_no_doppler_is_verbatim(tmp_path):
-    # Default controller (no doppler dict / no freqs) transmits the raw verbatim IQ unchanged.
-    io = bidir.FileBidirIo(None, str(tmp_path / "tx.cf32"))
+    # Default controller (no doppler dict / no freqs) stages the raw verbatim IQ, packed to CS16.
+    tx_path = tmp_path / "tx.cs16"
+    io = bidir.FileBidirIo(None, str(tx_path))
     tx = bidir._TxController(io, sample_rate=_SR)
     asyncio.run(_prepare_then_transmit(tx, _FakeSockets(), "f1", b"uplink-cmd"))
-    on_air = np.frombuffer((tmp_path / "tx.cf32").read_bytes(), dtype=np.complex64)
-    raw = bidir.build_uplink_iq(b"uplink-cmd", _SR, {}).astype(np.complex64)
-    assert np.array_equal(on_air, raw)
+    on_air = np.frombuffer(tx_path.read_bytes(), dtype=np.int16)
+    raw = bidir.build_uplink_iq(b"uplink-cmd", _SR, {})
+    assert np.array_equal(on_air, bidir.to_cs16(raw))
 
 
 def test_version(capsys):
@@ -739,10 +762,11 @@ def test_a_burst_within_the_hardware_ceiling_is_accepted():
     assert samples > 0
 
 
-def test_a_burst_aborts_before_the_upsample_allocation():
-    """P0-5: a stop before the burst starts must not pay for the upsample allocation."""
+def test_a_staged_burst_aborts_before_the_write():
+    """P0-5 / (3a): the big allocation (resample) is now PRE-KEY; a stop before the write still
+    cancels without radiating. transmit_burst receives the FINAL flat CS16 buffer."""
     io = bidir.FileBidirIo(None, None)
     # FileBidirIo returns cancelled if should_abort() is True — before any write.
-    result = io.transmit_burst(np.zeros(1000, np.complex64), should_abort=lambda: True)
+    result = io.transmit_burst(np.zeros(2000, np.int16), should_abort=lambda: True)
     assert result.outcome == "cancelled"
     assert result.accepted == 0

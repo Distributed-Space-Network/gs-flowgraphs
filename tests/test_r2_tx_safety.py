@@ -65,7 +65,8 @@ async def _run(monkeypatch: pytest.MonkeyPatch, *, accepted: int, total: int,
                modulate_raises: Exception | None = None) -> _Writer:
     w = _Writer()
 
-    def _fake_sink(args, iq, params=None, on_first_accept=None, should_abort=None):  # noqa: ANN001
+    def _fake_sink(args, iq, params=None, on_first_accept=None,  # noqa: ANN001
+                   should_abort=None, *, cs16=None):
         assert iq is not None and len(iq) > 0, "the sink must be handed real IQ"
         if accepted > 0 and on_first_accept is not None:
             on_first_accept()          # the SDR provably accepted a sample

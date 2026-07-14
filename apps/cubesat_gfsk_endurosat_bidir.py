@@ -57,7 +57,7 @@ from typing import Protocol
 import numpy as np
 from _fallback_select import SYMBOL_RATE_KEYS, symbol_rate_hz_of
 from _recorder import StreamRecorder
-from _soapy_tx import BurstResult
+from _soapy_tx import BurstResult, to_cs16
 from _spawn_contract import (
     EngineFailure,
     build_argparser,
@@ -375,17 +375,19 @@ class BidirIo(Protocol):
 
     def transmit_burst(
         self,
-        iq: np.ndarray,
+        cs16: np.ndarray,
         *,
         on_first_accept: Callable[[], None] | None = None,
         should_abort: Callable[[], bool] | None = None,
     ) -> BurstResult:
-        """Send one uplink burst; returns the shared transport's BurstResult
-        (accepted count + explicit outcome — R-16). ``on_first_accept`` fires
-        when the sink provably takes samples; ``should_abort`` is polled between
-        chunks so a pass stop cancels an in-flight burst (outcome="cancelled")
-        instead of radiating it to completion. Pauses RX internally if the
-        underlying device is shared (so RX and TX never touch it concurrently)."""
+        """Send one uplink burst. ``cs16`` is the FINAL flat CS16 buffer built entirely
+        pre-key (3a) — Doppler applied, resampled, packed — so this call does NO DSP and
+        NO large allocation; it only opens the TX stream and writes. Returns the shared
+        transport's BurstResult (accepted count + explicit outcome — R-16).
+        ``on_first_accept`` fires when the sink provably takes samples; ``should_abort``
+        is polled between chunks so a pass stop cancels an in-flight burst
+        (outcome="cancelled") instead of radiating it to completion. Pauses RX internally
+        if the underlying device is shared (so RX and TX never touch it concurrently)."""
         ...
 
     def close(self) -> None: ...
@@ -401,6 +403,9 @@ class FileBidirIo:
         self._rx_path = rx_path
         self._tx_path = tx_path
         self.sent_samples = 0
+        # Bench/file I/O runs at the modem rate — no resample — so the pre-key staging
+        # upsamples by 1 (the staged buffer is already the final CS16 at this rate).
+        self.tx_upsample_factor = 1
 
     def rx_chunks(self) -> Iterator[np.ndarray]:
         if not self._rx_path or not Path(self._rx_path).is_file():
@@ -415,22 +420,27 @@ class FileBidirIo:
 
     def transmit_burst(
         self,
-        iq: np.ndarray,
+        cs16: np.ndarray,
         *,
         on_first_accept: Callable[[], None] | None = None,
         should_abort: Callable[[], bool] | None = None,
     ) -> BurstResult:
-        buf = np.asarray(iq, dtype=np.complex64)
+        # (3a) receives the FINAL flat CS16 buffer built pre-key — this path does NO DSP,
+        # it just writes the bytes (a raw CS16 [I0,Q0,...] dump for bench use).
+        buf = np.ascontiguousarray(np.asarray(cs16, dtype=np.int16))
+        n_complex = int(buf.size // 2)
         if should_abort is not None and should_abort():
-            return BurstResult(accepted=0, total=len(buf), outcome="cancelled",
+            return BurstResult(accepted=0, total=n_complex, outcome="cancelled",
                                detail="aborted by caller")
+        if buf.size == 0:  # (3g) an empty burst is an error, not a silent success
+            return BurstResult(accepted=0, total=0, outcome="error", detail="empty burst buffer")
         if self._tx_path:
             with open(self._tx_path, "ab") as f:
                 f.write(buf.tobytes())
-        if len(buf) and on_first_accept is not None:
+        if on_first_accept is not None:
             on_first_accept()
-        self.sent_samples += len(buf)
-        return BurstResult(accepted=len(buf), total=len(buf), outcome="complete")
+        self.sent_samples += n_complex
+        return BurstResult(accepted=n_complex, total=n_complex, outcome="complete")
 
     def close(self) -> None:
         return None
@@ -505,18 +515,25 @@ def _rssi_dbm(chunk: np.ndarray) -> float:
 
 @dataclass(frozen=True)
 class _StagedBurst:
-    """A validated, fully-built BASEBAND burst, waiting for the key.
+    """A validated, fully-built FINAL burst, waiting for the key.
 
-    The NCO is deliberately NOT applied here. Doppler pre-compensation must reflect the satellite's
-    velocity at the moment the RF actually leaves the antenna, not at stage time, so the rotation is
-    applied at burst time — it is O(n) on an already-bounded array, allocates one buffer of known
-    size, and cannot fail on payload content. Everything that CAN fail (disk read, framing,
-    modulation, the np.repeat allocation) is done here, before anything is energized.
+    (3a) ALL waveform DSP is done here, PRE-KEY: disk read, framing, modulation, Doppler
+    pre-compensation, resampling to the hardware rate, the flat-CS16 pack, and the finite /
+    non-empty / sample-count validation. The cache therefore holds the FINAL flat CS16
+    hardware-rate buffer, Doppler ALREADY applied — so the keyed window does NO DSP and NO
+    large allocation, only a stream open + write of ``cs16``.
+
+    Doppler uses the app's last-known ``set_doppler`` offset snapshotted at STAGE time. This
+    reverses the earlier "Doppler NCO at emission time" scheme: a single offset for the short
+    burst is accepted so that nothing is computed after the PA is hot. HANDOFF: the orchestrator
+    must send ``set_doppler`` BEFORE ``prepare_transmit`` for the pre-comp to reflect the pass.
     """
 
     frame_id: str
     payload_sha256: str
-    iq: np.ndarray
+    cs16: np.ndarray          # FINAL flat CS16 hardware-rate buffer, Doppler applied
+    complex_samples: int      # hardware-rate complex-sample count (== cs16.size // 2)
+    modem_samples: int        # modem-rate complex count (predicted / RF-duration basis)
 
 
 class _TxController:
@@ -589,10 +606,14 @@ class _TxController:
                 # ROUND 12: pass the TX upsample factor so validate_uplink bounds the HARDWARE-rate
                 # allocation (samples * factor), not just the modem-rate one. 1 for file/bench I/O.
                 hw_factor = int(getattr(self._io, "tx_upsample_factor", 1) or 1)
-                samples = await asyncio.to_thread(
+                modem_samples = await asyncio.to_thread(
                     validate_uplink, payload, sample_rate, params, hardware_factor=hw_factor
                 )
-                iq = await asyncio.to_thread(build_uplink_iq, payload, sample_rate, params)
+                # (3a) build the COMPLETE final hardware-rate flat CS16 buffer HERE, cold:
+                # modulate -> Doppler (stage-time offset) -> resample -> pack -> finite/non-empty.
+                cs16 = await asyncio.to_thread(
+                    self._build_final_cs16, payload, sample_rate, params, hw_factor
+                )
             except UplinkRejected as e:
                 _log.error("bidir TX: uplink REJECTED pre-key (%s): %s", e.code, e.detail)
                 await send_event(
@@ -618,24 +639,28 @@ class _TxController:
                 )
                 return False
 
+            complex_samples = int(cs16.size // 2)  # hardware-rate complex samples now cached
             self._staged = _StagedBurst(
                 frame_id=frame_id,
                 payload_sha256=hashlib.sha256(payload).hexdigest(),
-                iq=iq,
+                cs16=cs16,
+                complex_samples=complex_samples,
+                modem_samples=int(modem_samples),
             )
             # ROUND 11 (re-check, D5): report the RF DURATION of the burst, so the orchestrator can
             # size its completion deadline to THIS burst instead of a second, independent constant.
-            # One authoritative number: the engine builds the burst and says how long it will take;
-            # the orchestrator waits that long (plus margin). duration = modem samples / modem
-            # rate (== payload_bits/baud; upsampling changes the sample count, not the RF time).
-            duration_s = (iq.size / sample_rate) if sample_rate > 0 else 0.0
+            # duration = modem samples / modem rate (== payload_bits/baud; upsampling changes the
+            # sample count, not the RF time).
+            duration_s = (modem_samples / sample_rate) if sample_rate > 0 else 0.0
             await send_event(
                 sockets.status_writer,
                 {
                     "event": "tx_prepared",
                     "frame_id": frame_id,
-                    "samples": int(iq.size),
-                    "predicted_samples": int(samples),
+                    # hardware-rate complex samples that will actually be streamed (Doppler +
+                    # resample already applied); predicted_samples stays the modem-rate count.
+                    "samples": complex_samples,
+                    "predicted_samples": int(modem_samples),
                     "payload_bytes": len(payload),
                     "payload_sha256": self._staged.payload_sha256,
                     "sample_rate": int(sample_rate),
@@ -643,6 +668,29 @@ class _TxController:
                 },
             )
             return True
+
+    def _build_final_cs16(
+        self, payload: bytes, sample_rate: float, params: dict[str, object], hw_factor: int
+    ) -> np.ndarray:
+        """(3a) The COMPLETE pre-key DSP, run cold in a worker thread: modulate the uplink,
+        apply the uplink Doppler pre-compensation (using the app's last-known ``set_doppler``
+        offset, snapshotted now), resample to the hardware rate, and pack to ONE contiguous flat
+        CS16 buffer. Validates non-empty + finite BEFORE returning. Raises :class:`UplinkRejected`
+        on an empty or non-finite waveform so ``prepare`` answers ``tx_prepare_failed`` (never a
+        keyed failure). Nothing here touches hardware, and the keyed window re-does NONE of it."""
+        iq = build_uplink_iq(payload, sample_rate, params)  # modem-rate complex64
+        # Doppler at STAGE time (single offset for the short burst): downlink offset -> uplink
+        # pre-comp, applied at the modem rate, exactly as the emission-time NCO used to.
+        tx_dop = tx_doppler_hz(self._doppler["hz"], self._downlink_hz, self._uplink_hz)
+        iq = apply_nco(iq, tx_dop, sample_rate)
+        hw = upsample_burst(iq, int(hw_factor))  # resample to the device hardware rate
+        if hw.size == 0:
+            raise UplinkRejected("empty-waveform", "the built waveform is empty — nothing to send")
+        if not np.all(np.isfinite(hw.view(np.float32))):
+            raise UplinkRejected(
+                "non-finite-waveform", "the built waveform has non-finite IQ (NaN/Inf)"
+            )
+        return to_cs16(hw)
 
     # -- post-key ------------------------------------------------------------------------------
 
@@ -697,15 +745,13 @@ class _TxController:
             detail = ""
             self.tx_active.set()
             try:
-                # The ONLY DSP left inside the keyed window: rotate the pre-built baseband by the
-                # CURRENT Doppler. O(n) on a bounded array, with a working set bounded to _NCO_CHUNK
-                # (apply_nco is chunked), and it cannot fail on payload content — that was all
-                # settled at stage time.
-                tx_dop = tx_doppler_hz(self._doppler["hz"], self._downlink_hz, self._uplink_hz)
-                iq = await asyncio.to_thread(apply_nco, staged.iq, tx_dop, self._sample_rate)
+                # (3a) NO DSP in the keyed window: the cached buffer is already the FINAL flat CS16
+                # (Doppler applied, resampled, packed) built cold at stage time. The keyed window
+                # only opens the TX stream and writes these bytes — no modulation, no rotation, no
+                # resample, no allocation.
                 result = await asyncio.to_thread(
                     lambda: self._io.transmit_burst(
-                        iq, on_first_accept=_first_accept, should_abort=self._should_abort
+                        staged.cs16, on_first_accept=_first_accept, should_abort=self._should_abort
                     )
                 )
                 accepted = int(result.accepted)
@@ -894,11 +940,26 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
 
     def __init__(self, args, params: dict[str, object]) -> None:
         import SoapySDR
-        from _soapy import apply_corrections, configure_soapy_source, merge_sdr_params, sdr_env
-        from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX, SOAPY_SDR_TX
+        from _soapy import (
+            apply_corrections,
+            configure_soapy_source,
+            merge_sdr_params,
+            merge_sdr_params_tx,
+            sdr_env,
+        )
+        from _soapy_tx import named_tx_gains
+        from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_CS16, SOAPY_SDR_RX, SOAPY_SDR_TX
 
+        # (3c) TX drive is a named per-element gain (PAD) ONLY — the overall setGain overload
+        # aborts SoapyXTRX. Resolve + REQUIRE it BEFORE opening the device, so a misconfigured
+        # (deaf / would-crash) TX fails closed COLD, not at key time. Raises TxGainConfigError.
+        self._tx_settings = merge_sdr_params_tx(params)
+        self._tx_named = named_tx_gains(self._tx_settings)
         self._sd = SoapySDR
         self._RX, self._TX, self._CF32 = SOAPY_SDR_RX, SOAPY_SDR_TX, SOAPY_SDR_CF32
+        # TX streams in the bench-proven CS16 wire format (the XTRX probe shape); RX
+        # stays CF32. The uplink burst is packed to flat CS16 before keying.
+        self._CS16 = SOAPY_SDR_CS16
         self._lock = threading.Lock()
         self.tx_active = threading.Event()
         rate = resolve_sample_rate(args, params)  # integer sps — must match the modulator's IQ rate
@@ -953,14 +1014,13 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         # The RX-oriented ``merged`` params (GS_SDR_ANTENNA/GS_SDR_GAINS — e.g. antenna "LNAW",
         # gain elements LNA/TIA/PGA) are NEVER pushed onto the TX endpoint: those names are
         # RX-only on LMS7/XTRX-class devices and setAntenna/setGain would RAISE, aborting the
-        # shared device init and losing the DOWNLINK too (not just the uplink). R-22: TX gets its
-        # OWN explicit settings — sdr_tx_* params / GS_SDR_TX_* env via merge_sdr_params_tx —
-        # applied only when configured (no manual default: PA-drive levels are BENCH-PENDING).
-        from _soapy import merge_sdr_params_tx
-
-        tx_settings = merge_sdr_params_tx(params)
-        if tx_settings:
-            configure_soapy_source(_EP(dev, SOAPY_SDR_TX), tx_settings, default_gain_db=None)
+        # shared device init and losing the DOWNLINK too (not just the uplink). R-22 + (3c): TX
+        # gets its OWN explicit NAMED gains (resolved + required above); the overall setGain
+        # overload is never used, so only the named PAD element drives the PA.
+        tx_only: dict[str, object] = {"sdr_gains": self._tx_named}
+        if isinstance(self._tx_settings.get("sdr_antenna"), str):
+            tx_only["sdr_antenna"] = self._tx_settings["sdr_antenna"]
+        configure_soapy_source(_EP(dev, SOAPY_SDR_TX), tx_only, default_gain_db=None)
         apply_corrections(_EP(dev, SOAPY_SDR_RX), ppm=env["ppm"], dc_removal=env["dc_removal"])
         # The uplink LO shares the XTRX reference, so the SAME ppm correction must ride the TX chain
         # — otherwise the calibrated reference error (ppm * uplink_hz, ~kHz) rides on top of the
@@ -1000,48 +1060,63 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
             else:
                 _log.warning("bidir RX readStream ret=%d", sr.ret)
 
-    def transmit_burst(self, iq: np.ndarray, *, on_first_accept=None, should_abort=None):
-        """One uplink burst through the shared bounded TX transport (P0-07).
+    def transmit_burst(self, cs16: np.ndarray, *, on_first_accept=None, should_abort=None):
+        """Write ONE already-final flat CS16 uplink burst. (3a) NO DSP here — the resample,
+        Doppler and CS16 pack all ran PRE-KEY in the staging, so the keyed window only opens
+        the TX stream and writes the cached buffer (no modulation/rotation/resample/allocation).
 
-        R-15: a REAL half-duplex transition — the RX stream is DEACTIVATED
-        before the TX stream activates (break-before-make at the stream level;
-        the antenna-side T/R relay is gs-client's safety sequencer), and
-        reactivated afterwards with a settle window during which the reader
-        discards samples (front-end transient, not downlink).
+        Conforms to the XTRX bench-probe shape (tools/probe_soapy_tx_write.py):
+        ``setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16)`` with NO explicit channel list; (3d) the
+        stream MTU is queried BEFORE activateStream; there is NO sleep between activate and the
+        first write (untimed XTRX buffers go stale); write_burst uses the 3-arg call + one bounded
+        readStreamStatus check (no flags/END_BURST/timed writes).
 
-        Returns a ``_soapy_tx.BurstResult`` (R-16: the caller's events must
-        report the ACCEPTED count and an explicit outcome, never a nominal
-        zero-sample completion)."""
+        (3h) Neither the (absent) write timeout nor the per-burst deadline can interrupt a HUNG
+        native writeStream — the deadline only bounds time BETWEEN writes; a genuinely hung driver
+        call is bounded only by the orchestrator's keyed-window backstop (gs-client PA-off).
+
+        R-15 half-duplex: RX is DEACTIVATED before TX activates. (3e) If RX cannot be cleanly
+        deactivated, TX is REFUSED — we do not key a stream we could not break from RX. (3f) On
+        every exit each cleanup step (TX deactivate, TX close, RX restore) is attempted
+        INDEPENDENTLY so one failing does not skip the others. RX is ALWAYS restored after a burst
+        that opened the TX stream, even on a write error.
+
+        Returns a ``_soapy_tx.BurstResult`` (R-16)."""
         from _soapy_tx import query_tx_mtu, write_burst
 
-        # ROUND 12 (P0): a stop that arrives before the burst starts must NOT pay for the (bounded,
-        # but still up to ~0.5 GB) hardware-rate allocation. Check the abort BEFORE upsampling. The
-        # size is already capped pre-key by validate_uplink's hardware-sample ceiling, and the
-        # subsequent write_burst polls should_abort between chunks.
+        buf = np.ascontiguousarray(np.asarray(cs16, dtype=np.int16))
+        n_complex = int(buf.size // 2)
         if should_abort is not None and should_abort():
-            return BurstResult(accepted=0, total=int(np.asarray(iq).size),
-                               outcome="cancelled", detail="aborted before upsample")
-        # R-14: the modulator's modem-rate burst is interpolated to the
-        # device's supported hardware rate (exact integer factor).
-        buf = upsample_burst(np.asarray(iq, dtype=np.complex64), self._factor)
+            return BurstResult(accepted=0, total=n_complex, outcome="cancelled",
+                               detail="aborted before key")
+        if buf.size == 0:  # (3g) empty output is an ERROR, refused before touching T/R
+            return BurstResult(accepted=0, total=0, outcome="error",
+                               detail="empty burst buffer — refusing to key")
         self.tx_active.set()
         try:
             with self._lock:
-                with contextlib.suppress(Exception):
-                    self._dev.deactivateStream(self._rx_stream)  # break RX first (R-15)
-                tx = self._dev.setupStream(self._TX, self._CF32, [0])
-                self._dev.activateStream(tx)
+                # (3e) break-before-make: if RX cannot be cleanly deactivated, REFUSE TX — do not
+                # key a TX stream we could not break from RX. RX is left as-is (unknown state).
                 try:
-                    # Deadline: burst real-time duration + generous margin — a
-                    # writer that cannot drain one burst in this is wedged; it
-                    # must not hold the device lock through ~21 one-second
-                    # timeouts (P0-07).
-                    deadline_s = max(5.0, 3.0 * len(buf) / max(1.0, self._hw_rate))
+                    self._dev.deactivateStream(self._rx_stream)
+                except Exception as e:  # noqa: BLE001
+                    _log.error("bidir TX: RX deactivate FAILED; refusing to key: %r", e)
+                    return BurstResult(accepted=0, total=n_complex, outcome="error",
+                                       detail=f"RX break failed; refusing TX: {e!r}")
+                tx = None
+                try:
+                    # CS16 wire format, NO explicit [0] channel list — the probe-verified shape.
+                    tx = self._dev.setupStream(self._TX, self._CS16)
+                    # (3d) query MTU BEFORE activateStream (positive-MTU-required stays).
+                    mtu = query_tx_mtu(self._dev, tx)
+                    self._dev.activateStream(tx)  # no post-activate sleep (probe rule)
+                    # Deadline bounds time BETWEEN writes only (see 3h above), not a hung call.
+                    deadline_s = max(5.0, 3.0 * n_complex / max(1.0, self._hw_rate))
                     result = write_burst(
                         self._dev,
                         tx,
                         buf,
-                        mtu=query_tx_mtu(self._dev, tx),
+                        mtu=mtu,
                         deadline_s=deadline_s,
                         on_first_accept=on_first_accept,
                         should_abort=should_abort,
@@ -1051,11 +1126,18 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                             "bidir TX burst incomplete: %d/%d (%s: %s)",
                             result.accepted, result.total, result.outcome, result.detail,
                         )
-                    with contextlib.suppress(Exception):
-                        self._dev.readStreamStatus(tx, timeoutUs=200_000)  # let the burst flush
+                except Exception as e:  # noqa: BLE001 — a truthful error result, still clean up
+                    _log.exception("bidir TX: stream/write failed")
+                    result = BurstResult(
+                        accepted=0, total=n_complex, outcome="error", detail=repr(e)
+                    )
                 finally:
-                    self._dev.deactivateStream(tx)
-                    self._dev.closeStream(tx)
+                    # (3f) each cleanup step independent — one failing must not skip the others.
+                    if tx is not None:
+                        with contextlib.suppress(Exception):
+                            self._dev.deactivateStream(tx)
+                        with contextlib.suppress(Exception):
+                            self._dev.closeStream(tx)
                     with contextlib.suppress(Exception):
                         self._dev.activateStream(self._rx_stream)  # make RX again (R-15)
                     # Reader discards until here — reactivation transient.

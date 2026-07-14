@@ -78,10 +78,11 @@ def test_sink_iq_file_path_honors_should_abort(tmp_path: Path) -> None:
 
 
 def test_bidir_file_io_honors_should_abort(tmp_path: Path) -> None:
-    tx_path = tmp_path / "uplink.cf32"
+    tx_path = tmp_path / "uplink.cs16"
     io = bidir.FileBidirIo(None, str(tx_path))
+    # (3a) transmit_burst takes the FINAL flat CS16 buffer; 64 int16 == 32 complex samples.
     result = io.transmit_burst(
-        np.ones(32, np.complex64), should_abort=lambda: True
+        np.ones(64, np.int16), should_abort=lambda: True
     )
     assert result.outcome == "cancelled" and result.accepted == 0
     assert not tx_path.exists()

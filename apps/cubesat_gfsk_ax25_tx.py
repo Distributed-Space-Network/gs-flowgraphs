@@ -159,7 +159,7 @@ def _preflight_and_build_iq(args, params: dict[str, object], profile, engine: st
 
 async def emit_burst(
     status_writer, args, params: dict[str, object], profile, engine: str, *,
-    should_abort=None, iq=None,
+    should_abort=None, iq=None, cs16=None,
 ) -> None:
     """Modulate, key the burst through the ONE validated sink, and report it honestly.
 
@@ -203,10 +203,12 @@ async def emit_burst(
             iq = await asyncio.to_thread(modulate_gnuradio, _build_frame(args, params, profile))
         else:
             iq = _build_frame_iq(args, params, profile)
+        # (3a) the HARDWARE sink uses cs16 (the pre-key FINAL flat CS16); the file path uses iq.
         result = await asyncio.to_thread(
             _sink_iq, args, iq, params,
             on_first_accept=_first_accept,
             should_abort=should_abort,
+            cs16=cs16,
         )
     except Exception as e:
         # AUDIT ROUND 4 (P0): emitting `tx-failed` and RETURNING NORMALLY is not enough.
@@ -239,11 +241,17 @@ def _sink_iq(
     params: dict[str, object] | None = None,
     on_first_accept=None,
     should_abort=None,
+    *,
+    cs16: np.ndarray | None = None,
 ):
     """Sink the burst; returns a ``_soapy_tx.BurstResult`` describing what was
     ACTUALLY accepted (R-16 — completion events must not fabricate success).
     ``should_abort`` is polled between chunks so a pass stop cancels an
-    in-flight burst instead of radiating it to completion."""
+    in-flight burst instead of radiating it to completion.
+
+    The FILE/bench path writes the modem-rate ``iq`` as cf32 (for offline decode). The HARDWARE
+    path uses ``cs16`` — the FINAL flat CS16 buffer built PRE-KEY (3a) in ``_prepare_tx_cs16`` —
+    so ``_soapy_sink`` does no DSP inside the keyed window."""
     from _soapy_tx import BurstResult
 
     sdr_args = str(args.sdr_args or "")
@@ -256,7 +264,7 @@ def _sink_iq(
         if on_first_accept is not None:
             on_first_accept()
         return BurstResult(accepted=len(data), total=len(data), outcome="complete")
-    return _soapy_sink(args, iq, params, on_first_accept, should_abort)  # pragma: no cover
+    return _soapy_sink(args, params, cs16, on_first_accept, should_abort)  # pragma: no cover
 
 
 class _SoapyDeviceAdapter:
@@ -294,8 +302,13 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
     over station ``GS_SDR_TX_*`` ONLY. RX-oriented names (``GS_SDR_ANTENNA``
     ``LNAW``, ``GS_SDR_GAINS`` ``LNA/TIA/PGA``) never reach the TX endpoint;
     on LMS7/XTRX they'd raise in ``setAntenna``/``setGain`` and kill the pass.
-    With nothing TX-specific configured the sane manual default gain still
-    applies (the deaf-TX trap), TX-direction-addressed.
+
+    XTRX-SAFE GAIN (3c, probe-verified): the overall ``setGain`` overload is REMOVED entirely
+    — it aborts SoapyXTRX (tools/probe_soapy_tx_write.py). TX drive is a NAMED per-element gain
+    (the PAD element via ``sdr_tx_gains``/``GS_SDR_TX_GAINS``) and is REQUIRED: if none is
+    configured this RAISES :class:`_soapy_tx.TxGainConfigError` — a deaf/would-crash TX is a
+    configuration error, refused, not papered over with the unsafe overall gain. The overall
+    ``sdr_gain_db`` key is stripped so ``configure_soapy_source`` can never reach that overload.
 
     Also sets the ANALOG TX filter to the SAMPLE rate, never the narrow channel width —
     below the device filter floor (~0.8 MHz on the XTRX) the analog path goes silent
@@ -303,8 +316,16 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
 
     NOTE: TX gain LEVELS are BENCH-PENDING — validate actual PA drive on the bench before a
     real uplink; this only ensures the front-end is configured at all."""
+    from _soapy_tx import named_tx_gains
+
     endpoint = _SoapyDeviceAdapter(dev, direction)
-    applied = configure_soapy_source(endpoint, merge_sdr_params_tx(params))
+    tx_settings = merge_sdr_params_tx(params)
+    # (3c) REQUIRE a named per-element gain (PAD); never apply the overall setGain overload.
+    named = named_tx_gains(tx_settings)  # raises TxGainConfigError when none is configured
+    tx_only: dict[str, object] = {"sdr_gains": named}
+    if isinstance(tx_settings.get("sdr_antenna"), str):
+        tx_only["sdr_antenna"] = tx_settings["sdr_antenna"]
+    applied = configure_soapy_source(endpoint, tx_only, default_gain_db=None)
     applied.update(apply_corrections(endpoint, ppm=sdr_env()["ppm"], dc_removal=False))
     with contextlib.suppress(Exception):  # bandwidth setting is optional per driver
         dev.setBandwidth(direction, 0, float(sample_rate))
@@ -372,42 +393,54 @@ def _tx_spawn_probe(args, params) -> tuple[bool, dict[str, object]]:
 
 
 def _soapy_sink(  # pragma: no cover
-    args, iq: np.ndarray, params=None, on_first_accept=None, should_abort=None
+    args, params, cs16, on_first_accept=None, should_abort=None
 ):
-    """P0-07: uses the shared bounded TX transport (apps/_soapy_tx.py) — MTU
-    chunking, bounded zero/timeout/error handling, END_BURST on the final data
-    chunk, per-burst deadline — instead of the fixed-4096 ret>0-only loop that
-    could spin forever or oversize a native driver write."""
+    """Open the XTRX TX stream and write the ALREADY-FINAL flat CS16 burst — (3a) NO DSP here.
+    ``cs16`` is the hardware-rate flat CS16 buffer built PRE-KEY (in ``_prepare_tx_cs16`` at
+    preflight), so the keyed window only configures + opens + writes; there is no modulation,
+    resample, pack, or large allocation on this path.
+
+    Conformed to the XTRX bench-probe shape (tools/probe_soapy_tx_write.py):
+    ``setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16)`` with NO explicit channel list; (3d) the stream
+    MTU is queried BEFORE activateStream; NO sleep between activate and the first write; write_burst
+    sends it with the 3-arg call + one bounded readStreamStatus check (no flags/END_BURST/timed
+    writes). (3f) TX deactivate + close are each attempted independently on exit. (3h) neither the
+    absent write timeout nor the deadline can interrupt a HUNG native writeStream — the deadline
+    only bounds time between writes; the real backstop is the orchestrator's keyed-window PA-off."""
     import SoapySDR
-    from _soapy_tx import query_tx_mtu, write_burst
-    from _stream import hardware_rate_for, require_sample_rate, upsample_burst
-    from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_TX
+    from _soapy_tx import BurstResult, query_tx_mtu, write_burst
+    from _stream import hardware_rate_for, require_sample_rate
+    from SoapySDR import SOAPY_SDR_CS16, SOAPY_SDR_TX
 
     log = logging.getLogger("cubesat_gfsk_ax25_tx")
+    buf = np.ascontiguousarray(np.asarray(cs16, dtype=np.int16))
+    n_complex = int(buf.size // 2)
+    if buf.size == 0:  # (3g) an empty burst is an error, not a silent success
+        return BurstResult(accepted=0, total=0, outcome="error", detail="empty burst buffer")
     dev = SoapySDR.Device(args.sdr_args)
     sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
-    # R-14: the DEVICE runs at a supported integer multiple of the modem rate
-    # (XTRX-class TX can't stream ~96 kHz); the burst is upsampled to match.
+    # R-14: the DEVICE runs at a supported integer multiple of the modem rate; the staged CS16
+    # was already resampled to THIS hardware rate pre-key (same deterministic hardware_rate_for).
     # The readback is validated — a silently-clamped rate garbles the burst.
     hw_rate, factor = hardware_rate_for(sample_rate, sdr_env()["capture_rate_hz"])
     dev.setSampleRate(SOAPY_SDR_TX, 0, hw_rate)
     require_sample_rate(dev, SOAPY_SDR_TX, 0, hw_rate)
     dev.setFrequency(SOAPY_SDR_TX, 0, float(args.center_freq_hz))
-    applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, hw_rate)
+    applied = configure_tx_sink(dev, SOAPY_SDR_TX, params, hw_rate)  # (3c) requires named PAD gain
     log.info("TX sink configured (modem=%.0f hw=%.0f x%d): %s",
              sample_rate, hw_rate, factor, applied)
-    stream = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32)
-    dev.activateStream(stream)
+    stream = dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16)  # CS16, no [0] channel list
     try:
-        buf = upsample_burst(iq.astype(np.complex64), factor)
+        mtu = query_tx_mtu(dev, stream)  # (3d) query MTU BEFORE activateStream
+        dev.activateStream(stream)  # no post-activate sleep (probe rule)
         # Deadline: the burst's real-time duration plus generous margin — a TX
         # that cannot drain a one-burst buffer inside this is wedged, not slow.
-        deadline_s = max(10.0, 3.0 * len(buf) / max(1.0, hw_rate))
+        deadline_s = max(10.0, 3.0 * n_complex / max(1.0, hw_rate))
         result = write_burst(
             dev,
             stream,
             buf,
-            mtu=query_tx_mtu(dev, stream),
+            mtu=mtu,
             deadline_s=deadline_s,
             on_first_accept=on_first_accept,
             should_abort=should_abort,
@@ -419,8 +452,36 @@ def _soapy_sink(  # pragma: no cover
             )
         return result
     finally:
-        dev.deactivateStream(stream)
-        dev.closeStream(stream)
+        # (3f) each cleanup step is attempted INDEPENDENTLY — one failing must not skip the other.
+        with contextlib.suppress(Exception):
+            dev.deactivateStream(stream)
+        with contextlib.suppress(Exception):
+            dev.closeStream(stream)
+
+
+def _prepare_tx_cs16(args, iq: np.ndarray) -> np.ndarray | None:
+    """PRE-KEY (3a): build the FINAL hardware-rate flat CS16 buffer for the HARDWARE sink, so the
+    keyed window (``_soapy_sink``) does NO DSP and NO large allocation. Returns None for the
+    file/bench sink (which writes modem-rate cf32 for offline decode) and for an empty burst.
+    Resamples to the same deterministic hardware rate ``_soapy_sink`` will set, then packs to CS16,
+    validating non-empty + finite. Raises ValueError on an empty / non-finite waveform so the caller
+    fails the spawn (tx-preflight-failed) rather than keying."""
+    from _soapy_tx import to_cs16
+    from _stream import hardware_rate_for, upsample_burst
+
+    sdr_args = str(args.sdr_args or "")
+    if not sdr_args or sdr_args.startswith("file:"):
+        return None  # bench/file path writes modem-rate cf32 in _sink_iq; nothing to pre-pack
+    sample_rate = float(args.sample_rate or _DEFAULT_SAMPLE_RATE)
+    _hw_rate, factor = hardware_rate_for(sample_rate, sdr_env()["capture_rate_hz"])
+    hw = upsample_burst(np.asarray(iq, dtype=np.complex64), int(factor))
+    if hw.size == 0:
+        msg = "TX preflight: the hardware-rate waveform is empty — refusing to key"
+        raise ValueError(msg)
+    if not np.all(np.isfinite(hw.view(np.float32))):
+        msg = "TX preflight: hardware-rate waveform has non-finite IQ (NaN/Inf) — refusing to key"
+        raise ValueError(msg)
+    return to_cs16(hw)
 
 
 async def amain(args) -> int:
@@ -470,6 +531,9 @@ async def amain(args) -> int:
         prevalidated_iq = await asyncio.to_thread(
             _preflight_and_build_iq, args, params, profile, engine
         )
+        # (3a) build the FINAL hardware-rate flat CS16 buffer PRE-KEY (hardware sink only), so the
+        # keyed window does no DSP/allocation. None for the file/bench sink (writes modem cf32).
+        prevalidated_cs16 = await asyncio.to_thread(_prepare_tx_cs16, args, prevalidated_iq)
     except ValueError as e:
         log.error("TX preflight FAILED — refusing to declare ready: %s", e)
         await send_event(
@@ -504,6 +568,7 @@ async def amain(args) -> int:
             sockets.status_writer, args, params, profile, engine,
             should_abort=stop_requested.is_set,
             iq=prevalidated_iq,  # ROUND 8: the frame we CHECKED is the frame we transmit
+            cs16=prevalidated_cs16,  # (3a) the FINAL flat CS16 built pre-key (hardware sink)
         )
 
     stop_reason = {"value": "command"}
