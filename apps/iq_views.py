@@ -346,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     fmts = tuple(f.strip().lower() for f in args.formats.split(",") if f.strip())
     try:
-        derive_views(
+        written = derive_views(
             args.input,
             center_hz=args.center_hz,
             sample_rate_hz=args.sample_rate,
@@ -357,6 +357,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception:
         log.exception("iq_views: failed to derive views from %s", args.input)
+        return 1
+    # RE-AUDIT (P2): a requested view that was NOT produced is a FAILURE, not a silent success. The
+    # per-view helpers already return None / omit the path on failure or a legitimate skip (a
+    # too-short capture has no waterfall; a failed ffmpeg has no OGG), so a requested format absent
+    # from `written` is exactly that. Without this, main() exited 0 and the supervisor logged
+    # "derived ogg" for an OGG that does not exist. Print the produced list so the caller logs what
+    # ACTUALLY exists.
+    produced = {p.suffix.lstrip(".").lower() for p in written}
+    requested = {f for f in fmts if f in ("sdf", "csv", "png", "ogg")}
+    print("produced=" + ",".join(sorted(produced)))  # noqa: T201 — machine-readable for the caller
+    missing = sorted(requested - produced)
+    if missing:
+        log.error(
+            "iq_views: requested view(s) %s were NOT produced from %s (produced: %s)",
+            ",".join(missing), args.input, ",".join(sorted(produced)) or "none",
+        )
         return 1
     return 0
 

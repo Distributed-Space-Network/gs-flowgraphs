@@ -1101,11 +1101,17 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         try:
             with self._lock:
                 # (3e) break-before-make: if RX cannot be cleanly deactivated, REFUSE TX — do not
-                # key a TX stream we could not break from RX. RX is left as-is (unknown state).
+                # key a TX stream we could not break from RX.
                 try:
                     self._dev.deactivateStream(self._rx_stream)
                 except Exception as e:  # noqa: BLE001
                     _log.error("bidir TX: RX deactivate FAILED; refusing to key: %r", e)
+                    # RE-AUDIT (P2, 3f): the deactivate is AMBIGUOUS — it may have TAKEN EFFECT (RX
+                    # now broken) before raising. Do NOT return leaving RX dead: best-effort
+                    # RE-ACTIVATE it and set the settle window so the reader drops the transient.
+                    with contextlib.suppress(Exception):
+                        self._dev.activateStream(self._rx_stream)
+                        self._rx_settle_until = time.monotonic() + _RX_SETTLE_S
                     return BurstResult(accepted=0, total=n_complex, outcome="error",
                                        detail=f"RX break failed; refusing TX: {e!r}")
                 tx = None

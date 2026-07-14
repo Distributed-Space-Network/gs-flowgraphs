@@ -226,6 +226,8 @@ def test_bidir_transmit_preserves_rx_break_before_make(monkeypatch):
 
 def test_bidir_transmit_refuses_when_rx_deactivate_fails(monkeypatch):
     # (3e) if RX cannot be cleanly broken, TX is REFUSED — never keyed on an un-broken stream.
+    # RE-AUDIT (3f/P2): the RX deactivate is AMBIGUOUS (it may have TAKEN EFFECT before raising), so
+    # RX must be best-effort RE-ACTIVATED — not left dead — before the refusal returns.
     _no_sleep(monkeypatch)
     dev = _FakeSdrDev(deactivate_fail=lambda s: s == _RX_STREAM)
     io = _bidir_io(dev)
@@ -234,9 +236,11 @@ def test_bidir_transmit_refuses_when_rx_deactivate_fails(monkeypatch):
 
     assert result.outcome == "error"
     assert "RX break failed" in result.detail
-    # only the failed RX-deactivate attempt happened: no TX stream was ever opened/activated
-    assert dev.ops == [("deactivate", _RX_STREAM)]
-    assert not any(op[0] in ("setup", "activate", "write") for op in dev.ops)
+    # No TX stream was ever opened / written (TX refused)...
+    assert not any(op[0] in ("setup", "write") for op in dev.ops)
+    # ...but RX was RE-ACTIVATED after the ambiguous deactivate (not left dead).
+    assert ("deactivate", _RX_STREAM) in dev.ops
+    assert ("activate", _RX_STREAM) in dev.ops
     assert not io.tx_active.is_set()
 
 

@@ -131,11 +131,16 @@ def named_tx_gains(tx_settings: object) -> dict[str, float]:
         for k, v in (gains or {}).items()
         if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
     }
-    if not named:
+    # RE-AUDIT (P2): require PAD SPECIFICALLY, not merely "some named gain". PAD is the element that
+    # sets the XTRX TX OUTPUT drive; any OTHER named gain alone (e.g. IAMP, a digital preamp) leaves
+    # the output PAD at its default and radiates the wrong level (often deaf). The overall setGain
+    # overload is XTRX-unsafe, so it is never a fallback — a TX without PAD is a config error.
+    if not any(k.upper() == "PAD" for k in named):
         raise TxGainConfigError(
-            "no named per-element TX gain (e.g. PAD) configured — refusing: the overall "
-            "setGain overload is XTRX-unsafe and a deaf TX radiates nothing; configure "
-            "sdr_tx_gains / GS_SDR_TX_GAINS with a named element (PAD)"
+            "no PAD TX gain configured — refusing: PAD is the REQUIRED named TX drive element "
+            f"(got {sorted(named) or 'none'}); the overall setGain overload is XTRX-unsafe and any "
+            "other named gain alone does not set the TX output. Configure sdr_tx_gains / "
+            "GS_SDR_TX_GAINS with PAD."
         )
     return named
 

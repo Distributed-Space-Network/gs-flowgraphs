@@ -179,6 +179,26 @@ def test_cli_main(tmp_path: Path) -> None:
     assert cf32.with_suffix(".png").exists() and cf32.with_suffix(".csv").exists()
 
 
+def test_main_fails_when_a_requested_view_is_not_produced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """RE-AUDIT (P2): a requested view that was NOT produced (e.g. ogg when ffmpeg failed) must make
+    main() return NON-ZERO and print the ACTUAL produced set — never a silent success (which made
+    the supervisor log 'derived ogg' for an OGG that does not exist)."""
+    cf32 = tmp_path / "partial.cf32"
+    _capture(cf32)
+
+    def _partial(_inp: object, **_kw: object) -> list[Path]:
+        sdf = cf32.with_suffix(".sdf")
+        sdf.write_bytes(b"x")
+        return [sdf]  # produced sdf, but NOT the requested ogg
+
+    monkeypatch.setattr(iq_views, "derive_views", _partial)
+    rc = main(["--input", str(cf32), "--sample-rate", "48000", "--formats", "sdf,ogg"])
+    assert rc == 1, "a requested-but-unproduced view must fail, not report silent success"
+    assert "produced=sdf" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- OGG discriminator audio
 
 

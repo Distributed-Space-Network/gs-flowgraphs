@@ -301,6 +301,15 @@ class TestNamedTxGains:
         with pytest.raises(TxGainConfigError):
             named_tx_gains({"sdr_gain_db": 30.0})
 
+    def test_named_gain_WITHOUT_pad_is_a_config_error(self):
+        # RE-AUDIT (P2): PAD is required SPECIFICALLY. A named gain that is NOT PAD (e.g. IAMP
+        # alone, a digital preamp) does not set the XTRX TX OUTPUT drive, so it must be refused —
+        # before this fix any named gain passed.
+        with pytest.raises(TxGainConfigError):
+            named_tx_gains({"sdr_gains": {"IAMP": 6.0}})
+        # PAD present (any case) is accepted, even alongside others.
+        assert named_tx_gains({"sdr_gains": {"pad": 40.0}}) == {"pad": 40.0}
+
     def test_non_numeric_entries_are_ignored(self):
         with pytest.raises(TxGainConfigError):
             named_tx_gains({"sdr_gains": {"PAD": "loud", 7: 3, "IAMP": True}})
