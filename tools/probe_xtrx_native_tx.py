@@ -5,12 +5,14 @@ This intentionally bypasses SoapyXTRX. Use it when SoapySDR writeStream() aborts
 need to know whether the native libxtrx TX path can start DMA and accept TX slices on the same
 device/rate/bandwidth/gain settings.
 
-The upstream test utility transmits its own generated samples, not a spacecraft command frame.
+Without ``-O``, the upstream utility transmits from an internally allocated host buffer. This
+probe diagnoses native TX startup only; it does not transmit a defined spacecraft command frame.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import re
 import shutil
@@ -35,9 +37,27 @@ FAILURE_MARKERS = (
     ("xtrx-timeout-skip", "TX DMA Current skip due to TO buffers"),
     ("xtrx-dma-timeout", "TX DMA TO"),
     ("xtrx-dma-error", "TX DMA ERROR"),
+    ("xtrxll-dmatx-pointer-abort", "xtrxllpciebase_dmatx_get"),
     ("process-abort", "Aborted"),
     ("core-dumped", "core dumped"),
 )
+
+GDB_SIGNAL_RE = re.compile(
+    r"^(?:Program|Thread\b[^\n]*)\s+"
+    r"(?:received signal|terminated with signal)\s+(SIG[A-Z0-9]+)",
+    re.MULTILINE,
+)
+POSIX_SIGNAL_NUMBERS = {
+    "SIGILL": 4,
+    "SIGABRT": 6,
+    "SIGBUS": 7,
+    "SIGFPE": 8,
+    "SIGKILL": 9,
+    "SIGSEGV": 11,
+    "SIGPIPE": 13,
+    "SIGALRM": 14,
+    "SIGTERM": 15,
+}
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -148,6 +168,15 @@ def _find_test_xtrx(explicit: str) -> str:
     return "test_xtrx"
 
 
+def _find_gdb(explicit: str) -> str:
+    if explicit:
+        return explicit
+    found = shutil.which("gdb")
+    if found:
+        return found
+    raise RuntimeError("--gdb-backtrace requires gdb; install it or pass --gdb=/path/to/gdb")
+
+
 def _underruns(text: str) -> int:
     match = re.search(r"TX STAT Underruns:\s*(\d+)", text)
     if not match:
@@ -173,13 +202,29 @@ def _signal_reason(returncode: int) -> str:
     return f"signal:{name}"
 
 
+def _gdb_signal(text: str) -> tuple[int | None, str] | None:
+    match = GDB_SIGNAL_RE.search(text)
+    if match is None:
+        return None
+    name = match.group(1)
+    signum = POSIX_SIGNAL_NUMBERS.get(name)
+    if signum is None:
+        signum = getattr(signal, name, None)
+    return (int(signum) if signum is not None else None, name)
+
+
 def _classify(cp: subprocess.CompletedProcess[str]) -> Result:
     stdout = cp.stdout or ""
     stderr = cp.stderr or ""
     text = f"{stderr}\n{stdout}"
     reasons = list(_reasons(text))
     underruns = _underruns(text)
-    if cp.returncode < 0:
+    inferior_signal = _gdb_signal(text)
+    if inferior_signal is not None:
+        signum, name = inferior_signal
+        status = f"SIGNAL_{signum}" if signum is not None else f"SIGNAL_{name}"
+        reasons.extend((f"gdb-signal:{name}", f"signal:{name}"))
+    elif cp.returncode < 0:
         status = f"SIGNAL_{-cp.returncode}"
         reasons.append(_signal_reason(cp.returncode))
     elif cp.returncode > 0:
@@ -231,6 +276,18 @@ def _collect_timeout_forensics(pid: int) -> str:
     return "\n".join(sections)
 
 
+def _signal_process_group(proc: subprocess.Popen[str], signum: int) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signum)
+        elif signum == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 def _build_command(args, case: Case) -> list[str]:
     cmd = [
         _find_test_xtrx(args.test_xtrx),
@@ -264,6 +321,26 @@ def _build_command(args, case: Case) -> list[str]:
         cmd.append("-I")
     if case.tx_no_discard:
         cmd.append("-U")
+    if args.gdb_backtrace:
+        cmd = [
+            _find_gdb(args.gdb),
+            "--batch",
+            "--quiet",
+            "-ex",
+            "set pagination off",
+            "-ex",
+            "set confirm off",
+            "-ex",
+            "set print thread-events off",
+            "-ex",
+            "run",
+            "-ex",
+            "echo \\n# GDB thread backtraces\\n",
+            "-ex",
+            "thread apply all bt full",
+            "--args",
+            *cmd,
+        ]
     if args.rt_priority > 0:
         chrt = shutil.which("chrt")
         if chrt:
@@ -273,23 +350,25 @@ def _build_command(args, case: Case) -> list[str]:
     return cmd
 
 
-def _run_case(args, case: Case) -> Result:
-    cmd = _build_command(args, case)
+def _run_case(args, case: Case, cmd: list[str] | None = None) -> Result:
+    if cmd is None:
+        cmd = _build_command(args, case)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     try:
         stdout, stderr = proc.communicate(timeout=args.timeout_s)
     except subprocess.TimeoutExpired:
         diagnostics = _collect_timeout_forensics(proc.pid) if args.timeout_forensics else ""
-        proc.terminate()
+        _signal_process_group(proc, signal.SIGTERM)
         try:
             stdout, stderr = proc.communicate(timeout=args.timeout_kill_grace_s)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _signal_process_group(proc, signal.SIGKILL)
             stdout, stderr = proc.communicate()
             if diagnostics:
                 diagnostics = (
@@ -322,14 +401,28 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--tx-discard-modes", type=_parse_discard_modes, default=[False],
                         help="comma list: discard,no-discard,both; no-discard passes -U")
     parser.add_argument("--cycles", type=int, default=1)
-    parser.add_argument("--loglevel", type=int, default=4)
+    parser.add_argument(
+        "--loglevel",
+        type=int,
+        default=5,
+        help=(
+            "libxtrxll log level; 5 makes its TX DMA status path read four registers, "
+            "matching the upstream Yocto workaround"
+        ),
+    )
     parser.add_argument("--log-period", type=int, default=0,
                         help="test_xtrx -L log period; useful with large --cycles")
     parser.add_argument("--rt-priority", type=int, default=0,
                         help="run test_xtrx through chrt -f PRIORITY when available")
+    parser.add_argument("--gdb", default="", help="path to gdb; auto-search if omitted")
+    parser.add_argument(
+        "--gdb-backtrace",
+        action="store_true",
+        help="run test_xtrx under batch gdb and print all thread backtraces on abort",
+    )
     parser.add_argument("--warn-non-power-of-two", action=argparse.BooleanOptionalAction,
                         default=True,
-                        help="warn for sample/slice sizes that are not powers of two")
+                        help="warn for TX slice sizes that are not powers of two")
     parser.add_argument("--timeout-s", type=float, default=10.0)
     parser.add_argument("--timeout-forensics", action=argparse.BooleanOptionalAction,
                         default=True,
@@ -410,7 +503,20 @@ def _print_diagnosis(
             flush=True,
         )
 
-    if hard_failures and usable and clean == 0:
+    if total_reasons.get("xtrxll-dmatx-pointer-abort", 0):
+        print("\n# Diagnosis", flush=True)
+        print(
+            "NATIVE_TX_DMA_POINTER_ABORT: libxtrxll aborted in "
+            "xtrxllpciebase_dmatx_get after reading an impossible TX ring-pointer span.",
+            flush=True,
+        )
+        print(
+            "Upstream libxtrxll aborts when ((nwr - ncleared) & 0x3f) exceeds its "
+            "32-buffer TX ring. Log level 5 selects the four-register read path from the "
+            "reported Yocto workaround.",
+            flush=True,
+        )
+    elif hard_failures and usable and clean == 0:
         print("\n# Diagnosis", flush=True)
         print(
             "NATIVE_TX_STARTUP_SEVERELY_UNSTABLE: native libxtrx produced only dirty "
@@ -466,12 +572,9 @@ def main(argv: list[str] | None = None) -> int:
         for value in slices:
             if not _is_power_of_two(value):
                 non_power.append(f"--slices={value}")
-        for value in sample_counts:
-            if not _is_power_of_two(value):
-                non_power.append(f"--samples={value}")
         if non_power:
             print(
-                "WARNING: upstream issue reports suggest power-of-two TX buffer sizes behave "
+                "WARNING: upstream issue reports suggest power-of-two TX slice sizes behave "
                 f"better; non-power-of-two values: {', '.join(non_power)}",
                 file=sys.stderr,
                 flush=True,
@@ -487,8 +590,13 @@ def main(argv: list[str] | None = None) -> int:
     for index, (repeat_index, case) in enumerate(trials, start=1):
         print(f"\n[{index}/{len(trials)} repeat={repeat_index}/{args.repeat}] {case.name()}",
               flush=True)
-        print("CMD:", " ".join(_build_command(args, case)), flush=True)
-        result = _run_case(args, case)
+        try:
+            cmd = _build_command(args, case)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr, flush=True)
+            return 2
+        print("CMD:", " ".join(cmd), flush=True)
+        result = _run_case(args, case, cmd)
         status_by_case[case][result.status] += 1
         reasons_by_case[case].update(result.reasons)
         if result.status == "HANG":

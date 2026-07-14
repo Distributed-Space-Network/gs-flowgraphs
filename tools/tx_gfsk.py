@@ -13,7 +13,7 @@ Payload comes from ``--payload-file``. Framings:
   * ``ax25``      — the file as an AX.25 UI info field (<= 77 B).
   * ``raw``       — the file bytes AS-IS on the air (MSB-first bits -> GFSK by default, nothing
     added: no preamble/sync/len/CRC, no NRZI/scrambling). For a blob that is ALREADY a complete
-    on-air frame (it must carry its own preamble/sync for the receiver to lock). Up to ~16 KB.
+    on-air frame (it must carry its own preamble/sync for the receiver to lock). Up to 32 KB.
     If the raw file is a packet train separated by zero-byte pads, pass ``--raw-zero-gap-bytes`` to
     turn long 0x00 runs into zero-amplitude IQ gaps instead of transmitting them as FSK "0" bits.
 
@@ -30,7 +30,7 @@ Examples:
   # Send a pre-framed raw packet train; 32+ zero bytes are inter-frame silence gaps:
   python tools/tx_gfsk.py --tx-freq=402500000 --samp-rate=2044800 --bw=800000 \
       --framing=raw --payload-file=/tmp/command.bin --raw-zero-gap-bytes=32 \
-      --other-settings="PAD=0"
+      --other-settings="PAD=-52"
 
   # No SDR — just render the IQ to a .cf32 (feed it to iq_analyze / a satnogs RX):
   python tools/tx_gfsk.py --framing=raw --payload-file=/tmp/command.bin --out-file=/tmp/tx.cf32
@@ -45,6 +45,7 @@ import contextlib
 import faulthandler
 import gc
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -58,15 +59,25 @@ log = logging.getLogger("tx_gfsk")
 
 DEFAULT_SYMBOL_RATE = 9600.0
 DEFAULT_SAMPLE_RATE = 2_044_800.0
-RAW_MAX_BYTES = 16_384  # raw cap (~13.7 s @ 9600 baud); guards against modulating a file into GBs
+RAW_MAX_BYTES = 32_768  # raw cap (~27.3 s @ 9600 baud); bounds the in-memory IQ allocation
 _TX_CHUNK = 1024
 _TX_MAX_STALLS = 20  # consecutive writeStream timeouts before aborting a burst (bounded, no spin)
 _TX_WRITE_TIMEOUT_US = 250_000
 _TX_DEBUG_WRITES = 4
 _TX_CS16_PEAK = 32767.0
-XTRX_MIN_TX_BW_HZ = 800_000.0  # narrower TBB requests have produced silent/unstable XTRX TX paths
 XTRX_LOW_RATE_EXPLICIT_CHANNELS_HZ = 1_000_000.0
 XTRX_VERY_LOW_RATE_CF32_HZ = 500_000.0
+XTRX_YOCTO_LOGLEVEL = 5
+
+
+def _configure_xtrx_loglevel(device: str, loglevel: int) -> None:
+    if "xtrx" not in str(device).lower():
+        return
+    os.environ["SOAPY_XTRX_LOGLEVEL"] = str(int(loglevel))
+    log.info(
+        "tx: SOAPY_XTRX_LOGLEVEL=%d (5 selects the Yocto four-register TX DMA status path)",
+        int(loglevel),
+    )
 
 
 def resolve_rate(samp_rate: float, symbol_rate: float) -> float:
@@ -166,15 +177,7 @@ def _is_xtrx_device(args) -> bool:
 
 
 def _resolve_tx_bw(args, used_rate: float) -> float:
-    bw = float(args.bw) if args.bw else float(used_rate)
-    if _is_xtrx_device(args) and bw < XTRX_MIN_TX_BW_HZ and not args.allow_narrow_bw:
-        log.warning(
-            "tx: requested BW %.0f Hz is below the XTRX bench-safe floor %.0f Hz; using %.0f Hz "
-            "(pass --allow-narrow-bw to force the requested value)",
-            bw, XTRX_MIN_TX_BW_HZ, XTRX_MIN_TX_BW_HZ,
-        )
-        return XTRX_MIN_TX_BW_HZ
-    return bw
+    return float(args.bw) if args.bw else float(used_rate)
 
 
 def _resolve_tx_chunk(requested: int, mtu: int) -> int:
@@ -225,8 +228,7 @@ def _resolve_tx_activate_mode(args) -> str:
         return text
     if _is_xtrx_device(args):
         log.info(
-            "tx: XTRX auto activation uses default numElems; MTU hints have not improved "
-            "the bench TX path"
+            "tx: XTRX Soapy activation uses default numElems; this path is diagnostic only"
         )
         return "0"
     return "0"
@@ -281,7 +283,13 @@ def _use_overall_tx_gain(args) -> bool:
     return True
 
 
-def _resolve_activate_elems(mode: str, *, burst_samples: int, mtu: int, repeat: int) -> int:
+def _resolve_activate_elems(
+    mode: str,
+    *,
+    burst_samples: int,
+    mtu: int,
+    repeat: int,
+) -> int:
     text = str(mode or "0").strip().lower()
     if text in {"0", "default", "none", "unspecified"}:
         return 0
@@ -294,7 +302,6 @@ def _resolve_activate_elems(mode: str, *, burst_samples: int, mtu: int, repeat: 
     except ValueError:
         log.warning("tx: invalid --tx-activate-elems=%r; using 0", mode)
         return 0
-
 
 def _iq_to_cs16(iq: np.ndarray, *, scale: float) -> np.ndarray:
     samples = np.asarray(iq, dtype=np.complex64)
@@ -433,8 +440,7 @@ def _configure_tx(dev, args, ch: int, used_rate: float) -> None:  # pragma: no c
 
     dev.setSampleRate(SOAPY_SDR_TX, ch, used_rate)
     dev.setFrequency(SOAPY_SDR_TX, ch, float(args.tx_freq))
-    # Open the analog TX filter to the sample rate (not a narrow channel) — below the XTRX ~0.8 MHz
-    # floor the analog path goes silent. Guarded: a driver without a settable BW ignores it.
+    # Apply the requested analog TX filter bandwidth. A driver without a settable BW ignores it.
     bw = _resolve_tx_bw(args, used_rate)
     with contextlib.suppress(Exception):
         dev.setBandwidth(SOAPY_SDR_TX, ch, bw)
@@ -550,8 +556,8 @@ def _write_burst(
         if sr.ret > 0:
             i += sr.ret
             stalls = 0
-            if i == sr.ret:  # first accepted write — proves the TX stream is taking samples
-                log.info("tx: streaming (first %d samples accepted)", sr.ret)
+            if i == sr.ret:
+                log.info("tx: first writeStream call returned %d samples", sr.ret)
             now = time.monotonic()
             if pace_sample_rate > 0.0:
                 target_elapsed = i / pace_sample_rate
@@ -640,7 +646,10 @@ def _transmit(
             raise RuntimeError(msg)
         chunk = _resolve_tx_chunk(tx_chunk, mtu)
         activate_elems = _resolve_activate_elems(
-            activate_elems_mode, burst_samples=stream_elems, mtu=mtu, repeat=repeat
+            activate_elems_mode,
+            burst_samples=stream_elems,
+            mtu=mtu,
+            repeat=repeat,
         )
         lead_ns = int(max(0.0, float(tx_time_lead_ms)) * 1_000_000.0)
         first_time_ns = None
@@ -691,6 +700,10 @@ def _transmit(
                 "tx: burst %d/%d write returned %d/%d samples in %.1f s",
                 r + 1, repeat, sent, stream_elems, time.monotonic() - burst_t0,
             )
+            if sent != stream_elems:
+                raise RuntimeError(
+                    f"TX accepted only {sent}/{stream_elems} samples; refusing clean completion"
+                )
             log.info("tx: readStreamStatus start")
             with contextlib.suppress(Exception):
                 dev.readStreamStatus(stream, timeoutUs=200_000)
@@ -757,16 +770,29 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--payload-file", required=True, help="raw payload bytes to transmit")
     p.add_argument("--framing", default="endurosat", choices=["endurosat", "ax25", "raw"])
     p.add_argument("--soapy-tx-device", default="driver=xtrx")
+    p.add_argument(
+        "--xtrx-loglevel",
+        type=int,
+        choices=range(8),
+        default=XTRX_YOCTO_LOGLEVEL,
+        help=(
+            "SOAPY_XTRX_LOGLEVEL used before opening XTRX; 5 selects the validated "
+            "Yocto four-register TX DMA status path"
+        ),
+    )
     p.add_argument("--samp-rate", type=float, default=DEFAULT_SAMPLE_RATE)
     p.add_argument("--tx-freq", type=float, default=0.0, help="TX centre freq, Hz (needed to key)")
     p.add_argument("--bw", type=float, default=0.0, help="analog TX bandwidth, Hz (0=samp-rate)")
-    p.add_argument("--allow-narrow-bw", action="store_true",
-                   help="do not lift narrow XTRX TX bandwidths to the bench-safe floor")
+    p.add_argument("--allow-narrow-bw", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--channel", type=int, default=0)
     p.add_argument("--antenna", default="")
     p.add_argument("--gain", type=float, default=None, help="overall TX gain, dB")
     p.add_argument("--gain-mode", default="", help="accepted for CLI parity; TX uses manual gain")
-    p.add_argument("--other-settings", default="", help='per-element gains, e.g. "PAD=30,IAMP=0"')
+    p.add_argument(
+        "--other-settings",
+        default="",
+        help='per-element gains, e.g. "PAD=-52" for minimum XTRX drive',
+    )
     p.add_argument("--symbol-rate", type=float, default=DEFAULT_SYMBOL_RATE)
     p.add_argument("--mod-index", type=float, default=0.5)
     p.add_argument("--bt", type=float, default=0.5)
@@ -781,17 +807,17 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--repeat-gap-ms", type=float, default=0.0)
     p.add_argument("--tx-format", default="auto", choices=["auto", "cf32", "cs16"],
-                   help="host TX sample format (auto uses CF32 <=500 kS/s on XTRX, CS16 above)")
+                   help="Soapy host sample format")
     p.add_argument("--tx-scale", type=float, default=1.0,
-                   help="digital IQ scale before CS16 conversion, clamped to 0..1")
+                   help="digital IQ scale before transmission, clamped to 0..1")
     p.add_argument("--tx-chunk", type=int, default=0,
-                   help=f"TX writeStream length in samples (0=default {_TX_CHUNK}, capped to MTU)")
+                   help=f"Soapy writeStream length (0=default {_TX_CHUNK}, capped to MTU)")
     p.add_argument("--tx-write-call", default="auto", choices=["auto", "simple", "flags", "full"],
                    help="Python writeStream call shape: auto, simple, flags, or full timeout form")
     p.add_argument("--tx-stream-channels", default="auto", choices=["auto", "default", "explicit"],
                    help="setupStream channel style: auto, default omits list, explicit passes [ch]")
     p.add_argument("--tx-activate-elems", default="auto",
-                   help="activateStream numElems hint: auto, 0, mtu, burst, or integer")
+                   help="Soapy activateStream numElems hint: auto, 0, mtu, burst, or integer")
     p.add_argument("--tx-write-timeout-us", type=int, default=_TX_WRITE_TIMEOUT_US,
                    help="writeStream timeout per chunk, microseconds (only passed in full mode)")
     p.add_argument("--tx-copy-chunks", action="store_true",
@@ -882,6 +908,7 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     dev = None
     try:
+        _configure_xtrx_loglevel(args.soapy_tx_device, args.xtrx_loglevel)
         dev = SoapySDR.Device(args.soapy_tx_device)
         _configure_tx(dev, args, args.channel, used_rate)
         _transmit(

@@ -4,8 +4,8 @@
 The parent process runs one tiny TX write per child process. If SoapyXTRX aborts, hangs, or wedges
 inside writeStream(), only that child dies and the parent can still report which combination failed.
 
-The child writes a short zero-amplitude buffer, so this probes the host/driver write path without
-modulating a command frame.
+The child writes a short zero-amplitude buffer by default, so this probes the host/driver write
+path without modulating a command frame.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import numpy as np
 
 FAILURE_MARKERS = (
     ("xtrx-delayed-buffers", "TX DMA Current delayed buffers"),
+    ("xtrx-timeout-skip", "TX DMA Current skip due to TO buffers"),
     ("xtrx-dma-timeout", "TX DMA TO"),
     ("xtrx-dma-error", "TX DMA ERROR"),
     ("xtrx-stream-error", "SoapyXTRX::writeStream"),
@@ -36,11 +37,20 @@ FAILURE_MARKERS = (
     ("writeStream-binding", "__writeStream"),
 )
 
-STATUS_ORDER = ("OK", "OK_DRIVER_ERR", "EXIT_10", "HANG", "SIGNAL_6")
+STATUS_ORDER = (
+    "OK",
+    "OK_DRIVER_ERR",
+    "TX_DISCARDED",
+    "EXIT_10",
+    "HANG",
+    "SIGNAL_6",
+)
+TX_DISCARD_REASONS = {"xtrx-delayed-buffers", "xtrx-timeout-skip"}
 XTRX_MIN_TX_BW_HZ = 800_000.0
 XTRX_MIN_TX_RATE_HZ = 2_100_000.0
 XTRX_LOW_RATE_EXPLICIT_CHANNELS_HZ = 1_000_000.0
 XTRX_VERY_LOW_RATE_CF32_HZ = 500_000.0
+XTRX_YOCTO_LOGLEVEL = 5
 GFSK_PROBE_PAYLOAD = b"SOAPY-TX-PROBE"
 
 
@@ -140,6 +150,17 @@ def _parse_settings(text: str) -> list[tuple[str, float]]:
 
 def _child_phase(name: str) -> None:
     print(f"child: phase={name}", flush=True)
+
+
+def _configure_xtrx_loglevel(device: str, loglevel: int) -> None:
+    if "xtrx" not in str(device).lower():
+        return
+    os.environ["SOAPY_XTRX_LOGLEVEL"] = str(int(loglevel))
+    print(
+        f"child: SOAPY_XTRX_LOGLEVEL={int(loglevel)} "
+        "(5 selects the Yocto four-register TX DMA status path)",
+        flush=True,
+    )
 
 
 def _child_setup_stream(dev, soapy, args):
@@ -403,6 +424,7 @@ def child_tx_gfsk_direct_main(args) -> int:
             flush=True,
         )
 
+        _configure_xtrx_loglevel(args.device, args.xtrx_loglevel)
         _child_phase("tx-gfsk-direct-device-open-enter")
         dev = SoapySDR.Device(args.device)
         _child_phase("tx-gfsk-direct-device-open-ok")
@@ -453,6 +475,7 @@ def child_main(args) -> int:
     stream = None
     try:
         print(f"child: case {args.case_name}", flush=True)
+        _configure_xtrx_loglevel(args.device, args.xtrx_loglevel)
         _child_phase("device-open-enter")
         dev = SoapySDR.Device(args.device)
         _child_phase("device-open-ok")
@@ -520,11 +543,32 @@ def child_main(args) -> int:
         _child_phase("get-mtu-ok")
         print(f"child: stream={stream!r} mtu={mtu}", flush=True)
 
-        block, num_elems = _make_block(args.format, args.layout, min(args.chunk, mtu), args)
+        total_writes = max(1, int(args.child_writes))
+        num_elems = max(1, min(args.chunk, mtu))
+        prepared_blocks = None
+        if args.pattern == "gfsk":
+            full_block, _ = _make_block(
+                args.format,
+                args.layout,
+                num_elems * total_writes,
+                args,
+            )
+            prepared_blocks = []
+            for block_index in range(total_writes):
+                first = block_index * num_elems
+                last = first + num_elems
+                if args.format == "cs16" and args.layout == "flat":
+                    prepared_blocks.append(full_block[first * 2:last * 2])
+                else:
+                    prepared_blocks.append(full_block[first:last])
+            block = prepared_blocks[0]
+        else:
+            block, num_elems = _make_block(args.format, args.layout, num_elems, args)
         print(
             f"child: block dtype={block.dtype} shape={block.shape} strides={block.strides} "
             f"nbytes={block.nbytes} c_contig={block.flags.c_contiguous} "
-            f"pattern={args.pattern} amplitude={args.amplitude:g} num_elems={num_elems}",
+            f"pattern={args.pattern} amplitude={args.amplitude:g} num_elems={num_elems} "
+            f"prebuilt_blocks={len(prepared_blocks) if prepared_blocks is not None else 1}",
             flush=True,
         )
 
@@ -544,30 +588,33 @@ def child_main(args) -> int:
         if args.status_after_activate:
             _read_stream_status(dev, stream, args, "after-activate")
 
-        total_writes = max(1, int(args.child_writes))
         accepted = 0
+        pace_started = time.monotonic()
+        previous_write_started: float | None = None
         end_burst = getattr(SoapySDR, "SOAPY_SDR_END_BURST", 2)
         for write_index in range(1, total_writes + 1):
-            if write_index > 1 and args.pattern == "gfsk":
-                block, num_elems = _make_block(
-                    args.format,
-                    args.layout,
-                    min(args.chunk, mtu),
-                    args,
-                    sample_offset=accepted,
-                )
+            if prepared_blocks is not None:
+                block = prepared_blocks[write_index - 1]
             flags = end_burst if args.end_burst == "last" and write_index == total_writes else 0
             if args.status_before_write:
                 _read_stream_status(dev, stream, args, f"before-write-{write_index}")
             _child_phase(f"write-{write_index}-enter")
             t0 = time.monotonic()
+            write_started_ms = 1000.0 * (t0 - pace_started)
+            start_gap_ms = (
+                1000.0 * (t0 - previous_write_started)
+                if previous_write_started is not None
+                else 0.0
+            )
+            previous_write_started = t0
             sr = _write(dev, stream, block, num_elems, args, flags=flags)
             _child_phase(f"write-{write_index}-ok")
             ret = int(getattr(sr, "ret", 0) or 0)
             print(
                 f"child: write {write_index}/{total_writes} ret={ret} "
                 f"flags={getattr(sr, 'flags', None)} sent_flags={flags} "
-                f"dt_ms={1000.0 * (time.monotonic() - t0):.1f}",
+                f"dt_ms={1000.0 * (time.monotonic() - t0):.1f} "
+                f"started_ms={write_started_ms:.1f} start_gap_ms={start_gap_ms:.1f}",
                 flush=True,
             )
             if ret <= 0:
@@ -576,10 +623,30 @@ def child_main(args) -> int:
             if args.status_after_write:
                 _read_stream_status(dev, stream, args, f"after-write-{write_index}")
             if args.pace:
-                time.sleep(ret / max(1.0, float(args.sample_rate)))
+                pace_factor = max(0.01, float(args.pace_factor))
+                prefill_writes = max(1, int(args.pace_prefill_writes))
+                prefill_samples = max(0, prefill_writes - 1) * num_elems
+                paced_samples = max(0, accepted - prefill_samples)
+                target_elapsed = pace_factor * paced_samples / max(1.0, float(args.sample_rate))
+                elapsed = time.monotonic() - pace_started
+                pace_sleep = max(0.0, target_elapsed - elapsed)
+                print(
+                    f"child: pace accepted={accepted} factor={pace_factor:g} "
+                    f"prefill_writes={prefill_writes} "
+                    f"target_ms={1000.0 * target_elapsed:.1f} "
+                    f"elapsed_ms={1000.0 * elapsed:.1f} "
+                    f"sleep_ms={1000.0 * pace_sleep:.1f}",
+                    flush=True,
+                )
+                if pace_sleep > 0:
+                    time.sleep(pace_sleep)
             if args.write_gap_ms > 0 and write_index < total_writes:
                 time.sleep(args.write_gap_ms / 1000.0)
         print(f"child: accepted_total={accepted}", flush=True)
+        if args.post_write_drain_ms > 0:
+            _child_phase("post-write-drain-enter")
+            time.sleep(args.post_write_drain_ms / 1000.0)
+            _child_phase("post-write-drain-ok")
         return 0
     finally:
         if stream is not None and dev is not None:
@@ -757,7 +824,10 @@ def _classify_completed(cp: subprocess.CompletedProcess[str]) -> TrialResult:
     else:
         reasons = _with_phase_reasons(text, base_reasons)
     if cp.returncode == 0:
-        status = "OK_DRIVER_ERR" if reasons else "OK"
+        if TX_DISCARD_REASONS.intersection(reasons):
+            status = "TX_DISCARDED"
+        else:
+            status = "OK_DRIVER_ERR" if reasons else "OK"
     elif cp.returncode < 0:
         status = f"SIGNAL_{-cp.returncode}"
     else:
@@ -878,7 +948,20 @@ def _print_diagnosis(
         )
 
     write_enter_failures = reasons.get("last-phase:write-1-enter", 0)
-    if accepted == 0 and write_enter_failures == total:
+    discarded = statuses.get("TX_DISCARDED", 0)
+    if discarded == total:
+        print("\n# Diagnosis", flush=True)
+        print(
+            "ALL_TX_DISCARDED: writeStream returned success, but libxtrx explicitly discarded "
+            "every selected write as late. No trial delivered a valid TX buffer.",
+            flush=True,
+        )
+        print(
+            "Do not sleep after activateStream: untimed SoapyXTRX starts at sample 32768, so an "
+            "activation delay can make the first write stale before it is submitted.",
+            flush=True,
+        )
+    elif accepted == 0 and write_enter_failures == total:
         print("\n# Diagnosis", flush=True)
         print(
             "GLOBAL_FIRST_WRITE_FAILURE: every selected trial reached stream activation, then "
@@ -1003,6 +1086,8 @@ def _parent_main_locked(args) -> int:
                 case.name(),
                 "--device",
                 args.device,
+                "--xtrx-loglevel",
+                str(args.xtrx_loglevel),
                 "--freq",
                 str(args.freq),
                 "--sample-rate",
@@ -1033,6 +1118,10 @@ def _parent_main_locked(args) -> int:
                 str(args.child_writes),
                 "--write-gap-ms",
                 str(args.write_gap_ms),
+                "--pace-factor",
+                str(args.pace_factor),
+                "--pace-prefill-writes",
+                str(args.pace_prefill_writes),
                 "--end-burst",
                 args.end_burst,
                 "--pattern",
@@ -1047,6 +1136,8 @@ def _parent_main_locked(args) -> int:
                 str(args.status_gap_ms),
                 "--post-activate-sleep-ms",
                 str(args.post_activate_sleep_ms),
+                "--post-write-drain-ms",
+                str(args.post_write_drain_ms),
             ]
             if args.pace:
                 cmd.append("--pace")
@@ -1068,20 +1159,23 @@ def _parent_main_locked(args) -> int:
                 cmd.append("--status-after-write")
             if args.status_errors_fatal:
                 cmd.append("--status-errors-fatal")
+            case_timeout_s = float(args.case_timeout_s)
             try:
                 cp = subprocess.run(
                     cmd,
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=args.case_timeout_s,
+                    timeout=case_timeout_s,
                 )
             except subprocess.TimeoutExpired as exc:
                 result = _classify_timeout(exc)
                 worst = max(worst, 2)
             else:
                 result = _classify_completed(cp)
-                if cp.returncode < 0:
+                if result.status == "HANG":
+                    worst = max(worst, 2)
+                elif result.status.startswith("SIGNAL_"):
                     worst = max(worst, 3)
                 elif cp.returncode > 0:
                     worst = max(worst, 1)
@@ -1099,10 +1193,12 @@ def _parent_main_locked(args) -> int:
             reasons_by_case[case].update(result.reasons)
             if result.status == "OK_DRIVER_ERR":
                 worst = max(worst, 1)
+            if result.status == "TX_DISCARDED":
+                worst = max(worst, 1)
             reason_text = ",".join(result.reasons) if result.reasons else "-"
             if result.status == "HANG":
                 print(
-                    f"RESULT: HANG after {args.case_timeout_s:.1f}s reasons={reason_text}",
+                    f"RESULT: HANG after {case_timeout_s:.1f}s reasons={reason_text}",
                     flush=True,
                 )
             elif result.status.startswith("SIGNAL_"):
@@ -1124,10 +1220,12 @@ def _parent_main_locked(args) -> int:
                 time.sleep(args.cooldown_s)
             if args.stop_on_ok and result.status == "OK":
                 break
-            if args.stop_on_wedge and _first_write_wedge(result):
+            if args.stop_on_wedge and (
+                result.status == "HANG" or result.status.startswith("SIGNAL_")
+            ):
                 print(
-                    "Stopping after first writeStream hang/abort; later trials may inherit "
-                    "a wedged device state.",
+                    "Stopping after TX hang/abort; later trials may inherit a wedged "
+                    "device state.",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1145,6 +1243,16 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--case-name", default="")
     parser.add_argument("--device", default="driver=xtrx")
+    parser.add_argument(
+        "--xtrx-loglevel",
+        type=int,
+        choices=range(8),
+        default=XTRX_YOCTO_LOGLEVEL,
+        help=(
+            "SOAPY_XTRX_LOGLEVEL used before opening XTRX; 5 selects the validated "
+            "Yocto four-register TX DMA status path"
+        ),
+    )
     parser.add_argument("--freq", type=float, default=402_500_000.0)
     parser.add_argument("--sample-rate", type=float, default=2_044_800.0)
     parser.add_argument("--bandwidth", type=float, default=800_000.0)
@@ -1152,7 +1260,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gain", type=float, default=None, help="overall TX gain, dB")
     parser.add_argument("--allow-xtrx-overall-gain", action="store_true",
                         help="force XTRX overall setGain despite observed SoapyXTRX aborts")
-    parser.add_argument("--other-settings", default="PAD=0")
+    parser.add_argument(
+        "--other-settings",
+        default="PAD=-52",
+        help="named TX gains; defaults to minimum XTRX PAD drive for bench safety",
+    )
     parser.add_argument("--format", default="cs16", choices=["cf32", "cs16"])
     parser.add_argument("--channels", default="default", choices=["default", "explicit"])
     parser.add_argument("--stream-args", default="none", choices=["none", "wire-cs16"])
@@ -1161,24 +1273,53 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--layout", default="2col", choices=["cf32", "2col", "flat"])
     parser.add_argument("--chunk", type=int, default=1024)
     parser.add_argument("--write-timeout-us", type=int, default=100_000)
-    parser.add_argument("--child-writes", type=int, default=1,
-                        help="number of writeStream calls to perform inside each child trial")
-    parser.add_argument("--write-gap-ms", type=float, default=0.0,
-                        help="sleep between child writeStream calls")
+    parser.add_argument(
+        "--child-writes",
+        type=int,
+        default=1,
+        help="number of Soapy writeStream calls to perform inside each child trial",
+    )
+    parser.add_argument(
+        "--write-gap-ms",
+        type=float,
+        default=0.0,
+        help="sleep between Soapy writeStream calls",
+    )
     parser.add_argument("--end-burst", default="never", choices=["never", "last"],
                         help="send SOAPY_SDR_END_BURST on the last write for flags/full modes")
     parser.add_argument("--pace", action="store_true",
                         help="pace child writes by accepted samples / sample-rate")
+    parser.add_argument(
+        "--pace-factor",
+        type=float,
+        default=1.0,
+        help="with --pace, wall-time/sample-time ratio (1=real time, 2=half speed)",
+    )
+    parser.add_argument(
+        "--pace-prefill-writes",
+        type=int,
+        default=1,
+        help="with --pace, queue this many writes before real-time pacing begins",
+    )
     parser.add_argument("--pattern", default="zero", choices=["zero", "dc", "tone", "ramp", "gfsk"],
                         help="sample pattern for the probe buffer")
     parser.add_argument("--amplitude", type=float, default=0.25,
                         help="non-zero pattern amplitude, 0..1")
     parser.add_argument("--xtrx-safe-bw", action="store_true",
                         help="lift XTRX bandwidth requests below 800 kHz, matching tx_gfsk")
-    parser.add_argument("--xtrx-safe-rate", action="store_true",
-                        help="lift XTRX TX sample rates below SoapyXTRX's 2.1 MHz lower bound")
+    parser.add_argument(
+        "--xtrx-safe-rate",
+        action="store_true",
+        help="lift XTRX TX sample rates below SoapyXTRX's 2.1 MHz lower bound",
+    )
     parser.add_argument("--post-activate-sleep-ms", type=float, default=0.0,
                         help="sleep after activateStream returns and before status/write probes")
+    parser.add_argument(
+        "--post-write-drain-ms",
+        type=float,
+        default=0.0,
+        help="keep the stream active after the final write so queued samples can drain",
+    )
     parser.add_argument("--status-after-activate", action="store_true",
                         help="call readStreamStatus after activateStream")
     parser.add_argument("--status-before-write", action="store_true",
@@ -1201,7 +1342,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         choices=["default", "write-calls", "single", "tx-gfsk", "tx-gfsk-direct"],
         help=(
             "case matrix: default smoke set, focused write-call matrix, one explicit case, "
-            "tx_gfsk-shaped control, or direct tx_gfsk code path"
+            "tx_gfsk-shaped Soapy control, or direct Soapy tx_gfsk path"
         ),
     )
     parser.add_argument("--include-wire-cs16", action="store_true",
@@ -1238,7 +1379,7 @@ def _build_argparser() -> argparse.ArgumentParser:
                         help="filter cases by layout: cf32, 2col, flat")
     parser.add_argument("--stop-on-ok", action="store_true")
     parser.add_argument("--stop-on-wedge", action="store_true",
-                        help="stop after a first-write hang/abort to avoid cascading failures")
+                        help="stop after any write hang/abort to avoid cascading failures")
     parser.add_argument("--direct-tx-gfsk", action="store_true", help=argparse.SUPPRESS)
     return parser
 
