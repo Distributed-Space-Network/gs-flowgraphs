@@ -87,6 +87,14 @@ _READ_CHUNK = 4096
 # R-15: samples read in this window after a TX burst reactivates the RX stream
 # are the front-end's settling transient and are discarded, not decoded.
 _RX_SETTLE_S = 0.05
+# Finding #17: a data-socket peer that stays CONNECTED but stops reading (its TCP
+# receive buffer fills) makes an unbounded ``data_writer.drain()`` await forever —
+# ConnectionReset/BrokenPipe never fire — so the decode loop cannot observe a stop
+# and engine teardown wedges until the supervisor SIGTERMs us (the stop-protocol
+# circular-wait this codebase treats as a defect). Bounding the drain turns a
+# wedged-but-open peer into a routine peer failure: drop the frame body, keep the
+# RX loop alive, let teardown proceed.
+_DATA_DRAIN_TIMEOUT_S = 5.0
 _UPLINK_MAX_BYTES = 65_536  # sanity cap on a raw uplink train (~54 s @ 9600); guards against GB IQ
 # ROUND 10 — the allocation ceilings the standalone TX app already had and this one did not.
 # gfsk.modulate() does np.repeat(symbols, sps): sps and the total sample count are what actually
@@ -448,7 +456,21 @@ async def emit_frame(sockets, body: bytes) -> None:
         )
     with contextlib.suppress(ConnectionResetError, BrokenPipeError):
         sockets.data_writer.write(body)
-        await sockets.data_writer.drain()
+        # Finding #17: bound the drain. A wedged-but-open consumer (connected, not
+        # reading, send buffer full) makes an unbounded drain() await forever without
+        # ever raising ConnectionReset/BrokenPipe, stalling the decode loop and blocking
+        # teardown until SIGTERM. A stall is a peer failure: drop this frame body and
+        # keep going, exactly as a dead peer is handled above.
+        try:
+            await asyncio.wait_for(
+                sockets.data_writer.drain(), timeout=_DATA_DRAIN_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            _log.warning(
+                "bidir RX: data-socket drain stalled >%.1fs (wedged-but-open peer); "
+                "dropping frame body and continuing",
+                _DATA_DRAIN_TIMEOUT_S,
+            )
 
 
 async def emit_signal(sockets, rssi_dbm: float) -> None:

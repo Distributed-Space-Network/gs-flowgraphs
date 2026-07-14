@@ -33,6 +33,18 @@ DEFAULT_MAX_STALLS = 20
 DEFAULT_WRITE_TIMEOUT_US = 1_000_000
 FALLBACK_MTU = 4096
 
+# Post-burst readStreamStatus poll bounds (finding #22). writeStream returning
+# ret>0 means the driver ACCEPTED the buffer into its DMA queue, NOT that valid
+# RF left the antenna: the XTRX bench probe (tools/probe_soapy_tx_write.py)
+# documents libxtrx accepting a buffer and then DISCARDING it late ("TX DMA ...
+# skip due to TO buffers" / "delayed buffers"), surfaced via readStreamStatus as
+# UNDERFLOW / TIME_ERROR / an END_ABRUPT flag. These bound that async check so it
+# can NEVER hang the keyed window: at most _MAX_STATUS_POLLS calls, each capped at
+# STATUS_POLL_TIMEOUT_US, and the whole poll capped at STATUS_POLL_DEADLINE_S.
+STATUS_POLL_TIMEOUT_US = 100_000
+STATUS_POLL_DEADLINE_S = 0.5
+_MAX_STATUS_POLLS = 8
+
 
 @dataclass(frozen=True)
 class BurstResult:
@@ -41,7 +53,11 @@ class BurstResult:
 
     accepted: int
     total: int
-    outcome: str  # "complete" | "stalled" | "error" | "deadline" | "cancelled"
+    # "discarded" = writeStream accepted every sample but the driver's own
+    # readStreamStatus reported a late/underflow/abrupt discard afterwards, so
+    # nothing valid (or only garbage) actually radiated — a dead uplink that must
+    # NOT be reported as a good one (finding #22).
+    outcome: str  # "complete" | "stalled" | "error" | "deadline" | "cancelled" | "discarded"
     detail: str = ""
 
     @property
@@ -63,6 +79,71 @@ def query_tx_mtu(dev: object, stream: object, *, fallback: int = FALLBACK_MTU) -
     return mtu
 
 
+def poll_tx_status(
+    dev: object,
+    stream: object,
+    *,
+    timeout_us: int = STATUS_POLL_TIMEOUT_US,
+    deadline_s: float = STATUS_POLL_DEADLINE_S,
+) -> tuple[bool, str]:
+    """Drain ``readStreamStatus`` after a burst to catch a late/underflow/discard the
+    driver reports ASYNCHRONOUSLY (finding #22).
+
+    ``writeStream`` returning ret>0 only means the buffer entered the driver's DMA
+    queue. An XTRX that then discards it late ("skip due to TO buffers") signals that
+    through a stream-status event, never through the write return. This reads those
+    events, bounded on every axis so it can't hang the keyed window.
+
+    Returns ``(bad, detail)``:
+
+    * ``(True, reason)`` on a DEFINITIVE underflow / time-error / stream-error /
+      corruption / END_ABRUPT discard — the burst did not radiate cleanly.
+    * ``(False, "")`` when the status is clean, the driver does not support status
+      reads, the status read itself errors, or nothing definitive arrived within the
+      bounded deadline. We NEVER fabricate a discard we cannot prove — a false failure
+      would abort a good pass; the concrete, driver-reported discard is what we act on.
+    """
+    read = getattr(dev, "readStreamStatus", None)
+    if not callable(read):
+        return (False, "")
+    import SoapySDR as _sd  # noqa: PLC0415
+
+    timeout = int(getattr(_sd, "SOAPY_SDR_TIMEOUT", -1))
+    not_supported = int(getattr(_sd, "SOAPY_SDR_NOT_SUPPORTED", -5))
+    end_abrupt = int(getattr(_sd, "SOAPY_SDR_END_ABRUPT", 8))
+    bad_ret = {
+        int(getattr(_sd, "SOAPY_SDR_UNDERFLOW", -7)): "underflow (samples discarded as late)",
+        int(getattr(_sd, "SOAPY_SDR_TIME_ERROR", -6)): "time-error (late buffers discarded)",
+        int(getattr(_sd, "SOAPY_SDR_STREAM_ERROR", -2)): "stream-error",
+        int(getattr(_sd, "SOAPY_SDR_CORRUPTION", -3)): "corruption",
+    }
+    t0 = time.monotonic()
+    polls = 0
+    while (time.monotonic() - t0) <= deadline_s and polls < _MAX_STATUS_POLLS:
+        polls += 1
+        try:
+            try:
+                sr = read(stream, timeoutUs=timeout_us)
+            except TypeError:
+                sr = read(stream, timeout_us)
+        except Exception:
+            # Can't read status → cannot prove a discard; do not fabricate one.
+            log.debug("tx: readStreamStatus unavailable/raised; status not checked", exc_info=True)
+            return (False, "")
+        ret = int(getattr(sr, "ret", 0) or 0)
+        flags = int(getattr(sr, "flags", 0) or 0)
+        if ret in bad_ret:
+            return (True, f"readStreamStatus ret={ret} ({bad_ret[ret]})")
+        if flags & end_abrupt:
+            return (True, f"readStreamStatus flags={flags} (END_ABRUPT — burst discarded)")
+        if ret in (timeout, not_supported):
+            # No (further) status pending, or the driver has no status queue: clean.
+            return (False, "")
+        # ret==0 (a benign status event) or any other non-fatal code: keep draining,
+        # bounded by the deadline/poll cap, in case a discard event is queued behind it.
+    return (False, "")
+
+
 def write_burst(
     dev: object,
     stream: object,
@@ -75,6 +156,7 @@ def write_burst(
     on_first_accept: Callable[[], None] | None = None,
     max_stalls: int = DEFAULT_MAX_STALLS,
     copy_chunks: bool = False,
+    poll_status: bool = True,
 ) -> BurstResult:
     """Write one IQ buffer as one burst, bounded on every axis.
 
@@ -137,4 +219,15 @@ def write_burst(
                 )
         else:
             return BurstResult(i, n, "error", f"writeStream ret={ret}")
+    # Finding #22: every sample was ACCEPTED into the driver, but acceptance is not
+    # radiation. Before reporting a clean burst, drain the driver's stream-status for a
+    # late/underflow/END_ABRUPT discard it only surfaces asynchronously — otherwise an
+    # XTRX that threw the whole burst away reports as a fully successful transmission
+    # (dead uplink indistinguishable from a good one). Bounded so it cannot hang the
+    # keyed window; a status we cannot read leaves the burst reported "complete".
+    if poll_status and accepted_any:
+        bad, status_detail = poll_tx_status(dev, stream)
+        if bad:
+            log.warning("tx: burst ACCEPTED but driver discarded it: %s", status_detail)
+            return BurstResult(i, n, "discarded", status_detail)
     return BurstResult(i, n, "complete")
