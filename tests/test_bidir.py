@@ -209,6 +209,29 @@ def test_tx_controller_stages_then_bursts(tmp_path):
     assert not tx.has_staged_burst  # one-shot: consumed
 
 
+def test_tx_prepared_rate_is_consistent_with_hardware_samples_at_upsample_factor():
+    """RE-AUDIT regression: on a real SDR the staged CS16 is upsampled to the hardware rate
+    (factor > 1), so tx_prepared `samples` is the HARDWARE complex count. `sample_rate` must be the
+    HARDWARE rate too, or the orchestrator's pre-key proof (samples / sample_rate == duration_s)
+    fails for every burst and keying is REFUSED. FileBidirIo hides this at factor 1; drive > 1.
+    """
+    class _Factor22Io:  # a real-SDR-shaped IO: prepare() only reads tx_upsample_factor
+        tx_upsample_factor = 22
+
+    socks = _FakeSockets()
+    tx = bidir._TxController(_Factor22Io(), sample_rate=_SR)
+    payload = b"uplink-doppler-check"
+    assert asyncio.run(tx.prepare(socks, "f22", payload, _SR, {})) is True
+    ev = _events(socks)[0]
+    assert ev["event"] == "tx_prepared"
+    modem = len(bidir.build_uplink_iq(payload, _SR, {}))
+    assert ev["samples"] == modem * 22, "samples is the hardware complex count"
+    assert ev["sample_rate"] == int(_SR * 22), "sample_rate must be the HARDWARE rate"
+    assert ev["predicted_samples"] == modem, "modem-rate count preserved separately"
+    # THE INVARIANT the orchestrator's pre-key proof checks:
+    assert abs(ev["samples"] / ev["sample_rate"] - ev["duration_s"]) < 0.01
+
+
 def test_transmit_REFUSES_to_build_while_keyed(tmp_path):
     """THE INVARIANT. transmit() runs with the PA hot. If nothing was staged it must REFUSE — not
     quietly build the burst, which is the exact hazard the handshake removes."""

@@ -663,7 +663,12 @@ class _TxController:
                     "predicted_samples": int(modem_samples),
                     "payload_bytes": len(payload),
                     "payload_sha256": self._staged.payload_sha256,
-                    "sample_rate": int(sample_rate),
+                    # RE-AUDIT FIX: report the HARDWARE rate the CS16 buffer streams at, CONSISTENT
+                    # with `samples` (the hardware complex count) so `samples / sample_rate` ==
+                    # duration. Reporting the modem rate while `samples` was the hardware count made
+                    # the orchestrator's samples/rate/duration proof fail for any upsample factor
+                    # > 1 (all real SDR paths) and REFUSE keying. duration_s stays the RF time.
+                    "sample_rate": int(sample_rate * hw_factor),
                     "duration_s": round(duration_s, 3),
                 },
             )
