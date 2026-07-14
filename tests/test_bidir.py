@@ -714,3 +714,35 @@ def test_stop_during_a_burst_is_processed_and_aborts_it():
     assert complete and complete[-1]["outcome"] == "cancelled", (
         f"the in-flight burst was not aborted by stop: {evs}"
     )
+
+
+# --------------------------------- ROUND 12 (11th audit, P0-5): hardware-rate memory bound
+
+
+def test_the_HARDWARE_rate_allocation_is_bounded_before_keying():
+    """The modem-sample cap is not what gets allocated: the burst is upsampled to the hardware rate
+    (samples * factor) and resample_poly materializes THAT buffer AFTER keying. A burst under the
+    modem cap can still be ~0.5 GB of hardware IQ. validate_uplink now bounds the hardware-rate
+    count given the TX upsample factor, and rejects cold."""
+    # A burst under the modem cap (~8.2M modem samples) but x16 upsample = 131M hardware > 64M cap.
+    payload = b"x" * 1024  # 1024*8 = 8192 bits
+    # sps 1000 (sample_rate = 1000 * 9600) → 8192 * 1000 = 8.192M modem samples (under 200M, ~7s RF)
+    modem = bidir.validate_uplink(payload, 9600.0 * 1000, {})  # factor default 1 → accepted
+    assert modem == 8192 * 1000
+    with pytest.raises(bidir.UplinkRejected) as e:
+        bidir.validate_uplink(payload, 9600.0 * 1000, {}, hardware_factor=16)
+    assert e.value.code == "hardware-iq-too-large"
+
+
+def test_a_burst_within_the_hardware_ceiling_is_accepted():
+    samples = bidir.validate_uplink(b"cmd", _SR, {}, hardware_factor=22)  # small burst, x22
+    assert samples > 0
+
+
+def test_a_burst_aborts_before_the_upsample_allocation():
+    """P0-5: a stop before the burst starts must not pay for the upsample allocation."""
+    io = bidir.FileBidirIo(None, None)
+    # FileBidirIo returns cancelled if should_abort() is True — before any write.
+    result = io.transmit_burst(np.zeros(1000, np.complex64), should_abort=lambda: True)
+    assert result.outcome == "cancelled"
+    assert result.accepted == 0

@@ -244,10 +244,17 @@ async def amain(args: argparse.Namespace) -> int:
                         continue
                     sha = hashlib.sha256(payload).hexdigest()
                     staged[fid] = (len(payload), sha)
+                    # ROUND 12: report a CONSISTENT samples/rate/duration proof. The stub does not
+                    # modulate, so it reports one sample per byte at the configured rate and the
+                    # matching duration, so the orchestrator's consistency check passes.
+                    n_samples = max(1, len(payload))
+                    rate = float(args.sample_rate) if args.sample_rate else 1.0
                     await _send_line(status_writer, {
                         "event": "tx_prepared", "frame_id": fid,
-                        "samples": max(1, len(payload)), "payload_bytes": len(payload),
+                        "samples": n_samples, "payload_bytes": len(payload),
                         "payload_sha256": sha,
+                        "sample_rate": args.sample_rate,
+                        "duration_s": round(n_samples / rate, 6),
                     })
                 else:
                     await _send_line(status_writer, {

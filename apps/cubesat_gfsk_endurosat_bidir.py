@@ -94,6 +94,13 @@ _UPLINK_MAX_BYTES = 65_536  # sanity cap on a raw uplink train (~54 s @ 9600); g
 _MAX_SPS = 1024
 # ~1.6 GB of complex64 — far past any real burst, short of an OOM kill:
 _MAX_IQ_SAMPLES = 200_000_000
+# ROUND 12 (11th audit, P0): the MODEM cap above is not the memory that gets allocated. The burst is
+# upsampled to the HARDWARE rate before it goes out — samples * factor — and resample_poly
+# materializes that whole buffer (plus temporaries) AFTER the PA is keyed. A burst under the modem
+# cap can still be ~0.5 GB of hardware IQ. This bounds the hardware-rate sample count, checked
+# BEFORE keying, so the post-key allocation is within a reviewed ceiling. ~64M complex64 ≈ 512 MiB
+# of output; resample_poly's transient sits on top of it, keeping peak well under an OOM.
+_MAX_HARDWARE_IQ_SAMPLES = 64_000_000
 _MIN_SYMBOL_RATE_HZ = 1200.0  # protocol floor; the REST backend has offered baud=10
 _MAX_SYMBOL_RATE_HZ = 10_000_000.0
 _MAX_SAMPLE_RATE_HZ = 100_000_000.0
@@ -150,7 +157,9 @@ def resolve_sample_rate(args, params: dict[str, object]) -> float:
     return float(sps) * sym  # exact integer samples/symbol
 
 
-def validate_uplink(payload: bytes, sample_rate: float, params: dict[str, object]) -> int:
+def validate_uplink(
+    payload: bytes, sample_rate: float, params: dict[str, object], *, hardware_factor: int = 1
+) -> int:
     """Prove this burst is FLYABLE, and return the exact IQ sample count it will allocate.
 
     ROUND 10. Every check here used to be absent from the bidirectional path — the app's only guard
@@ -247,6 +256,19 @@ def validate_uplink(payload: bytes, sample_rate: float, params: dict[str, object
             "iq-too-large",
             f"this burst would allocate {samples} IQ samples "
             f"(~{samples * 8 / 1e9:.1f} GB), past the {_MAX_IQ_SAMPLES} cap",
+        )
+
+    # ROUND 12 (P0): bound the HARDWARE-rate sample count that resample_poly materializes AFTER the
+    # PA is keyed. samples above is the modem-rate count; the transmit path upsamples it by
+    # hardware_factor. Reject here, cold, if that post-key buffer would exceed the reviewed ceiling.
+    factor = max(1, int(hardware_factor))
+    hw_samples = samples * factor
+    if hw_samples > _MAX_HARDWARE_IQ_SAMPLES:
+        raise UplinkRejected(
+            "hardware-iq-too-large",
+            f"this burst upsamples to {hw_samples} hardware IQ samples (x{factor}, "
+            f"~{hw_samples * 8 / 1e9:.1f} GB), past the {_MAX_HARDWARE_IQ_SAMPLES} cap — allocated "
+            f"AFTER keying",
         )
     return samples
 
@@ -542,8 +564,11 @@ class _TxController:
             # for frame B and radiate frame A. Drop it before we try.
             self._staged = None
             try:
+                # ROUND 12: pass the TX upsample factor so validate_uplink bounds the HARDWARE-rate
+                # allocation (samples * factor), not just the modem-rate one. 1 for file/bench I/O.
+                hw_factor = int(getattr(self._io, "tx_upsample_factor", 1) or 1)
                 samples = await asyncio.to_thread(
-                    validate_uplink, payload, sample_rate, params
+                    validate_uplink, payload, sample_rate, params, hardware_factor=hw_factor
                 )
                 iq = await asyncio.to_thread(build_uplink_iq, payload, sample_rate, params)
             except UplinkRejected as e:
@@ -868,6 +893,8 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         # modem, so a mismatch fails the spawn closed (R-11).
         hw_rate, factor = hardware_rate_for(rate, env["capture_rate_hz"])
         self._hw_rate, self._factor = hw_rate, factor
+        # ROUND 12: exposed so validate_uplink (pre-key) can bound the HARDWARE-rate allocation.
+        self.tx_upsample_factor = factor
         self._decim = StreamingDecimator(factor)
         # RX on the downlink.
         dev.setSampleRate(SOAPY_SDR_RX, 0, hw_rate)
@@ -965,6 +992,13 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         zero-sample completion)."""
         from _soapy_tx import query_tx_mtu, write_burst
 
+        # ROUND 12 (P0): a stop that arrives before the burst starts must NOT pay for the (bounded,
+        # but still up to ~0.5 GB) hardware-rate allocation. Check the abort BEFORE upsampling. The
+        # size is already capped pre-key by validate_uplink's hardware-sample ceiling, and the
+        # subsequent write_burst polls should_abort between chunks.
+        if should_abort is not None and should_abort():
+            return BurstResult(accepted=0, total=int(np.asarray(iq).size),
+                               outcome="cancelled", detail="aborted before upsample")
         # R-14: the modulator's modem-rate burst is interpolated to the
         # device's supported hardware rate (exact integer factor).
         buf = upsample_burst(np.asarray(iq, dtype=np.complex64), self._factor)
