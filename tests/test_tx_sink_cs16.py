@@ -364,3 +364,52 @@ def test_ax25_prepare_tx_cs16_rejects_empty_and_non_finite(monkeypatch):
         txapp._prepare_tx_cs16(args, np.zeros(0, dtype=np.complex64))
     with pytest.raises(ValueError):
         txapp._prepare_tx_cs16(args, np.full(100, np.nan + 0j, dtype=np.complex64))
+
+
+# --------------------------------------------------------------- SWEEP-1 (#5) rx_chunks fail-closed
+
+
+class _ScriptedRxDev:
+    """readStream returns a scripted sequence of ret codes, then raises _RxScriptEnd once the
+    script is exhausted — so a NON-raising rx_chunks generator terminates the test deterministically
+    instead of spinning forever."""
+
+    def __init__(self, rets: list[int]) -> None:
+        self._rets = list(rets)
+
+    def readStream(self, _stream, _buffs, _num, timeoutUs: int = 0):  # noqa: N803 (Soapy kwarg name)
+        del timeoutUs
+        if not self._rets:
+            raise _RxScriptEnd
+        return SimpleNamespace(ret=self._rets.pop(0))
+
+
+class _RxScriptEnd(Exception):
+    pass
+
+
+def test_rx_chunks_raises_engine_failure_on_persistent_readstream_error(monkeypatch, fake_soapysdr):
+    """SWEEP-1 (#5): a readStream returning a hard error code (STREAM_ERROR) on every read is a
+    dead/unplugged radio; rx_chunks must RAISE EngineFailure (so run_rx fails the pass) after the
+    consecutive-error bound, instead of warn-and-continue spinning forever (deaf-RX hang)."""
+    fake_soapysdr.SOAPY_SDR_OVERFLOW = -4  # rx_chunks imports OVERFLOW + TIMEOUT
+    monkeypatch.setattr(bidir, "_MAX_CONSECUTIVE_RX_ERRORS", 5)
+    err = fake_soapysdr.SOAPY_SDR_STREAM_ERROR  # -2
+    io = _bidir_io(_ScriptedRxDev([err] * 20))
+    with pytest.raises(bidir.EngineFailure, match="dead/unplugged"):
+        for _ in io.rx_chunks():
+            pass
+
+
+def test_rx_chunks_error_count_resets_on_timeout(monkeypatch, fake_soapysdr):
+    """SWEEP-1 (#5): a TIMEOUT (or overflow) between errors resets the consecutive-error counter, so
+    an isolated blip never fails the pass. 4 errors + timeout + 4 errors (bound=5) must NOT raise
+    EngineFailure — the script exhausts and we hit the sentinel instead."""
+    fake_soapysdr.SOAPY_SDR_OVERFLOW = -4
+    monkeypatch.setattr(bidir, "_MAX_CONSECUTIVE_RX_ERRORS", 5)
+    err = fake_soapysdr.SOAPY_SDR_STREAM_ERROR  # -2
+    tmo = fake_soapysdr.SOAPY_SDR_TIMEOUT  # -1
+    io = _bidir_io(_ScriptedRxDev([err, err, err, err, tmo, err, err, err, err]))
+    with pytest.raises(_RxScriptEnd):  # exhausted WITHOUT an EngineFailure
+        for _ in io.rx_chunks():
+            pass

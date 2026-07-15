@@ -562,14 +562,46 @@ async def amain(args) -> int:
         },
     )
 
+    # SWEEP-1 (#6): the single burst runs as a BACKGROUND task, not awaited inline. run_command_loop
+    # dispatches handlers serially, so awaiting the whole burst inside `start` blocked the loop for
+    # the entire transmission: a mid-burst `stop` could not be dequeued, `stop_requested` never got
+    # set, and should_abort (wired to it) could never fire, so the in-flight abort was dead code
+    # (and a hung native writeStream wedged the whole loop). Mirrors the bidir app's ROUND-11 P0-4
+    # fix. The AUDIT ROUND 4 P0 contract (a burst FAILURE must fail the pass, nonzero exit) is
+    # preserved by the done-callback + the burst_error check below.
+    burst_task: dict[str, asyncio.Task[None] | None] = {"t": None}
+    burst_error: list[BaseException] = []
+
+    def _on_burst_done(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return  # success: wait for the orchestrator's stop, exactly as the inline path did
+        # AUDIT ROUND 4 (P0): emit_burst already emitted its `error` event before raising. Record
+        # the failure and force the command loop to END NOW (feed the control reader EOF) so amain
+        # returns nonzero even if the orchestrator has not yet sent `stop` — matching the old inline
+        # path, which surfaced the raise immediately as "handler-failed".
+        burst_error.append(exc)
+        stop_requested.set()
+        with contextlib.suppress(Exception):
+            sockets.control_reader.feed_eof()
+
     async def _on_start(_cmd: dict[str, object]) -> None:
         await send_event(sockets.status_writer, {"event": "started"})
-        await emit_burst(
-            sockets.status_writer, args, params, profile, engine,
-            should_abort=stop_requested.is_set,
-            iq=prevalidated_iq,  # ROUND 8: the frame we CHECKED is the frame we transmit
-            cs16=prevalidated_cs16,  # (3a) the FINAL flat CS16 built pre-key (hardware sink)
+        if burst_task["t"] is not None:
+            return  # one-shot: ignore a duplicate start
+        task = asyncio.create_task(
+            emit_burst(
+                sockets.status_writer, args, params, profile, engine,
+                should_abort=stop_requested.is_set,
+                iq=prevalidated_iq,  # ROUND 8: the frame we CHECKED is the frame we transmit
+                cs16=prevalidated_cs16,  # (3a) the FINAL flat CS16 built pre-key (hardware sink)
+            ),
+            name="ax25-tx-burst",
         )
+        burst_task["t"] = task
+        task.add_done_callback(_on_burst_done)
 
     stop_reason = {"value": "command"}
 
@@ -580,6 +612,19 @@ async def amain(args) -> int:
     handlers = {"start": _on_start, "stop": _on_stop}
     try:
         reason = await run_command_loop(sockets.control_reader, handlers, sockets.status_writer)
+        # Settle the in-flight burst so its transmit_complete/error is flushed and any failure is
+        # observed BEFORE we decide the exit code or ack the stop.
+        t = burst_task["t"]
+        if t is not None:
+            with contextlib.suppress(Exception):
+                await t
+        if burst_error:
+            # AUDIT ROUND 4 (P0): the burst failed — fail the pass with a nonzero exit, exactly as
+            # the old inline "handler-failed" path did (the error event was already emitted).
+            logging.getLogger(__name__).error(
+                "TX burst failed (%r) — exiting nonzero so the pass fails", burst_error[0]
+            )
+            return 1
         if reason == "handler-failed":
             # A command handler raised. The app must NOT return 0: gs-client's supervisor
             # classifies a clean exit as a normal stop, and the pass would complete as if
@@ -602,6 +647,13 @@ async def amain(args) -> int:
         return 1
     finally:
         stop_requested.set()
+        t = burst_task["t"]
+        if t is not None and not t.done():
+            # Teardown with the burst still in flight (e.g. control EOF mid-burst): request abort,
+            # then cancel and reap so no task is left running past process exit.
+            t.cancel()
+            with contextlib.suppress(BaseException):
+                await t
         await sockets.aclose()
 
 

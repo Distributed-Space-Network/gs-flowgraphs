@@ -87,6 +87,12 @@ _READ_CHUNK = 4096
 # R-15: samples read in this window after a TX burst reactivates the RX stream
 # are the front-end's settling transient and are discarded, not decoded.
 _RX_SETTLE_S = 0.05
+# SWEEP-1 (#5): a Soapy readStream that returns a hard error code (STREAM_ERROR / CORRUPTION — a
+# negative .ret that is NOT timeout/overflow) on this many CONSECUTIVE reads is a dead/unplugged
+# radio, not a transient. rx_chunks then RAISES so the reader captures it and run_rx fails the pass,
+# instead of warn-and-continue spinning forever (a dead radio indistinguishable from a quiet sky).
+# A single good/timeout/overflow read resets the counter, so an isolated blip never trips it.
+_MAX_CONSECUTIVE_RX_ERRORS = 200
 # Finding #17: a data-socket peer that stays CONNECTED but stops reading (its TCP
 # receive buffer fills) makes an unbounded ``data_writer.drain()`` await forever —
 # ConnectionReset/BrokenPipe never fire — so the decode loop cannot observe a stop
@@ -1046,6 +1052,7 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         from SoapySDR import SOAPY_SDR_OVERFLOW, SOAPY_SDR_TIMEOUT
 
         buff = np.empty(_READ_CHUNK, dtype=np.complex64)
+        consecutive_errors = 0
         while True:
             if self.tx_active.is_set():
                 time.sleep(0.001)
@@ -1053,6 +1060,7 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
             with self._lock:
                 sr = self._dev.readStream(self._rx_stream, [buff], len(buff), timeoutUs=200_000)
             if sr.ret > 0:
+                consecutive_errors = 0
                 if time.monotonic() < self._rx_settle_until:
                     continue  # R-15: post-reactivation settling transient — discard
                 # R-14: hardware-rate capture → modem-rate chunks (stateful,
@@ -1061,9 +1069,24 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                 if len(out):
                     yield out
             elif sr.ret in (SOAPY_SDR_TIMEOUT, SOAPY_SDR_OVERFLOW):
+                consecutive_errors = 0  # timeout/overflow are expected on a quiet/busy stream
                 continue
             else:
-                _log.warning("bidir RX readStream ret=%d", sr.ret)
+                # SWEEP-1 (#5): a hard error code (STREAM_ERROR / CORRUPTION). Warn-and-continue
+                # used to spin here forever on a dead/unplugged radio — the reader never raised,
+                # run_rx never failed the pass, and the engine hung deaf. Bound consecutive errors
+                # and RAISE so the reader's except captures it and run_rx re-raises EngineFailure
+                # (dead radio must fail the pass, not look like a quiet sky).
+                consecutive_errors += 1
+                _log.warning(
+                    "bidir RX readStream ret=%d (consecutive error #%d)", sr.ret, consecutive_errors
+                )
+                if consecutive_errors >= _MAX_CONSECUTIVE_RX_ERRORS:
+                    raise EngineFailure(
+                        f"bidir RX: readStream returned hard error ret={sr.ret} on "
+                        f"{consecutive_errors} consecutive reads — the RX radio is dead/unplugged; "
+                        f"failing the pass instead of hanging deaf."
+                    )
 
     def transmit_burst(self, cs16: np.ndarray, *, on_first_accept=None, should_abort=None):
         """Write ONE already-final flat CS16 uplink burst. (3a) NO DSP here — the resample,
