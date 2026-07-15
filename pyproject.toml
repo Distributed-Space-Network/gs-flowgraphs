@@ -12,7 +12,7 @@ name = "gs-flowgraphs-dsp"
 version = "0.1.0"
 description = "Pure-numpy DSP + AX.25 protocol library for the DSN ground-station flowgraphs"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "scipy>=1.10"]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "soundfile>=0.12"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

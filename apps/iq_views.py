@@ -19,8 +19,6 @@ import datetime as _dt
 import json
 import logging
 import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -31,10 +29,6 @@ log = logging.getLogger("iq_views")
 _SDF_CHUNK = 1 << 20  # samples per chunk when transcoding cf32 → SDF (bounded memory)
 _OGG_CHUNK = 1 << 20  # samples per chunk when deriving discriminator audio (bounded memory)
 OGG_SAMPLE_RATE_HZ = 48_000  # SatNOGS discriminator-audio rate; audio_analyze.py expects it
-# The OGG stream is written to ffmpeg as we walk the capture, so encoding overlaps the read;
-# communicate() only awaits the final flush. The parent (gs-client supervisor) bounds the whole
-# iq_views run, so this is just a standalone-run backstop against a wedged encoder.
-_OGG_ENCODE_FLUSH_TIMEOUT_S = 120.0
 
 
 def _unlink_quiet(path: Path) -> None:
@@ -42,14 +36,69 @@ def _unlink_quiet(path: Path) -> None:
         path.unlink()
 
 
-def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
-    """Terminate the encoder and REAP it (bounded), so a cancelled/failed encode never orphans an
-    ffmpeg child or leaves its pipes open. ``communicate`` (not bare ``wait``) drains stdout/stderr
-    so the kill cannot deadlock on a full pipe; every step is best-effort under a short timeout."""
-    with contextlib.suppress(Exception):
-        proc.kill()
-    with contextlib.suppress(Exception):
-        proc.communicate(timeout=5.0)
+class _StreamingResampler:
+    """Exact, stateful rational-rate resampler (``in_rate`` → ``out_rate``) for chunked streams.
+
+    OPERATOR DECISION 2026-07-15: OGG encoding moved from the external ffmpeg binary to the
+    pip-installable ``soundfile`` wheel (bundled libsndfile+Vorbis), so the resample ffmpeg
+    used to do now happens here. Polyphase-equivalent: zero-stuff by L, FIR low-pass
+    (windowed-sinc, gain L — the same design ``scipy.signal.resample_poly`` uses), take every
+    M-th sample — with the FIR state (``lfilter`` ``zi``) and the decimation phase carried
+    across chunks, so the output is bit-identical for ANY chunking of the same input.
+    scipy is already a runtime dependency (apps/_stream.py uses the same primitives)."""
+
+    MAX_UPSAMPLE = 16  # a larger L means an exotic capture rate; refuse honestly, never alias
+
+    def __init__(self, in_rate: int, out_rate: int) -> None:
+        from fractions import Fraction
+
+        from scipy.signal import firwin
+
+        if in_rate <= 0 or out_rate <= 0:
+            msg = f"rates must be positive: {in_rate} -> {out_rate}"
+            raise ValueError(msg)
+        ratio = Fraction(out_rate, in_rate)
+        self.up, self.down = ratio.numerator, ratio.denominator
+        if self.up > self.MAX_UPSAMPLE:
+            msg = (
+                f"unsupported capture rate {in_rate} Hz for {out_rate} Hz audio "
+                f"(upsample factor {self.up} > {self.MAX_UPSAMPLE})"
+            )
+            raise ValueError(msg)
+        if self.up == 1 and self.down == 1:
+            # Identity rate (a 48 kHz capture): pure passthrough — no filter, no delay.
+            self._h = np.ones(1, dtype=np.float32)
+            self._zi = np.zeros(0, dtype=np.float32)
+            self._phase = 0
+            return
+        half = max(self.up, self.down)
+        ntaps = 20 * half + 1  # resample_poly's default kaiser design (half_len = 10*half)
+        self._h = (firwin(ntaps, 1.0 / half, window=("kaiser", 5.0)) * self.up).astype(np.float32)
+        self._zi = np.zeros(len(self._h) - 1, dtype=np.float32)
+        self._phase = 0  # upsampled-stream index (mod `down`) of the next chunk's first sample
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        from scipy.signal import lfilter
+
+        x = np.asarray(x, dtype=np.float32)
+        if x.size == 0:
+            return np.empty(0, dtype=np.float32)
+        if self.up == 1 and self.down == 1:
+            return x
+        up = np.zeros(x.size * self.up, dtype=np.float32)
+        up[:: self.up] = x
+        y, self._zi = lfilter(self._h, 1.0, up, zi=self._zi)
+        first = (-self._phase) % self.down
+        out = y[first :: self.down]
+        self._phase = (self._phase + up.size) % self.down
+        return np.asarray(out, dtype=np.float32)
+
+    def flush(self) -> np.ndarray:
+        """Drain the FIR group delay so the audio tail is not truncated at stream end."""
+        if self.up == 1 and self.down == 1:
+            return np.empty(0, dtype=np.float32)  # passthrough has no delay to drain
+        tail_in = len(self._h) // (2 * self.up) + 1
+        return self.process(np.zeros(tail_in, dtype=np.float32))
 
 
 def _discriminator_chunk(
@@ -78,7 +127,7 @@ def _discriminator_chunk(
 
 
 def _discriminator(iq: np.ndarray, *, chunk_samples: int = _OGG_CHUNK) -> np.ndarray:
-    """Whole-capture discriminator via the SAME chunked path the OGG encoder feeds ffmpeg.
+    """Whole-capture discriminator via the SAME chunked path the OGG encoder consumes.
 
     Exposed for tests: for ANY chunk size the result must equal the single-shot whole-array
     computation (phase continuity across boundaries is the correctness property)."""
@@ -91,29 +140,16 @@ def _discriminator(iq: np.ndarray, *, chunk_samples: int = _OGG_CHUNK) -> np.nda
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.float32)
 
 
-def _ffmpeg_ogg_argv(
-    ffmpeg: str, input_rate_hz: float, ogg_channels: int, out_path: Path
-) -> list[str]:
-    """Build the ffmpeg argv: read mono float32 discriminator from stdin at the capture's TRUE
-    rate, resample to 48 kHz, encode Vorbis to ``out_path``. For ``ogg_channels == 2`` the single
-    mono signal is EXPLICITLY duplicated into both output channels via a pan filter (a deterministic
-    mapping, NOT the implicit mono->stereo upmix); stereo carries no extra information.
-
-    The OUTPUT muxer is pinned with an explicit ``-f ogg`` because the file is written to a
-    ``.ogg.tmp`` name from which ffmpeg CANNOT infer the container — without it ffmpeg errors out
-    (or, worse, guesses a different muxer). ``-f f32le`` earlier is the INPUT demuxer, unrelated."""
-    rate = max(1, int(round(input_rate_hz)))
-    argv = [
-        ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-        "-f", "f32le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
-    ]
+def _write_audio_frames(sound_file: object, audio: np.ndarray, ogg_channels: int) -> None:
+    """Write one resampled block: mono as-is, or the SAME mono signal explicitly duplicated
+    into both channels (a deterministic mapping — stereo carries no extra information).
+    Ringing from the resampler can overshoot ±1.0 slightly; clip so the encoder never wraps."""
+    if audio.size == 0:
+        return
+    audio = np.clip(audio, -1.0, 1.0)
     if ogg_channels == 2:
-        argv += ["-af", "pan=stereo|c0=c0|c1=c0"]
-    argv += [
-        "-ar", str(OGG_SAMPLE_RATE_HZ), "-ac", str(ogg_channels),
-        "-c:a", "libvorbis", "-f", "ogg", str(out_path),
-    ]
-    return argv
+        audio = np.repeat(audio[:, None], 2, axis=1)
+    sound_file.write(audio)  # type: ignore[attr-defined]
 
 
 def write_discriminator_ogg(
@@ -122,80 +158,68 @@ def write_discriminator_ogg(
     *,
     sample_rate_hz: float,
     ogg_channels: int = 1,
-    ffmpeg: str | None = None,
 ) -> Path | None:
     """Derive FM-discriminator audio from ``iq`` and encode it as a 48 kHz Vorbis ``<pass>.ogg``.
 
-    The mono float32 discriminator is streamed to ONE quiet ffmpeg process in bounded chunks (phase
-    continuity preserved across boundaries). ffmpeg is told the true input rate, resamples to 48 kHz
-    and encodes Vorbis. The output is written to ``<pass>.ogg.tmp`` and renamed atomically to
-    ``<pass>.ogg`` ONLY after ffmpeg exits 0; the temp file is removed on cancellation or failure,
-    so a partial file never wears the final name. Returns the final path, or ``None`` when nothing
-    was written (ffmpeg missing, bad channel count, too-short capture, or encode failure)."""
+    OPERATOR DECISION 2026-07-15 (CA-INTEG-002): the encoder is the pip-installable
+    ``soundfile`` wheel (bundled libsndfile + Vorbis) — no external ffmpeg binary, so the
+    station's OGG dependency is provisioned by pip/wheelhouse like every other package.
+
+    The mono float32 discriminator is derived in bounded chunks (phase continuity preserved
+    across boundaries), resampled to 48 kHz by an exact stateful polyphase resampler, and
+    written incrementally. The output goes to ``<pass>.ogg.tmp`` and is renamed atomically to
+    ``<pass>.ogg`` ONLY after a clean, non-empty encode; the temp file is removed on
+    cancellation or failure, so a partial file never wears the final name. Returns the final
+    path, or ``None`` when nothing was written (soundfile missing, bad channel count,
+    unsupported rate, too-short capture, or encode failure)."""
     if ogg_channels not in (1, 2):
         log.error("iq_views: ogg_channels must be 1 or 2, got %r — skipping OGG", ogg_channels)
         return None
-    exe = ffmpeg or shutil.which("ffmpeg")
-    if exe is None:
-        log.warning("iq_views: ffmpeg not found on PATH — skipping OGG discriminator audio")
+    try:
+        import soundfile as sf
+    except ImportError:
+        log.warning(
+            "iq_views: python-soundfile is not installed — skipping OGG discriminator audio "
+            "(pip install soundfile; its wheel bundles the Vorbis encoder)"
+        )
         return None
     n = int(np.asarray(iq).shape[0])
     if n < 2:
         log.warning("iq_views: capture too short (%d samples) for discriminator audio", n)
         return None
+    try:
+        resampler = _StreamingResampler(int(round(sample_rate_hz)), OGG_SAMPLE_RATE_HZ)
+    except ValueError as e:
+        log.warning("iq_views: cannot derive OGG: %s", e)
+        return None
     final = cf32_path.with_suffix(".ogg")
     tmp = cf32_path.with_suffix(".ogg.tmp")
     _unlink_quiet(tmp)  # a stale temp from a crashed run must never be renamed as the final file
-    argv = _ffmpeg_ogg_argv(exe, sample_rate_hz, ogg_channels, tmp)
     try:
-        proc = subprocess.Popen(
-            argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
-    except OSError as e:
-        log.warning("iq_views: could not start ffmpeg for OGG: %s", e)
+        with sf.SoundFile(
+            str(tmp), mode="w", samplerate=OGG_SAMPLE_RATE_HZ, channels=ogg_channels,
+            format="OGG", subtype="VORBIS",
+        ) as f:
+            prev: np.complex64 | None = None
+            for off in range(0, n, _OGG_CHUNK):
+                block = np.ascontiguousarray(iq[off : off + _OGG_CHUNK], dtype=np.complex64)
+                disc, prev = _discriminator_chunk(block, prev)
+                _write_audio_frames(f, resampler.process(disc), ogg_channels)
+            _write_audio_frames(f, resampler.flush(), ogg_channels)
+    except (OSError, RuntimeError, ValueError) as e:
         _unlink_quiet(tmp)
-        return None
-    assert proc.stdin is not None
-    try:
-        prev: np.complex64 | None = None
-        for off in range(0, n, _OGG_CHUNK):
-            block = np.ascontiguousarray(iq[off : off + _OGG_CHUNK], dtype=np.complex64)
-            disc, prev = _discriminator_chunk(block, prev)
-            proc.stdin.write(np.ascontiguousarray(disc, dtype="<f4").tobytes())
-        proc.stdin.close()
-    except (BrokenPipeError, OSError):
-        # ffmpeg exited early (e.g. libvorbis missing) — reap it and report via the return code.
-        with contextlib.suppress(Exception):
-            proc.stdin.close()
-    except BaseException:
-        # Cancellation (KeyboardInterrupt / CancelledError / SystemExit) or any unexpected error
-        # mid-stream: kill AND reap the encoder, drop the temp, never leave a partial file.
-        _kill_and_reap(proc)
-        _unlink_quiet(tmp)
-        raise
-    try:
-        _, err = proc.communicate(timeout=_OGG_ENCODE_FLUSH_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        _kill_and_reap(proc)
-        _unlink_quiet(tmp)
-        log.warning("iq_views: ffmpeg OGG encode timed out — removed %s", tmp.name)
+        log.warning("iq_views: OGG encode failed: %s", e)
         return None
     except BaseException:
-        # Cancellation during the final flush must also kill+reap and clean up before propagating.
-        _kill_and_reap(proc)
+        # Cancellation (KeyboardInterrupt / SystemExit) mid-encode: drop the temp so a
+        # partial file never wears the final name, then propagate.
         _unlink_quiet(tmp)
         raise
-    # A truthful success requires ALL of: clean exit, a temp file, and NON-EMPTY output. ffmpeg can
-    # exit 0 yet write nothing/an empty file (no samples reached the muxer); reporting that as a
-    # produced artifact is a false success, so an empty temp is a failure just like a non-zero exit.
-    tmp_ok = tmp.exists() and tmp.stat().st_size > 0
-    if proc.returncode != 0 or not tmp_ok:
+    # A truthful success requires a NON-EMPTY output: an encoder that produced nothing is a
+    # failure, not a product (reporting it as produced is the false-success class).
+    if not (tmp.exists() and tmp.stat().st_size > 0):
         _unlink_quiet(tmp)
-        detail = (err or b"").decode("utf-8", errors="replace").strip()[:500]
-        log.warning(
-            "iq_views: ffmpeg OGG encode failed (rc=%s, output=%s): %s",
-            proc.returncode, "present" if tmp_ok else "missing/empty", detail,
-        )
+        log.warning("iq_views: OGG encode produced no output — reporting failure")
         return None
     try:
         os.replace(tmp, final)
@@ -224,7 +248,6 @@ def derive_views(
     formats: tuple[str, ...],
     csv_seconds: float = 30.0,
     ogg_channels: int = 1,
-    ffmpeg: str | None = None,
 ) -> list[Path]:
     """Write the requested views next to ``cf32``. Returns the paths written.
 
@@ -309,7 +332,7 @@ def derive_views(
         written.append(sdf)
     if want_ogg:  # optional FM-discriminator audio (48 kHz Vorbis), same selection policy as above
         ogg = write_discriminator_ogg(
-            path, iq, sample_rate_hz=sample_rate_hz, ogg_channels=ogg_channels, ffmpeg=ffmpeg
+            path, iq, sample_rate_hz=sample_rate_hz, ogg_channels=ogg_channels
         )
         if ogg is not None:
             written.append(ogg)
@@ -341,7 +364,6 @@ def main(argv: list[str] | None = None) -> int:
         "--ogg-channels", type=int, default=1,
         help="discriminator-audio channels: 1=mono (default), 2=duplicate mono into L/R",
     )
-    p.add_argument("--ffmpeg", default=None, help="path to ffmpeg when it is not on PATH")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     fmts = tuple(f.strip().lower() for f in args.formats.split(",") if f.strip())
@@ -353,14 +375,13 @@ def main(argv: list[str] | None = None) -> int:
             formats=fmts,
             csv_seconds=args.csv_seconds,
             ogg_channels=args.ogg_channels,
-            ffmpeg=args.ffmpeg,
         )
     except Exception:
         log.exception("iq_views: failed to derive views from %s", args.input)
         return 1
     # RE-AUDIT (P2): a requested view that was NOT produced is a FAILURE, not a silent success. The
     # per-view helpers already return None / omit the path on failure or a legitimate skip (a
-    # too-short capture has no waterfall; a failed ffmpeg has no OGG), so a requested format absent
+    # too-short capture has no waterfall; a failed encode has no OGG), so a requested format absent
     # from `written` is exactly that. Without this, main() exited 0 and the supervisor logged
     # "derived ogg" for an OGG that does not exist. Print the produced list so the caller logs what
     # ACTUALLY exists.
