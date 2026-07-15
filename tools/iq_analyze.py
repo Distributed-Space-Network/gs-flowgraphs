@@ -16,6 +16,15 @@ Two input formats, by extension:
 
 Usage:  python tools/iq_analyze.py <capture.cf32|.csv> [--symbol-rate 9600] [--sample-rate HZ]
 
+The default is a REAL whole-pass sweep: every physically usable baud in
+``SWEEP_BAUDS`` is decoded, and each time window tries DC, the strongest narrow
+carrier, and broadband packet candidates.  This matters when a weak burst is
+visible beside a much stronger Doppler track: the old implementation probed all
+bauds but decoded at most three of them, then locked only the strongest line.
+With ``--raw-bits-dir``, strict locks also receive a bounded carrier/filter/SPS
+refinement; separate bursts at the same baud are ranked by checksum evidence or
+payload-agnostic bit correlation.
+
 License: GPLv3 (see ../COPYING).
 """
 
@@ -24,6 +33,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -43,14 +53,34 @@ PREAMBLE_BITS = (1, 0)  # 0xAA = 1010..., MSB-first
 SYNC_FLAG = (0, 1, 1, 1, 1, 1, 1, 0)  # 0x7E
 # Standard amateur symbol rates the AX.25 sweep tries when the pass didn't decode at the labelled
 # rate (baud == symbol rate; a wrong-rate demod yields no FCS-valid frame, so the sweep is safe).
-DEFAULT_SWEEP_BAUDS = (1200.0, 2400.0, 4800.0, 9600.0)
+DEFAULT_SWEEP_BAUDS = (1200.0, 2400.0, 4800.0, 9600.0, 19200.0)
 # Candidate baud rates for auto-detection. The declared/labelled baud CAN BE WRONG (a real pass
 # labelled "9600" actually carried a 2400-baud bird), so the tool sweeps these and reports which one
 # shows a real preamble. Bounded by the channel: a rate above the recording's Nyquist can't fit, so
 # a 48 kHz capture caps meaningfully at ~19200 — sweeping MHz-range bauds is physically pointless.
-SWEEP_BAUDS = (1200.0, 2400.0, 4800.0, 9600.0, 19200.0)
+SWEEP_BAUDS = DEFAULT_SWEEP_BAUDS
 # A spectral line this many dB over the noise floor counts as a real carrier (vs a spur/noise bin).
 CARRIER_SNR_DB = 6.0
+# Per-window carrier recovery keeps the strongest narrow line AND packet-band energy peaks.  The
+# latter is how a weaker 2400-baud burst beside a bright CW/Doppler track is found.
+DEFAULT_CARRIER_COUNT = 3
+BROAD_CARRIER_SNR_DB = 1.0
+# Raw hard decisions are persisted without a valid CRC only when there is independent modem-lock
+# evidence.  The alternating-run threshold is derived from the number of sliced bits, keeping the
+# per-demod random false-alarm probability bounded instead of baking in one capture's preamble.
+RAW_ALT_FALSE_ALARM = 5e-5
+# A lock earns a bounded second pass over nearby carrier/filter/resampler settings.  Weak secondary
+# preamble anchors are allowed only inside an already-established event, then ranked by CRC/FCS or
+# consistency with another burst at the same baud.  This improves damaged repeated beacons without
+# teaching the analyzer any capture-specific payload bytes.
+RAW_REFINE_CARRIER_FRACTIONS = (-0.25, -1 / 6, -1 / 12, 0.0, 1 / 12, 1 / 6, 0.25)
+RAW_REFINE_BW_MULTIPLIERS = (1.25, 4 / 3, 1.5, 2.0)
+RAW_REFINE_TARGET_SPS = (8, 16)
+RAW_REFINE_MAX_LOCKS = 8
+RAW_REFINE_MAX_ANCHORS = 2
+RAW_REFINE_MAX_VARIANTS = 256
+RAW_REPEAT_MIN_SIMILARITY = 0.65
+RAW_REPEAT_TIE_TOLERANCE = 0.005
 
 
 @dataclass
@@ -205,6 +235,98 @@ def _peak_excluding(
     return float(freqs[pk])
 
 
+def _window_spectrum(iq: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(frequency_hz, power)`` for one decode window.
+
+    Kept separate so :func:`decode_pass` computes the FFT once per time window and reuses it for
+    every baud.  A full five-rate sweep used to repeat carrier work unnecessarily.
+    """
+    n = int(len(iq))
+    if n < 64:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    x = np.asarray(iq) * np.hanning(n)
+    power = np.abs(np.fft.fftshift(np.fft.fft(x))) ** 2
+    freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs))
+    return freqs, power
+
+
+def _carrier_candidates(
+    iq: np.ndarray,
+    fs: float,
+    *,
+    channel_bw_hz: float,
+    max_candidates: int = DEFAULT_CARRIER_COUNT,
+    exclude_hz: float | None = None,
+    exclude_bw_hz: float = 12000.0,
+    spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+) -> list[float]:
+    """Find narrow-line and BROADBAND packet carrier candidates in one window.
+
+    Selecting only the largest FFT bin is wrong in the common case of a weak packet beside a much
+    stronger CW/Doppler line.  We therefore keep that narrow peak for compatibility, then search a
+    clipped-power rolling band.  Clipping makes a one-bin CW line contribute almost nothing to a
+    multi-kHz band while a real FSK/GFSK packet contributes across hundreds/thousands of bins.
+    The returned list is bounded, so the extra coverage cannot become an unbounded frequency grid.
+    """
+    limit = max(0, int(max_candidates))
+    if limit == 0:
+        return []
+    freqs, power = spectrum if spectrum is not None else _window_spectrum(iq, fs)
+    if not len(power):
+        return []
+    valid = np.isfinite(power)
+    # Leave a small FFT-edge guard: a channel filter cannot recover a packet centred at Nyquist.
+    edge = max(50.0, float(channel_bw_hz) / 2.0)
+    valid &= np.abs(freqs) <= max(0.0, fs / 2.0 - edge)
+    if exclude_hz is not None:
+        valid &= np.abs(freqs - float(exclude_hz)) >= float(exclude_bw_hz) / 2.0
+    vals = power[valid]
+    if not len(vals):
+        return []
+    floor = float(np.median(vals)) + 1e-30
+    out: list[float] = []
+
+    # Narrow candidate: preserves the old carrier recovery for an ordinary isolated signal.
+    narrow = np.where(valid, power, 0.0)
+    pk = int(np.argmax(narrow))
+    # _peak_excluding historically used 4x amplitude over median amplitude.  Power is squared, so
+    # use 16x here.  The broadband path below has its own much lower integrated-energy threshold.
+    if narrow[pk] >= floor * 16.0:
+        out.append(float(freqs[pk]))
+
+    if len(out) >= limit or channel_bw_hz <= 0.0:
+        return out[:limit]
+
+    # Packet-band candidate(s).  Use ~75% of the channel width (1.5*baud for the default 2*baud
+    # channel) so a 2-FSK/GFSK occupied band raises the average without diluting it excessively.
+    df = abs(float(freqs[1] - freqs[0])) if len(freqs) > 1 else fs
+    band_bins = max(8, min(len(power) - 1, int(round(0.75 * channel_bw_hz / max(df, 1e-9)))))
+    clipped = np.minimum(power, floor * 16.0)
+    clipped = np.where(valid, clipped, 0.0)
+    csum = np.concatenate(([0.0], np.cumsum(clipped, dtype=np.float64)))
+    band = csum[band_bins:] - csum[:-band_bins]
+    centres = np.arange(len(band)) + band_bins // 2
+    band_valid = valid[centres]
+    if not np.any(band_valid):
+        return out[:limit]
+    baseline = float(np.median(band[band_valid])) + 1e-30
+    threshold = baseline * (10.0 ** (BROAD_CARRIER_SNR_DB / 10.0))
+    work = np.where(band_valid, band, 0.0)
+    separation_bins = max(1, band_bins // 2)
+    while len(out) < limit:
+        k = int(np.argmax(work))
+        if work[k] < threshold:
+            break
+        centre_bin = int(centres[k])
+        carrier = float(freqs[centre_bin])
+        # A broadband estimate that lands on the already-kept narrow line adds no coverage.
+        if all(abs(carrier - old) >= max(100.0, channel_bw_hz / 4.0) for old in out):
+            out.append(carrier)
+        lo, hi = max(0, k - separation_bins), min(len(work), k + separation_bins + 1)
+        work[lo:hi] = 0.0
+    return out[:limit]
+
+
 def _longest_alt_run(bits: np.ndarray) -> int:
     """Length (in bits) of the longest strictly-alternating ``1010…`` / ``0101…`` run — the
     demodulated footprint of a 0xAA/0x55 modem PREAMBLE. A clean run well above the noise floor (a
@@ -221,6 +343,486 @@ def _longest_alt_run(bits: np.ndarray) -> int:
     brk = np.flatnonzero(~changes)  # positions where alternation breaks
     bounds = np.concatenate(([-1], brk, [len(changes)]))
     return int(np.max(np.diff(bounds) - 1)) + 1
+
+
+def _longest_alt_span(bits: np.ndarray) -> tuple[int, int]:
+    """``(start, end_exclusive)`` of the longest strictly alternating run."""
+    spans = _alternating_spans(bits, max_spans=1)
+    return spans[0] if spans else (0, 0)
+
+
+def _alternating_spans(
+    bits: np.ndarray, *, min_bits: int = 1, max_spans: int = 0,
+) -> list[tuple[int, int]]:
+    """Alternating spans ordered by decreasing length, then earliest occurrence.
+
+    Refinement deliberately considers more than the single longest span: a damaged preamble can
+    split into two shorter runs, and the first equally-long random run is not necessarily the frame
+    anchor.  The initial lock gate remains strict; weaker spans are used only inside that lock.
+    """
+    b = np.asarray(bits, dtype=np.uint8)
+    if not len(b):
+        return []
+    if len(b) == 1:
+        return [(0, 1)] if min_bits <= 1 else []
+    breaks = np.flatnonzero(b[1:] == b[:-1])  # break lies between i and i+1
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks + 1, [len(b)]))
+    lengths = ends - starts
+    order = sorted(
+        (int(i) for i in np.flatnonzero(lengths >= max(1, int(min_bits)))),
+        key=lambda i: (-int(lengths[i]), int(starts[i])),
+    )
+    if max_spans > 0:
+        order = order[: int(max_spans)]
+    return [(int(starts[i]), int(ends[i])) for i in order]
+
+
+def _max_hdlc_flag_run(bits: np.ndarray) -> int:
+    """Longest consecutive 0x7e flag train after plain and G3RUH AX.25 transforms.
+
+    A single bare 0x7e is common in random hard decisions.  A sustained flag train is independent
+    evidence of symbol/framing lock and is therefore useful for deciding whether raw bits deserve
+    to be persisted even when the final FCS is bad.
+    """
+    from gfsk_ax25 import g3ruh  # noqa: PLC0415
+
+    best = 0
+    arr = np.asarray(bits, dtype=np.uint8)
+    for scramble in (False, True):
+        decoded = g3ruh.descramble(arr) if scramble else arr
+        decoded = g3ruh.nrzi_decode(decoded)
+        s = "".join(map(str, decoded.tolist()))
+        for m in re.finditer(r"(?:01111110){2,}", s):
+            best = max(best, (m.end() - m.start()) // 8)
+    return best
+
+
+def _alt_lock_threshold(bit_count: int, override: int = 0) -> int:
+    """Alternating-run length unlikely to occur by chance in ``bit_count`` random bits."""
+    if override > 0:
+        return int(override)
+    n = max(2, int(bit_count))
+    return max(16, int(math.ceil(1.0 + math.log2(n / RAW_ALT_FALSE_ALARM))))
+
+
+def _raw_lock_candidate(
+    bits: np.ndarray,
+    *,
+    frames: list[tuple[str, bytes]],
+    min_alt_run: int = 0,
+) -> dict[str, object] | None:
+    """Describe a defensible raw-bit lock, or return ``None`` for arbitrary sliced noise."""
+    arr = np.asarray(bits, dtype=np.uint8)
+    start, end = _longest_alt_span(arr)
+    alt_run = end - start
+    alt_threshold = _alt_lock_threshold(len(arr), min_alt_run)
+    hdlc_flags = _max_hdlc_flag_run(arr)
+    reasons: list[str] = []
+    if frames:
+        reasons.append("crc_valid_frame")
+    if alt_run >= alt_threshold:
+        reasons.append("alternating_preamble")
+    if hdlc_flags >= 4:
+        reasons.append("hdlc_flag_train")
+    if not reasons:
+        return None
+
+    # A payload's first bit can continue the alternating run, so the likely candidate starts one
+    # bit before the detected break.  The .rawbits file still contains the COMPLETE demod window;
+    # this is only an offset into it, not a protocol-specific extraction length.
+    candidate_start = max(0, end - 1)
+    return {
+        "reasons": reasons,
+        "alternating_run_bits": int(alt_run),
+        "alternating_run_threshold_bits": int(alt_threshold),
+        "alternating_run_start_bit": int(start),
+        "alternating_run_end_bit": int(end),
+        "candidate_start_bit": int(candidate_start),
+        "max_consecutive_hdlc_flags": int(hdlc_flags),
+        "validated_frames": [
+            {"framing": name, "payload_hex": body.hex()} for name, body in frames
+        ],
+    }
+
+
+def _select_raw_candidates(
+    candidates: list[dict[str, object]],
+    *,
+    window_s: float,
+    max_files: int = 20,
+) -> list[dict[str, object]]:
+    """Return the strongest non-overlapping physical lock events."""
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            bool(c.get("validated_frames")),
+            float(c.get("repeat_similarity", 0.0)),
+            int(c.get("alternating_run_bits", 0)),
+            int(c.get("max_consecutive_hdlc_flags", 0)),
+        ),
+        reverse=True,
+    )
+    kept: list[dict[str, object]] = []
+    for cand in ranked:
+        if len(kept) >= max(1, int(max_files)):
+            break
+        # Overlapping decode windows around one physical packet produce near-identical candidates.
+        if any(
+            int(old["baud"]) == int(cand["baud"])
+            and abs(float(old["time_s"]) - float(cand["time_s"])) < 0.75 * window_s
+            for old in kept
+        ):
+            continue
+        kept.append(cand)
+    return kept
+
+
+def _persist_raw_candidates(
+    candidates: list[dict[str, object]],
+    output_dir: str | Path,
+    *,
+    window_s: float,
+    max_files: int = 20,
+) -> list[Path]:
+    """Keep the strongest non-overlapping locks and write ASCII raw bits + JSON metadata."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    kept = _select_raw_candidates(candidates, window_s=window_s, max_files=max_files)
+
+    written: list[Path] = []
+    for cand in sorted(kept, key=lambda c: float(c["time_s"])):
+        sign = "p" if float(cand["carrier_hz"]) >= 0 else "m"
+        carrier = abs(int(round(float(cand["carrier_hz"]))))
+        stem = (
+            f"rawbits_t{float(cand['time_s']):010.3f}_b{int(cand['baud'])}_"
+            f"c{sign}{carrier:05d}"
+        )
+        bits_path = out_dir / f"{stem}.rawbits"
+        meta_path = out_dir / f"{stem}.json"
+        arr = np.asarray(cand["_bits"], dtype=np.uint8)
+        metadata = {k: v for k, v in cand.items() if not k.startswith("_")}
+        bits_path.write_text("".join(map(str, arr.tolist())) + "\n", encoding="ascii")
+        meta_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        written.extend((bits_path, meta_path))
+    return written
+
+
+def _refined_anchor_evidence(
+    bits: np.ndarray,
+    *,
+    frames: list[tuple[str, bytes]],
+    min_alt_run: int,
+) -> list[dict[str, object]]:
+    """Candidate anchors inside an event that already passed the strict raw-lock gate."""
+    arr = np.asarray(bits, dtype=np.uint8)
+    alt_threshold = _alt_lock_threshold(len(arr), min_alt_run)
+    weak_threshold = max(12, alt_threshold // 2)
+    spans = _alternating_spans(
+        arr, min_bits=weak_threshold, max_spans=RAW_REFINE_MAX_ANCHORS
+    )
+    hdlc_flags = _max_hdlc_flag_run(arr)
+    if not spans and not frames and hdlc_flags < 4:
+        return []
+    if not spans:  # A checksum/flag lock is still useful even without an alternating preamble.
+        spans = [(0, 0)]
+    strongest = _longest_alt_run(arr)
+    out: list[dict[str, object]] = []
+    for start, end in spans:
+        alt_run = end - start
+        reasons: list[str] = []
+        if frames:
+            reasons.append("crc_valid_frame")
+        if alt_run >= alt_threshold:
+            reasons.append("alternating_preamble")
+        elif alt_run:
+            reasons.append("refined_preamble_anchor")
+        if hdlc_flags >= 4:
+            reasons.append("hdlc_flag_train")
+        out.append({
+            "reasons": reasons,
+            "alternating_run_bits": int(alt_run),
+            "strongest_alternating_run_bits": int(strongest),
+            "alternating_run_threshold_bits": int(alt_threshold),
+            "alternating_run_start_bit": int(start),
+            "alternating_run_end_bit": int(end),
+            "candidate_start_bit": int(max(0, end - 1)),
+            "max_consecutive_hdlc_flags": int(hdlc_flags),
+            "validated_frames": [
+                {"framing": name, "payload_hex": body.hex()} for name, body in frames
+            ],
+        })
+    return out
+
+
+def _repeat_correlation_bits(baud: float) -> int:
+    """Comparison span for repeated bursts: a quarter-second, bounded for cost/statistics."""
+    return min(1024, max(256, int(round(float(baud) * 0.25))))
+
+
+def _refine_raw_candidates(
+    iq: np.ndarray,
+    fs: float,
+    candidates: list[dict[str, object]],
+    framings_to_try: tuple[str, ...],
+    *,
+    window_s: float,
+    overlap: float,
+    capture_offset_s: float,
+    channel_bw_hz: float,
+    allow_carrier_refine: bool,
+    mod_index: float,
+    bt: float,
+    target_sps: int,
+    correct_cfo: bool,
+    recover_timing: bool,
+    raw_min_alt_run: int,
+) -> tuple[list[dict[str, object]], list[tuple[str, bytes, float, float]]]:
+    """Refine established locks and rank repeated bursts without known payload bytes.
+
+    The expensive ensemble runs only after the strict first pass has found a physical event.  Each
+    event tries nearby carrier centres, packet-width filters, 8/16 SPS, and the adjacent overlapping
+    window.  A checksum wins outright; otherwise candidate anchors are compared across separate
+    events at the same baud.  Strong repeated-burst agreement is an objective ranking signal even
+    when every copy has a damaged CRC.
+    """
+    if not candidates:
+        return [], []
+    iq = np.asarray(iq, dtype=np.complex64)
+    n = int(len(iq))
+    win = max(1, int(fs * window_s))
+    step = max(1, int(win * (1.0 - overlap)))
+    events = _select_raw_candidates(
+        candidates, window_s=window_s, max_files=RAW_REFINE_MAX_LOCKS
+    )
+    variants_by_event: list[list[dict[str, object]]] = []
+    discoveries: list[tuple[str, bytes, float, float]] = []
+
+    for event_index, base in enumerate(events):
+        baud = float(base["baud"])
+        base_carrier = float(base["carrier_hz"])
+        base_off = int(base.get("_window_offset_samples", 0))
+        segments = [(base_off, min(n, base_off + win))]
+        previous = (max(0, base_off - step), min(n, base_off + win))
+        if previous not in segments and previous[1] - previous[0] >= win // 2:
+            segments.append(previous)
+        offsets = (
+            tuple(float(f) * baud for f in RAW_REFINE_CARRIER_FRACTIONS)
+            if allow_carrier_refine else (0.0,)
+        )
+        widths = {float(channel_bw_hz)} if channel_bw_hz > 0.0 else set()
+        widths.update(float(m) * baud for m in RAW_REFINE_BW_MULTIPLIERS)
+        widths = {w for w in widths if 0.0 < w < fs}
+        sps_values = sorted({max(2, int(target_sps)), *RAW_REFINE_TARGET_SPS})
+        variants: list[dict[str, object]] = []
+
+        for lo, hi in segments:
+            seg = np.asarray(iq[lo:hi])
+            segment_start_s = float(capture_offset_s + lo / fs)
+            for carrier_offset in offsets:
+                carrier = base_carrier + carrier_offset
+                for width in sorted(widths):
+                    for sps in sps_values:
+                        bits = gfsk.demodulate_capture(
+                            seg, fs, symbol_rate_hz=baud, mod_index=mod_index, bt=bt,
+                            target_sps=sps, carrier_hz=carrier, channel_bw_hz=width,
+                            correct_cfo=correct_cfo, recover_timing=recover_timing,
+                        )
+                        if not len(bits):
+                            continue
+                        validated: list[tuple[str, bytes]] = []
+                        for name in framings_to_try:
+                            frames, _ = framings.deframe(bits, name)
+                            validated.extend((name, body) for body in frames)
+                            discoveries.extend((name, body, carrier, baud) for body in frames)
+                        anchors = _refined_anchor_evidence(
+                            bits, frames=validated, min_alt_run=raw_min_alt_run
+                        )
+                        for evidence in anchors:
+                            start_bit = int(evidence["candidate_start_bit"])
+                            evidence.update({
+                                "capture_time_basis": "seconds from capture start",
+                                "time_s": segment_start_s + start_bit / baud,
+                                "window_start_time_s": segment_start_s,
+                                "preamble_end_time_s": segment_start_s
+                                + int(evidence["alternating_run_end_bit"]) / baud,
+                                "window_s": float((hi - lo) / fs),
+                                "baud": int(round(baud)),
+                                "carrier_hz": float(carrier),
+                                "channel_bw_hz": float(width),
+                                "mod_index": float(mod_index),
+                                "bt": float(bt),
+                                "target_sps": int(sps),
+                                "correct_cfo": bool(correct_cfo),
+                                "recover_timing": bool(recover_timing),
+                                "polarity": 0,
+                                "bit_count": int(len(bits)),
+                                "bit_format": "ASCII 0/1 hard decisions; first char is bit 0",
+                                "refined": True,
+                                "_bits": np.asarray(bits, dtype=np.uint8),
+                                "_event_index": int(event_index),
+                                "_base_carrier_hz": float(base_carrier),
+                                "_window_offset_samples": int(lo),
+                            })
+                            variants.append(evidence)
+
+        # Repeated parameter settings often produce byte-identical hard decisions.  Collapse them
+        # before the correlation matrix so duplicates cannot vote themselves into first place.
+        unique: list[dict[str, object]] = []
+        seen_slices: set[bytes] = set()
+        compare_bits = _repeat_correlation_bits(baud)
+        for variant in variants:
+            start = int(variant["candidate_start_bit"])
+            arr = np.asarray(variant["_bits"], dtype=np.uint8)
+            sample = arr[start : start + compare_bits]
+            if len(sample) < compare_bits:
+                continue
+            key = np.packbits(sample, bitorder="big").tobytes()
+            if key in seen_slices:
+                continue
+            seen_slices.add(key)
+            unique.append(variant)
+            if len(unique) >= RAW_REFINE_MAX_VARIANTS:
+                break
+        variants_by_event.append(unique or [base])
+
+    # Compare only distinct physical events at the same baud.  Mapping bits to +/-1 makes the dot
+    # product an exact Hamming similarity, and abs(dot) naturally accepts discriminator inversion.
+    for left_index, left in enumerate(variants_by_event):
+        for right_index in range(left_index + 1, len(variants_by_event)):
+            right = variants_by_event[right_index]
+            if not left or not right or int(left[0]["baud"]) != int(right[0]["baud"]):
+                continue
+            nbits = _repeat_correlation_bits(float(left[0]["baud"]))
+            left_slices = []
+            right_slices = []
+            for variant in left:
+                start = int(variant["candidate_start_bit"])
+                left_slices.append(
+                    np.asarray(variant["_bits"], dtype=np.uint8)[start : start + nbits]
+                )
+            for variant in right:
+                start = int(variant["candidate_start_bit"])
+                right_slices.append(
+                    np.asarray(variant["_bits"], dtype=np.uint8)[start : start + nbits]
+                )
+            if any(len(x) != nbits for x in (*left_slices, *right_slices)):
+                continue
+            left_pm = 1 - 2 * np.stack(left_slices).astype(np.int16)
+            right_pm = 1 - 2 * np.stack(right_slices).astype(np.int16)
+            agreement = left_pm @ right_pm.T
+            for i, variant in enumerate(left):
+                j = int(np.argmax(np.abs(agreement[i])))
+                score = int(agreement[i, j])
+                similarity = (nbits + abs(score)) / (2.0 * nbits)
+                if similarity > float(variant.get("_repeat_similarity", 0.0)):
+                    variant["_repeat_similarity"] = similarity
+                    variant["_repeat_peer"] = right[j]
+                    variant["_repeat_bits"] = nbits
+                    variant["_repeat_inverted"] = score < 0
+            for j, variant in enumerate(right):
+                i = int(np.argmax(np.abs(agreement[:, j])))
+                score = int(agreement[i, j])
+                similarity = (nbits + abs(score)) / (2.0 * nbits)
+                if similarity > float(variant.get("_repeat_similarity", 0.0)):
+                    variant["_repeat_similarity"] = similarity
+                    variant["_repeat_peer"] = left[i]
+                    variant["_repeat_bits"] = nbits
+                    variant["_repeat_inverted"] = score < 0
+
+    selected: list[dict[str, object]] = []
+    for event_index, variants in enumerate(variants_by_event):
+        best_repeat = max(float(v.get("_repeat_similarity", 0.0)) for v in variants)
+
+        def rank(
+            variant: dict[str, object],
+            best_repeat: float = best_repeat,
+        ) -> tuple[bool, int, float, int, int, float, float, int]:
+            repeat = float(variant.get("_repeat_similarity", 0.0))
+            flags = int(variant.get("max_consecutive_hdlc_flags", 0))
+            if repeat < RAW_REPEAT_MIN_SIMILARITY:
+                repeat_class = 0
+            elif repeat >= best_repeat - RAW_REPEAT_TIE_TOLERANCE:
+                repeat_class = 2  # statistically indistinguishable from this event's best
+            else:
+                repeat_class = 1
+            return (
+                bool(variant.get("validated_frames")),
+                repeat_class,
+                repeat if repeat_class == 1 else 0.0,
+                flags if flags >= 4 else 0,
+                int(variant.get("alternating_run_bits", 0)),
+                -abs(
+                    float(variant["carrier_hz"])
+                    - float(variant.get("_base_carrier_hz", variant["carrier_hz"]))
+                ),
+                -float(variant["channel_bw_hz"]),
+                -abs(int(variant["target_sps"]) - int(target_sps)),
+            )
+
+        best = max(variants, key=rank)
+        similarity = float(best.get("_repeat_similarity", 0.0))
+        if similarity >= RAW_REPEAT_MIN_SIMILARITY:
+            reasons = list(best.get("reasons", []))
+            if "repeated_burst_correlation" not in reasons:
+                reasons.append("repeated_burst_correlation")
+            best["reasons"] = reasons
+            best["ensemble_repeat_similarity"] = similarity
+        best["refinement"] = {
+            "method": "bounded carrier/filter/SPS ensemble; CRC/FCS then repeated-burst ranking",
+            "variants_evaluated": len(variants),
+            "event_index": event_index,
+        }
+        selected.append(best)
+
+    # Report correlation between the SELECTED outputs, not a discarded ensemble peer.  The larger
+    # ensemble score above is still retained as selection provenance.
+    for candidate in selected:
+        baud = float(candidate["baud"])
+        nbits = _repeat_correlation_bits(baud)
+        start = int(candidate["candidate_start_bit"])
+        bits = np.asarray(candidate["_bits"], dtype=np.uint8)[start : start + nbits]
+        best_peer: dict[str, object] | None = None
+        best_score = 0
+        for peer in selected:
+            if peer is candidate or int(peer["baud"]) != int(candidate["baud"]):
+                continue
+            peer_start = int(peer["candidate_start_bit"])
+            peer_bits = np.asarray(peer["_bits"], dtype=np.uint8)[
+                peer_start : peer_start + nbits
+            ]
+            if len(bits) != nbits or len(peer_bits) != nbits:
+                continue
+            score = int(np.sum((1 - 2 * bits.astype(np.int16))
+                               * (1 - 2 * peer_bits.astype(np.int16))))
+            if abs(score) > abs(best_score):
+                best_score = score
+                best_peer = peer
+        if best_peer is None:
+            continue
+        similarity = (nbits + abs(best_score)) / (2.0 * nbits)
+        if similarity < RAW_REPEAT_MIN_SIMILARITY:
+            continue
+        candidate["repeat_similarity"] = similarity
+        candidate["repeat_correlation"] = {
+            "compared_bits": nbits,
+            "matching_bits": int(round(similarity * nbits)),
+            "similarity": similarity,
+            "inverted": best_score < 0,
+            "peer_time_s": float(best_peer["time_s"]),
+            "peer_carrier_hz": float(best_peer["carrier_hz"]),
+        }
+    return selected, discoveries
+
+
+def _usable_sweep_bauds(fs: float, labelled: float) -> tuple[float, ...]:
+    """All requested rates that fit the recorded channel, plus a usable nonstandard label."""
+    rates = {float(b) for b in SWEEP_BAUDS if 0 < float(b) <= float(fs) / 2.0}
+    if 0 < float(labelled) <= float(fs) / 2.0:
+        rates.add(float(labelled))
+    return tuple(sorted(rates))
 
 
 def detect_baud(
@@ -284,22 +886,31 @@ def decode_pass(
     *, exclude_hz: float | None = None, exclude_bw_hz: float = 12000.0,
     channel_bw_hz: float = 0.0, window_s: float = 1.0, overlap: float = 0.5,
     carriers: list[float] | None = None, bauds: tuple[float, ...] | None = None,
+    carrier_count: int = DEFAULT_CARRIER_COUNT,
+    mod_index: float = DEFAULT_MOD_INDEX, bt: float = DEFAULT_BT, target_sps: int = 16,
+    correct_cfo: bool = True, recover_timing: bool = False,
+    raw_bits_dir: str | Path | None = None, capture_offset_s: float = 0.0,
+    raw_min_alt_run: int = 0,
+    refine_raw: bool = True,
+    raw_outputs: list[Path] | None = None,
 ) -> dict[str, dict]:
     """Whole-pass decode of a BURSTY GFSK downlink recorded next to a strong CONTINUOUS carrier.
 
     The single-window carrier-recovering sweep (:func:`framing_sweep`) demodulates one big window
     at one carrier — which fails here two ways: it can only lock ONE carrier (the loud continuous
     interferer wins the CFO/discriminator) and it covers only part of the pass. This slides SHORT
-    windows over the ENTIRE capture and, per window, de-rotates the strongest NON-interferer peak
-    (the data burst — which tracks Doppler window-to-window with no external track) to DC,
+    windows over the ENTIRE capture and, per window, de-rotates bounded narrow-line and broadband
+    packet candidates (which track Doppler window-to-window with no external track) to DC,
     CHANNEL-FILTERS to reject the interferer (``channel_bw_hz``; default ``2*symbol_rate``), demods,
     and runs each deframer (CRC-gated). DC is always also tried (a near-centre bird). Frames are
     deduped per framing by payload. Returns ``{framing: {"frames": [...], "carriers": {...}}}``.
 
     ``carriers`` forces an explicit per-window candidate list (``--carrier-hz``) instead of the
-    auto {DC, peak-excluding-interferer}. ``bauds`` sweeps several symbol rates per window (the
+    automatic DC/narrow/broadband candidates. ``bauds`` sweeps several symbol rates per window (the
     label can be wrong); ``None`` uses just ``symbol_rate``. The channel filter defaults to
-    ``2*baud`` per swept baud, so a narrow low-baud signal is not drowned by a wide filter."""
+    ``2*baud`` per swept baud, so a narrow low-baud signal is not drowned by a wide filter.
+    When raw output is requested, ``refine_raw`` runs the bounded post-lock ensemble and uses
+    repeated-burst correlation without any known payload bytes."""
     iq = np.asarray(iq, dtype=np.complex64)
     n = int(len(iq))
     baud_list = tuple(bauds) if bauds else (symbol_rate,)
@@ -309,29 +920,38 @@ def decode_pass(
         name: {"frames": [], "carriers": set(), "bauds": set()} for name in framings_to_try
     }
     seen: dict[str, set] = {name: set() for name in framings_to_try}
+    raw_candidates: list[dict[str, object]] = []
     for off in range(0, n, step):
         seg = np.asarray(iq[off : off + win])
         if len(seg) < win // 2:
             break
-        if carriers is not None:
-            cands: set[float] = {float(c) for c in carriers}
-        else:
-            cands = {0.0}
-            pk = _peak_excluding(seg, fs, exclude_hz, exclude_bw_hz)
-            if pk is not None:
-                cands.add(float(round(pk)))
+        spectrum = _window_spectrum(seg, fs) if carriers is None else None
         for baud in baud_list:
             ch = channel_bw_hz if channel_bw_hz > 0.0 else 2.0 * baud
-            for carrier in cands:
+            if carriers is not None:
+                cands: set[float] = {float(c) for c in carriers}
+            else:
+                cands = {0.0}
+                cands.update(
+                    float(round(c)) for c in _carrier_candidates(
+                        seg, fs, channel_bw_hz=ch, max_candidates=carrier_count,
+                        exclude_hz=exclude_hz, exclude_bw_hz=exclude_bw_hz,
+                        spectrum=spectrum,
+                    )
+                )
+            for carrier in sorted(cands):
                 bits = gfsk.demodulate_capture(
-                    seg, fs, symbol_rate_hz=baud, mod_index=DEFAULT_MOD_INDEX, bt=DEFAULT_BT,
+                    seg, fs, symbol_rate_hz=baud, mod_index=mod_index, bt=bt,
+                    target_sps=max(2, int(target_sps)),
                     carrier_hz=float(carrier), channel_bw_hz=ch,
-                    correct_cfo=True, recover_timing=False,
+                    correct_cfo=correct_cfo, recover_timing=recover_timing,
                 )
                 if not len(bits):
                     continue
+                validated_here: list[tuple[str, bytes]] = []
                 for name in framings_to_try:
                     frames, _ = framings.deframe(bits, name)  # FCS/CRC-gated + ax25 addr-checked
+                    validated_here.extend((name, f) for f in frames)
                     for f in frames:
                         h = f.hex()
                         if h in seen[name]:
@@ -340,10 +960,67 @@ def decode_pass(
                         out[name]["frames"].append(f)
                         out[name]["carriers"].add(int(carrier))
                         out[name]["bauds"].add(int(baud))
+                if raw_bits_dir is not None:
+                    evidence = _raw_lock_candidate(
+                        bits, frames=validated_here, min_alt_run=raw_min_alt_run,
+                    )
+                    if evidence is not None:
+                        _alt_start, alt_end = _longest_alt_span(bits)
+                        window_start_s = float(capture_offset_s + off / fs)
+                        candidate_start = int(evidence["candidate_start_bit"])
+                        evidence.update({
+                            "capture_time_basis": "seconds from capture start",
+                            "time_s": window_start_s + candidate_start / float(baud),
+                            "window_start_time_s": window_start_s,
+                            "preamble_end_time_s": window_start_s + alt_end / float(baud),
+                            "window_s": float(window_s),
+                            "baud": int(round(baud)),
+                            "carrier_hz": float(carrier),
+                            "channel_bw_hz": float(ch),
+                            "mod_index": float(mod_index),
+                            "bt": float(bt),
+                            "target_sps": int(target_sps),
+                            "correct_cfo": bool(correct_cfo),
+                            "recover_timing": bool(recover_timing),
+                            "polarity": 0,
+                            "bit_count": int(len(bits)),
+                            "bit_format": "ASCII 0/1 hard decisions; first char is bit 0",
+                            "_bits": np.asarray(bits, dtype=np.uint8).copy(),
+                            "_window_offset_samples": int(off),
+                        })
+                        raw_candidates.append(evidence)
+    if raw_bits_dir is not None and raw_candidates:
+        raw_candidates = _select_raw_candidates(
+            raw_candidates, window_s=window_s, max_files=20
+        )
+        if refine_raw:
+            refine_input = raw_candidates[:RAW_REFINE_MAX_LOCKS]
+            unrefined = raw_candidates[RAW_REFINE_MAX_LOCKS:]
+            refined, discoveries = _refine_raw_candidates(
+                iq, fs, refine_input, framings_to_try,
+                window_s=window_s, overlap=overlap, capture_offset_s=capture_offset_s,
+                channel_bw_hz=channel_bw_hz, allow_carrier_refine=carriers is None,
+                mod_index=mod_index, bt=bt, target_sps=target_sps,
+                correct_cfo=correct_cfo, recover_timing=recover_timing,
+                raw_min_alt_run=raw_min_alt_run,
+            )
+            raw_candidates = refined + unrefined
+            for name, body, carrier, baud in discoveries:
+                h = body.hex()
+                if h in seen[name]:
+                    continue
+                seen[name].add(h)
+                out[name]["frames"].append(body)
+                out[name]["carriers"].add(int(round(carrier)))
+                out[name]["bauds"].add(int(round(baud)))
     # Return sorted lists (not sets) for carriers/bauds so the result is JSON-serializable + stable.
     for name in out:
         out[name]["carriers"] = sorted(out[name]["carriers"])
         out[name]["bauds"] = sorted(out[name]["bauds"])
+    if raw_bits_dir is not None and raw_candidates:
+        written = _persist_raw_candidates(raw_candidates, raw_bits_dir, window_s=window_s)
+        if raw_outputs is not None:
+            raw_outputs.extend(written)
     return out
 
 
@@ -461,7 +1138,14 @@ def analyze_file(
     *, run_ax25: bool = False, run_endurosat: bool = False, sweep_window_s: float = 0.0,
     carrier_hz: float | None = None, want_waterfall: bool = False, channel_bw_hz: float = 0.0,
     interferer_hz: float | None = None, no_interferer_exclude: bool = False,
+    auto_exclude_interferer: bool = False,
     decode_window_s: float = 1.0, max_burst_list: int = 40, sweep_baud: bool = True,
+    carrier_count: int = DEFAULT_CARRIER_COUNT,
+    mod_index: float = DEFAULT_MOD_INDEX, bt: float = DEFAULT_BT, target_sps: int = 16,
+    correct_cfo: bool = True, recover_timing: bool = False,
+    raw_bits_dir: str | Path | None = None,
+    raw_min_alt_run: int = 0,
+    refine_raw: bool = True,
 ) -> None:
     cap = load_capture(path, sample_rate_hz)
     dur = len(cap.iq) / cap.fs if cap.fs else 0.0
@@ -490,12 +1174,13 @@ def analyze_file(
     # Doppler-tracking line is a co-visible satellite tens of kHz away, NOT our data. Treat it as an
     # off-channel INTERFERER: exclude it from carrier estimation and channel-filter it out — else it
     # captures the CFO/discriminator and every burst decodes as noise. --interferer-hz overrides the
-    # auto pick (the loud continuous line); --no-exclude-interferer turns it off (clean captures).
+    # explicit pick. Auto-exclusion is OPT-IN: the previous default silently masked a weaker packet
+    # track near the strongest line (cmd_107). Multi-carrier recovery now handles the normal case.
     interferer: float | None = None
     if not no_interferer_exclude:
         if interferer_hz is not None:
             interferer = float(interferer_hz)
-        elif sp is not None and sp["snr_db"] >= CARRIER_SNR_DB:
+        elif auto_exclude_interferer and sp is not None and sp["snr_db"] >= CARRIER_SNR_DB:
             interferer = float(round(sp["peak_hz"]))
     if interferer is not None:
         print(f"  -> treating {interferer:+.0f} Hz as an off-channel interferer (continuous carrier"
@@ -518,12 +1203,17 @@ def analyze_file(
     # a 2400-baud bird). Find the strongest off-interferer burst and report the 0xAA-preamble run
     # per candidate baud — a run >> the ~10-bit noise level flags the true rate even when the
     # framing that follows is encrypted/whitened and won't validate. Label-independent ground truth.
-    sweep_bauds: tuple[float, ...] | None = None
+    sweep_bauds: tuple[float, ...] | None = (
+        _usable_sweep_bauds(cap.fs, symbol_rate) if sweep_baud else None
+    )
     if sweep_baud:
         strong = _strongest_burst_window(decode_iq, cap.fs, interferer)
         if strong is not None:
             wseg, wcar = strong
-            ranked = sorted(detect_baud(wseg, cap.fs, carrier_hz=wcar), key=lambda r: -r[1])
+            ranked = sorted(
+                detect_baud(wseg, cap.fs, carrier_hz=wcar, candidates=sweep_bauds),
+                key=lambda r: -r[1],
+            )
             print(f"baud detect (0xAA-preamble run/baud @ strongest burst carrier {wcar:+.0f} Hz; "
                   "run>>10 = real):")
             for b, r in ranked:
@@ -532,34 +1222,43 @@ def analyze_file(
             top_baud, top_run = ranked[0]
             if top_run >= 32 and abs(top_baud - symbol_rate) > 1:
                 print(f"  NOTE: detected baud {int(top_baud)} != labelled {int(symbol_rate)} - "
-                      "decoding will sweep both.")
-            # sweep the label + the top-2 detected candidates (>=24-bit run) — capped so a harmonic
-            # that also scores doesn't multiply the whole-pass demod cost by 4-5x.
-            sweep_bauds = tuple(sorted({symbol_rate, *[b for b, r in ranked[:2] if r >= 24]}))
+                      "the exhaustive sweep will still decode every usable rate.")
     # PRIMARY decode: whole-pass, short-window, channel-filtered, interferer-excluding. Recovers the
     # bursty downlink frames across the ENTIRE pass (the single-window sweep only saw one carrier /
     # one slice). --carrier-hz forces the data carrier; else it is estimated per window. Sweeps the
-    # detected candidate bauds (CRC-gated, so a wrong baud yields nothing).
+    # complete usable baud set (CRC-gated, so a wrong baud yields nothing).
     forced = None if carrier_hz is None else [float(carrier_hz)]
-    ch = channel_bw_hz if channel_bw_hz > 0 else 2.0 * symbol_rate
     bshow = ("/".join(str(int(b)) for b in sweep_bauds) if sweep_bauds else int(symbol_rate))
     n_baud = len(sweep_bauds) if sweep_bauds else 1
     n_win = max(1, int((len(decode_iq) / cap.fs) / max(decode_window_s * 0.5, 1e-9)))
-    print(f"whole-pass decode ({bshow} Bd, channel~{ch/1e3:.1f} kHz, {decode_window_s:g}s windows, "
-          f"CRC-gated; framings={','.join(selected)}; ~{n_win * n_baud} demods):")
+    channel_text = (f"{channel_bw_hz/1e3:.1f} kHz" if channel_bw_hz > 0 else "2*baud")
+    n_carriers = len(forced) if forced is not None else 1 + max(0, int(carrier_count))
+    print(f"whole-pass decode ({bshow} Bd, channel={channel_text}, {decode_window_s:g}s windows, "
+          f"CRC-gated; framings={','.join(selected)}; up to "
+          f"~{n_win * n_baud * n_carriers} demods):")
+    raw_outputs: list[Path] = []
     res = decode_pass(
         decode_iq, cap.fs, symbol_rate, tuple(selected), exclude_hz=interferer,
         channel_bw_hz=channel_bw_hz, window_s=decode_window_s, carriers=forced, bauds=sweep_bauds,
+        carrier_count=carrier_count, mod_index=mod_index, bt=bt, target_sps=target_sps,
+        correct_cfo=correct_cfo, recover_timing=recover_timing,
+        raw_bits_dir=raw_bits_dir, capture_offset_s=decode_off / cap.fs,
+        raw_min_alt_run=raw_min_alt_run, refine_raw=refine_raw, raw_outputs=raw_outputs,
     )
     for name in selected:
         frames = res[name]["frames"]
-        head = frames[0][:16].hex() if frames else "-"
         cshow = f" carriers~{[f'{c:+d}' for c in res[name]['carriers'][:6]]}" if frames else ""
         bshow2 = f" bauds={res[name]['bauds']}" if frames else ""
-        print(f"  {name}: {len(frames)} frame(s){cshow}{bshow2}  first={head}")
+        print(f"  {name}: {len(frames)} frame(s){cshow}{bshow2}")
+        for k, frame in enumerate(frames):
+            print(f"    frame[{k}]={frame.hex()}")
+    if raw_bits_dir is not None:
+        print(f"  rawbits: {len(raw_outputs) // 2} lock candidate(s) written to "
+              f"{Path(raw_bits_dir).resolve()}")
     # Raw burst view (diagnostic): interferer-aware detection + per-burst carrier + channel filter.
     bursts = find_bursts(decode_iq, cap.fs, exclude_hz=interferer)
     guard = int(cap.fs * 0.003)
+    ch = channel_bw_hz if channel_bw_hz > 0 else 2.0 * symbol_rate
     shown = min(len(bursts), max_burst_list)
     print(f"{len(bursts)} bursts (showing {shown}; per-burst carrier, channel-filtered):")
     for k, (s, e) in enumerate(bursts[:max_burst_list]):
@@ -596,13 +1295,34 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--channel-bw", type=float, default=0.0,
                    help="channel-select bandwidth Hz to reject an off-channel carrier (0=2*baud)")
     p.add_argument("--interferer-hz", type=float, default=None,
-                   help="Hz of a continuous carrier to reject (default: the loud continuous line)")
+                   help="explicit continuous-carrier offset to reject (Hz)")
+    p.add_argument("--auto-exclude-interferer", action="store_true",
+                   help="reject the whole-pass strongest line (off by default; can hide weak data)")
     p.add_argument("--no-exclude-interferer", action="store_true",
-                   help="do NOT treat the loud continuous line as interference (clean captures)")
+                   help="disable interferer rejection, including an explicit/automatic choice")
+    p.add_argument("--carrier-count", type=int, default=DEFAULT_CARRIER_COUNT,
+                   help="non-DC narrow/broad carrier candidates per window (default: 3)")
     p.add_argument("--decode-window-s", type=float, default=1.0,
                    help="whole-pass decode window (s); short -> Doppler ~const per window")
     p.add_argument("--no-sweep-baud", action="store_true",
-                   help="trust --symbol-rate; skip auto baud detection/sweep (1200..19200)")
+                   help="trust --symbol-rate; otherwise decode every usable rate 1200..19200")
+    p.add_argument("--mod-index", type=float, default=DEFAULT_MOD_INDEX,
+                   help="GFSK modulation index (default: 0.5)")
+    p.add_argument("--bt", type=float, default=DEFAULT_BT,
+                   help="GFSK Gaussian BT product (default: 0.5)")
+    p.add_argument("--target-sps", type=int, default=16,
+                   help="demodulator resample target, samples/symbol (default: 16)")
+    p.add_argument("--no-cfo", action="store_true",
+                   help="disable residual carrier-frequency correction")
+    p.add_argument("--recover-timing", action="store_true",
+                   help="enable symbol timing recovery")
+    p.add_argument("--raw-bits-dir", default=None,
+                   help="write full hard-decision streams with lock evidence into this directory")
+    p.add_argument("--raw-min-alt-run", type=int, default=0,
+                   help="override alternating-preamble lock threshold (0=statistical default)")
+    p.add_argument("--no-refine-raw", action="store_true",
+                   help="skip bounded post-lock carrier/filter/SPS and repeat-correlation "
+                        "refinement")
     p.add_argument("--waterfall", action="store_true",
                    help="write a colored spectrogram <capture>.analyze.png (needs matplotlib)")
     args = p.parse_args(argv)
@@ -611,7 +1331,12 @@ def main(argv: list[str] | None = None) -> int:
                  sweep_window_s=args.sweep_window_s, channel_bw_hz=args.channel_bw,
                  interferer_hz=args.interferer_hz,
                  no_interferer_exclude=args.no_exclude_interferer,
+                 auto_exclude_interferer=args.auto_exclude_interferer,
                  decode_window_s=args.decode_window_s, sweep_baud=not args.no_sweep_baud,
+                 carrier_count=args.carrier_count, mod_index=args.mod_index, bt=args.bt,
+                 target_sps=args.target_sps, correct_cfo=not args.no_cfo,
+                 recover_timing=args.recover_timing, raw_bits_dir=args.raw_bits_dir,
+                 raw_min_alt_run=args.raw_min_alt_run, refine_raw=not args.no_refine_raw,
                  carrier_hz=args.carrier_hz, want_waterfall=args.waterfall)
     return 0
 
