@@ -404,12 +404,30 @@ def test_rx_chunks_raises_engine_failure_on_persistent_readstream_error(monkeypa
 def test_rx_chunks_error_count_resets_on_timeout(monkeypatch, fake_soapysdr):
     """SWEEP-1 (#5): a TIMEOUT (or overflow) between errors resets the consecutive-error counter, so
     an isolated blip never fails the pass. 4 errors + timeout + 4 errors (bound=5) must NOT raise
-    EngineFailure — the script exhausts and we hit the sentinel instead."""
+    EngineFailure — the script exhausts and we hit the sentinel instead. (Deaf window huge so the
+    SWEEP-2 time deadline does not fire either.)"""
     fake_soapysdr.SOAPY_SDR_OVERFLOW = -4
     monkeypatch.setattr(bidir, "_MAX_CONSECUTIVE_RX_ERRORS", 5)
+    monkeypatch.setattr(bidir, "_RX_DEAF_TIMEOUT_S", 1e9)
     err = fake_soapysdr.SOAPY_SDR_STREAM_ERROR  # -2
     tmo = fake_soapysdr.SOAPY_SDR_TIMEOUT  # -1
     io = _bidir_io(_ScriptedRxDev([err, err, err, err, tmo, err, err, err, err]))
     with pytest.raises(_RxScriptEnd):  # exhausted WITHOUT an EngineFailure
+        for _ in io.rx_chunks():
+            pass
+
+
+def test_rx_chunks_raises_on_persistent_timeout_deaf_radio(monkeypatch, fake_soapysdr):
+    """SWEEP-2 (gap#1): the far more common deaf-radio mode returns SOAPY_SDR_TIMEOUT forever (stalled
+    RX DMA / dead LNA), which RESETS the hard-error counter every read — so the SWEEP-1 backstop never
+    fired. A time-based no-progress deadline must fail the pass when NOTHING is delivered for the deaf
+    window. With the window at 0, the first timeout past t0 raises."""
+    fake_soapysdr.SOAPY_SDR_OVERFLOW = -4
+    # Negative window so the first timeout past t0 trips deterministically (a fast test loop may not
+    # advance the coarse monotonic clock past 0 within a few iterations).
+    monkeypatch.setattr(bidir, "_RX_DEAF_TIMEOUT_S", -1.0)
+    tmo = fake_soapysdr.SOAPY_SDR_TIMEOUT  # -1
+    io = _bidir_io(_ScriptedRxDev([tmo] * 50))
+    with pytest.raises(bidir.EngineFailure, match="deaf/stalled"):
         for _ in io.rx_chunks():
             pass

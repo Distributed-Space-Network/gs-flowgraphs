@@ -93,6 +93,14 @@ _RX_SETTLE_S = 0.05
 # instead of warn-and-continue spinning forever (a dead radio indistinguishable from a quiet sky).
 # A single good/timeout/overflow read resets the counter, so an isolated blip never trips it.
 _MAX_CONSECUTIVE_RX_ERRORS = 200
+# SWEEP-2 (gap#1): the far more common deaf-radio mode is not a hard error code but a stream that
+# stops DELIVERING samples (dead LNA/cable, stalled RX DMA while the device stays enumerated) —
+# readStream then returns SOAPY_SDR_TIMEOUT indefinitely, which does NOT increment the hard-error
+# counter. A healthy SDR streams noise continuously, so this many seconds with ZERO samples
+# delivered (outside a TX burst, when RX is intentionally paused) is a deaf/stalled radio, not a
+# quiet sky.
+# Generous enough never to false-trip a live pass; well under a typical pass length.
+_RX_DEAF_TIMEOUT_S = 15.0
 # Finding #17: a data-socket peer that stays CONNECTED but stops reading (its TCP
 # receive buffer fills) makes an unbounded ``data_writer.drain()`` await forever —
 # ConnectionReset/BrokenPipe never fire — so the decode loop cannot observe a stop
@@ -1053,23 +1061,46 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
 
         buff = np.empty(_READ_CHUNK, dtype=np.complex64)
         consecutive_errors = 0
+        # SWEEP-2 (gap#1): monotonic time of the last read that made PROGRESS (delivered samples, or
+        # OVERFLOW = samples flowing but dropped; both are signs of life). If nothing makes progress
+        # for _RX_DEAF_TIMEOUT_S the radio is deaf/stalled and the pass must fail, even when the
+        # mode is a benign-looking TIMEOUT storm that never trips the hard-error counter.
+        last_progress = time.monotonic()
         while True:
             if self.tx_active.is_set():
+                # RX is intentionally paused during a TX burst — don't let it count as "deaf".
+                last_progress = time.monotonic()
                 time.sleep(0.001)
                 continue
             with self._lock:
                 sr = self._dev.readStream(self._rx_stream, [buff], len(buff), timeoutUs=200_000)
+            now = time.monotonic()
             if sr.ret > 0:
                 consecutive_errors = 0
-                if time.monotonic() < self._rx_settle_until:
+                last_progress = now
+                if now < self._rx_settle_until:
                     continue  # R-15: post-reactivation settling transient — discard
                 # R-14: hardware-rate capture → modem-rate chunks (stateful,
                 # exact integer factor).
                 out = self._decim.process(buff[: sr.ret].copy())
                 if len(out):
                     yield out
-            elif sr.ret in (SOAPY_SDR_TIMEOUT, SOAPY_SDR_OVERFLOW):
-                consecutive_errors = 0  # timeout/overflow are expected on a quiet/busy stream
+            elif sr.ret == SOAPY_SDR_OVERFLOW:
+                consecutive_errors = 0
+                last_progress = now  # overflow = samples flowing (buffer overran) = a sign of life
+                continue
+            elif sr.ret == SOAPY_SDR_TIMEOUT:
+                # SWEEP-2 (gap#1): a stream that stops delivering samples returns TIMEOUT forever.
+                # This used to just reset the counter and continue, so the SWEEP-1 backstop never
+                # fired on the most common deaf mode. Fail the pass once NOTHING has been delivered
+                # for the deaf window (RX is paused during TX bursts, so those don't count).
+                consecutive_errors = 0
+                if now - last_progress > _RX_DEAF_TIMEOUT_S:
+                    raise EngineFailure(
+                        f"bidir RX: no samples delivered for {now - last_progress:.0f}s "
+                        f"(readStream TIMEOUT) — the RX radio is deaf/stalled; failing the pass "
+                        f"instead of hanging deaf."
+                    )
                 continue
             else:
                 # SWEEP-1 (#5): a hard error code (STREAM_ERROR / CORRUPTION). Warn-and-continue
@@ -1081,11 +1112,14 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                 _log.warning(
                     "bidir RX readStream ret=%d (consecutive error #%d)", sr.ret, consecutive_errors
                 )
-                if consecutive_errors >= _MAX_CONSECUTIVE_RX_ERRORS:
+                if consecutive_errors >= _MAX_CONSECUTIVE_RX_ERRORS or (
+                    now - last_progress > _RX_DEAF_TIMEOUT_S
+                ):
                     raise EngineFailure(
                         f"bidir RX: readStream returned hard error ret={sr.ret} on "
-                        f"{consecutive_errors} consecutive reads — the RX radio is dead/unplugged; "
-                        f"failing the pass instead of hanging deaf."
+                        f"{consecutive_errors} consecutive reads / no samples for "
+                        f"{now - last_progress:.0f}s — the RX radio is dead/unplugged; failing the "
+                        f"pass instead of hanging deaf."
                     )
 
     def transmit_burst(self, cs16: np.ndarray, *, on_first_accept=None, should_abort=None):
