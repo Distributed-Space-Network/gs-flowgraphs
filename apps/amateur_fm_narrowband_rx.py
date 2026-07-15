@@ -58,6 +58,7 @@ from _spawn_contract import (
     pump_data_queue,
     run_command_loop,
     send_event,
+    signal_pump_end,
 )
 from _rateplan import fm_rx_plan
 from _recorder import PassRecorder, first_sample_probe
@@ -509,7 +510,11 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
                 tb.wait()
             except Exception:
                 log.exception("tb.stop/wait raised")
-        data_queue.put(None)
+        # CA-FLOW-005: never a blocking put — with the data peer gone (pump done)
+        # and the queue filled by the producer, `data_queue.put(None)` froze the
+        # event loop forever (no stopped ack, engine only ends by SIGKILL).
+        if not signal_pump_end(data_queue, pump_task):
+            pump_task.cancel()
         signal_task.cancel()
         await asyncio.gather(pump_task, signal_task, return_exceptions=True)
 

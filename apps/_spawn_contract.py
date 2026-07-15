@@ -177,6 +177,40 @@ async def pump_data_queue(
             return
 
 
+def signal_pump_end(
+    queue_: queue.Queue[bytes | None],
+    pump_task: asyncio.Task[None] | None = None,
+) -> bool:
+    """Deliver the ``None`` pump sentinel WITHOUT ever blocking the event loop.
+
+    CA-FLOW-005: shutdown used a blocking ``queue_.put(None)``. When the data
+    peer had already closed (pump exited — nothing consumes) and the GR producer
+    had filled the bounded queue, that put blocked the asyncio loop FOREVER: no
+    stopped ack, no control socket, a frozen engine that only SIGKILL ends.
+
+    - Pump already finished: nothing will ever consume — skip the enqueue.
+    - Queue full: drop the oldest chunk and retry (the graph is stopped or
+      stopping; shutdown owns the queue and the sentinel outranks stale audio).
+
+    Returns True when the sentinel was delivered or is not needed (pump done);
+    False if it could not be delivered within a bounded number of attempts —
+    the caller should cancel the pump task instead of waiting on it.
+    """
+    if pump_task is not None and pump_task.done():
+        return True
+    attempts = (queue_.maxsize if queue_.maxsize > 0 else 0) + 2
+    for _ in range(attempts):
+        try:
+            queue_.put_nowait(None)
+        except queue.Full:
+            with contextlib.suppress(queue.Empty):
+                queue_.get_nowait()
+            continue
+        return True
+    log.error("data queue: could not deliver the pump sentinel (producer still live?)")
+    return False
+
+
 # ----------------------------------------------------------------------
 # Open the three sockets per A.7.2
 # ----------------------------------------------------------------------
@@ -477,5 +511,6 @@ __all__ = [
     "read_command",
     "run_command_loop",
     "send_event",
+    "signal_pump_end",
     "watch_engine_death",
 ]

@@ -300,13 +300,18 @@ def derive_views(
     written: list[Path] = []
     if want_png:
         png = path.with_suffix(".png")
+        # CA-FLOW-007 (R2-21 recurrence): a REUSED pass workspace (retry) can hold a
+        # PNG from an earlier attempt. The old `png.exists()` probe accepted that
+        # stale file as this run's product whenever the writer skipped a too-short
+        # capture. Remove the target first AND trust the writer's explicit outcome.
+        png.unlink(missing_ok=True)
         title = path.stem if metadata_trusted else f"{path.stem}  [AXES UNVERIFIED: no sidecar]"
-        write_waterfall_png(
+        wrote_png = write_waterfall_png(
             png, iq, sample_rate_hz=sample_rate_hz, center_hz=center_hz, title=title)
         # R2-21: write_waterfall_png SKIPS a capture shorter than one FFT window (it refuses
         # to fabricate an all-zeros image). Reporting the path anyway told the caller a
         # product exists when nothing was written — a phantom artifact.
-        if png.exists():
+        if wrote_png:
             written.append(png)
         else:
             log.warning(

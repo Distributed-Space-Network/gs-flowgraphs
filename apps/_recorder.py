@@ -184,12 +184,17 @@ def _write_waterfall_matplotlib(
 def write_waterfall_png(
     path: Path, iq: np.ndarray, *, nfft: int = 1024,
     sample_rate_hz: float = 0.0, center_hz: float = 0.0, title: str | None = None,
-) -> None:
+) -> bool:
     """Write a whole-pass waterfall (time on Y, frequency on X) from the IQ. Colored SatNOGS-style
     (viridis + Power/Frequency/Time axes) via matplotlib when available; otherwise a dependency-free
     8-bit grayscale PNG (so the recorder never fails a pass just because matplotlib is missing).
     ``sample_rate_hz`` scales the frequency axis to kHz; without it the frequency axis is unlabeled
-    (normalized)."""
+    (normalized).
+
+    Returns True when a PNG was written, False when the write was SKIPPED (capture
+    shorter than one FFT window). CA-FLOW-007: callers must use this explicit
+    outcome — probing ``path.exists()`` mistakes a stale PNG left in a reused pass
+    workspace for the product of THIS run."""
     spec = _spectrogram_db(np.asarray(iq, dtype=np.complex64), nfft=nfft)
     if spec.shape[0] == 0:
         # Audit round 2: a capture shorter than one FFT window has no spectrogram. We
@@ -201,13 +206,13 @@ def write_waterfall_png(
             "written (a synthetic all-zeros image would misrepresent the band as quiet)",
             int(np.asarray(iq).size), nfft,
         )
-        return
+        return False
     duration_s = (float(len(iq)) / sample_rate_hz) if sample_rate_hz > 0 else 0.0
     try:
         _write_waterfall_matplotlib(
             path, spec, sample_rate_hz=sample_rate_hz, duration_s=duration_s,
             center_hz=center_hz, title=title)
-        return
+        return True
     except Exception as e:  # noqa: BLE001 — matplotlib absent/broken → grayscale, never fail the pass
         logging.getLogger("gs_flowgraphs._recorder").info(
             "waterfall: matplotlib unavailable (%s); writing grayscale PNG", e)
@@ -215,6 +220,7 @@ def write_waterfall_png(
     rng = hi - lo if hi > lo else 1.0
     img = np.clip((spec - lo) / rng * 255.0, 0, 255).astype(np.uint8)
     path.write_bytes(_encode_png_gray(img))
+    return True
 
 
 # ---------------------------------------------------------------- finalize

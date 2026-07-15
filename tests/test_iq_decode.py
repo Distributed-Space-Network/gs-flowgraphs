@@ -117,6 +117,34 @@ def test_decode_capture_no_false_positives_on_endurosat(tmp_path):
     assert not (tmp_path / "frames.jsonl").exists()
 
 
+def test_main_returns_one_when_append_fails_with_records(tmp_path):
+    # CA-FLOW-006: decoded records that cannot be persisted (frames.jsonl append
+    # OSError — here the target is a directory; ENOSPC is the field shape) must
+    # exit NONZERO. It used to warn and return 0: the frames were silently lost
+    # while the pass looked successfully post-processed.
+    cap = _write_cf32(
+        tmp_path, _guard(_modulate_bits(ccsds.build_tm_frame(_H, bytes(range(50)))))
+    )
+    (tmp_path / "frames.jsonl").mkdir()  # open("a") raises OSError
+    rc = iq_decode.main([
+        "--input", str(cap), "--sample-rate", str(_FS), "--symbol-rate", str(_SYM),
+        "--framings", "ccsds_tm",
+    ])
+    assert rc == 1
+
+
+def test_main_no_records_remains_clean_zero(tmp_path):
+    # No decoded records -> the append never runs -> clean zero, even with the
+    # same unwritable frames.jsonl target present.
+    cap = _write_cf32(tmp_path, _guard(el.transmit(bytes(range(24)), _FS)))
+    (tmp_path / "frames.jsonl").mkdir()
+    rc = iq_decode.main([
+        "--input", str(cap), "--sample-rate", str(_FS), "--symbol-rate", str(_SYM),
+        "--framings", "ccsds_tm",
+    ])
+    assert rc == 0
+
+
 def test_decode_capture_missing_file_and_empty_framings(tmp_path):
     assert iq_decode.decode_capture(
         tmp_path / "nope.cf32", sample_rate_hz=_FS, framings_to_try=("ccsds_tm",)

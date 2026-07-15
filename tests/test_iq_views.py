@@ -36,6 +36,32 @@ def test_derive_views_writes_png_and_csv(tmp_path: Path) -> None:
     assert set(written) == {cf32.with_suffix(".png"), cf32.with_suffix(".csv")}
 
 
+def test_stale_png_in_reused_workspace_is_not_reported_as_produced(tmp_path: Path) -> None:
+    # CA-FLOW-007 (R2-21 recurrence): a retry reuses the pass workspace, which still
+    # holds the PNG from an earlier attempt. This run's capture is SHORTER than one
+    # FFT window, so the writer skips — the stale PNG must be neither reported as
+    # produced nor left on disk to be swept up as this pass's product.
+    cf32 = tmp_path / "retry.cf32"
+    _capture(cf32, n=100)  # < one 1024-point FFT window: waterfall write is skipped
+    stale = cf32.with_suffix(".png")
+    stale.write_bytes(b"\x89PNG stale artifact from the previous attempt")
+    written = derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("png",))
+    assert written == []
+    assert not stale.exists()
+
+
+def test_fresh_png_still_produced_over_a_stale_one(tmp_path: Path) -> None:
+    # The stale file must not suppress a REAL product either: a long-enough capture
+    # replaces it and reports the path.
+    cf32 = tmp_path / "retry_ok.cf32"
+    _capture(cf32)
+    stale = cf32.with_suffix(".png")
+    stale.write_bytes(b"stale")
+    written = derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("png",))
+    assert written == [stale]
+    assert stale.stat().st_size > 100  # a real PNG, not the seeded bytes
+
+
 def test_derive_views_respects_requested_formats(tmp_path: Path) -> None:
     cf32 = tmp_path / "p.cf32"
     _capture(cf32)

@@ -177,14 +177,22 @@ def decode_capture(
 def _append_frames(cf32: Path, records: list[dict]) -> None:
     """Append post-pass frames to the pass's ``frames.jsonl`` (the decoded-frames product), each
     tagged ``post_pass=True``. Runs after the flowgraph exited, so there is no race with the live
-    writer. Never raises."""
+    writer.
+
+    CA-FLOW-006: an append OSError (ENOSPC is reachable even as root) used to be
+    swallowed with a warning — decoded frames were LOST while main still exited 0
+    and the pass looked successfully post-processed. Persistence failure now
+    propagates so the run exits nonzero and the loss is on the record."""
     out = cf32.parent / "frames.jsonl"
     try:
         with out.open("a", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
     except OSError as e:
-        log.warning("iq_decode: frames.jsonl append failed: %s", e)
+        raise RuntimeError(
+            f"iq_decode: frames.jsonl append failed with {len(records)} decoded "
+            f"record(s) unpersisted: {e}"
+        ) from e
 
 
 def _load_track(path_str: str) -> list[tuple[float, float]]:
