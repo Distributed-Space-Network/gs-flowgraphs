@@ -136,6 +136,14 @@ class _FakeSoapyDevice:
 
     def setGain(self, direction, channel, *args):  # noqa: N802
         self.calls.append(("setGain", direction, channel, *args))
+        if len(args) == 2:  # (name, value) — remember for the readback echo
+            self._named = getattr(self, "_named", {})
+            self._named[(direction, channel, args[0])] = float(args[1])
+
+    def getGain(self, direction, channel, name):  # noqa: N802
+        # TX-CHAIN EXTENSION: faithful echo so verify_named_tx_gains passes on a
+        # correctly-applied gain (clamp/failure cases are covered in test_tx_sink_cs16).
+        return getattr(self, "_named", {})[(direction, channel, name)]
 
     def setFrequencyCorrection(self, direction, channel, ppm):  # noqa: N802
         self.calls.append(("setFrequencyCorrection", direction, channel, ppm))

@@ -401,7 +401,18 @@ class BidirIo(Protocol):
         ``on_first_accept`` fires when the sink provably takes samples; ``should_abort``
         is polled between chunks so a pass stop cancels an in-flight burst
         (outcome="cancelled") instead of radiating it to completion. Pauses RX internally
-        if the underlying device is shared (so RX and TX never touch it concurrently)."""
+        if the underlying device is shared (so RX and TX never touch it concurrently).
+
+        HARDWARE-SAFETY EXTENSION (2026-07-15): a shared-device burst leaves RX
+        STOPPED on return. It is resumed only by :meth:`resume_rx` — gs-client's
+        explicit post-burst handshake, sent after the PA is proven quiet and the
+        external T/R switch is back on RX with its settle observed."""
+        ...
+
+    def resume_rx(self) -> None:
+        """Re-activate the RX stream after a burst (the resume_rx handshake). Raises on
+        failure — the caller must fail the pass and leave RX stopped. No-op for I/O with
+        no shared device (bench/file, simulated)."""
         ...
 
     def close(self) -> None: ...
@@ -455,6 +466,12 @@ class FileBidirIo:
             on_first_accept()
         self.sent_samples += n_complex
         return BurstResult(accepted=n_complex, total=n_complex, outcome="complete")
+
+    def resume_rx(self) -> None:
+        """Explicit SIMULATED resume: file I/O shares no device, so there is nothing to
+        re-activate — but the handshake still round-trips so simulated missions exercise
+        the production protocol without weakening it."""
+        return None
 
     def close(self) -> None:
         return None
@@ -981,6 +998,10 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         self._CS16 = SOAPY_SDR_CS16
         self._lock = threading.Lock()
         self.tx_active = threading.Event()
+        # HARDWARE-SAFETY EXTENSION: set when a burst leaves RX stopped; cleared only by
+        # resume_rx() (gs-client's post-burst handshake: PA proven quiet, external T/R
+        # switch back on RX, settle observed). The reader parks while it is set.
+        self.rx_suspended = threading.Event()
         rate = resolve_sample_rate(args, params)  # integer sps — must match the modulator's IQ rate
         self._rate = rate
         dev = SoapySDR.Device(args.sdr_args)
@@ -1004,8 +1025,21 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         dev.setFrequency(SOAPY_SDR_RX, 0, float(args.center_freq_hz))
         with contextlib.suppress(Exception):
             dev.setBandwidth(SOAPY_SDR_RX, 0, hw_rate)
-        # TX on the uplink freq (split-freq). params['uplink_hz'] falls back to the RX centre.
-        uplink_hz = float(params.get("uplink_hz", args.center_freq_hz) or args.center_freq_hz)
+        # TX on the uplink freq (split-freq). TX-CHAIN EXTENSION: the booked uplink
+        # carrier is REQUIRED — the old fallback silently substituted the RX centre as
+        # the TX carrier, radiating on the downlink frequency when the backend omitted
+        # uplink_hz. A missing/invalid uplink carrier fails the spawn COLD.
+        raw_uplink = params.get("uplink_hz")
+        if not isinstance(raw_uplink, (int, float)) or isinstance(raw_uplink, bool):
+            msg = (
+                "bidirectional TX requires params['uplink_hz'] (the booked uplink "
+                "carrier) — refusing to substitute the RX centre as a TX carrier"
+            )
+            raise ValueError(msg)
+        uplink_hz = float(raw_uplink)
+        if not (math.isfinite(uplink_hz) and uplink_hz > 0.0):
+            msg = f"bidirectional TX uplink_hz is unusable: {raw_uplink!r}"
+            raise ValueError(msg)
         self._uplink_hz = uplink_hz
         dev.setSampleRate(SOAPY_SDR_TX, 0, hw_rate)
         require_sample_rate(dev, SOAPY_SDR_TX, 0, hw_rate)
@@ -1040,6 +1074,13 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         if isinstance(self._tx_settings.get("sdr_antenna"), str):
             tx_only["sdr_antenna"] = self._tx_settings["sdr_antenna"]
         configure_soapy_source(_EP(dev, SOAPY_SDR_TX), tx_only, default_gain_db=None)
+        # TX-CHAIN EXTENSION: read back the named PAD just applied and fail COLD —
+        # before ready, long before any key — if it is unreadable, non-finite, or
+        # clamped away from the request. A silently-clamped PAD radiates the wrong
+        # power no matter what the station's calibration table says.
+        from _soapy_tx import verify_named_tx_gains
+
+        verify_named_tx_gains(dev, SOAPY_SDR_TX, self._tx_named)
         apply_corrections(_EP(dev, SOAPY_SDR_RX), ppm=env["ppm"], dc_removal=env["dc_removal"])
         # The uplink LO shares the XTRX reference, so the SAME ppm correction must ride the TX chain
         # — otherwise the calibrated reference error (ppm * uplink_hz, ~kHz) rides on top of the
@@ -1067,8 +1108,11 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         # mode is a benign-looking TIMEOUT storm that never trips the hard-error counter.
         last_progress = time.monotonic()
         while True:
-            if self.tx_active.is_set():
-                # RX is intentionally paused during a TX burst — don't let it count as "deaf".
+            if self.tx_active.is_set() or self.rx_suspended.is_set():
+                # RX is intentionally paused during a TX burst, and stays SUSPENDED after
+                # it until gs-client's resume_rx handshake (the external T/R switch may
+                # still be on TX and the PA may still be energized) — don't let either
+                # window count as "deaf".
                 last_progress = time.monotonic()
                 time.sleep(0.001)
                 continue
@@ -1163,12 +1207,13 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                     self._dev.deactivateStream(self._rx_stream)
                 except Exception as e:  # noqa: BLE001
                     _log.error("bidir TX: RX deactivate FAILED; refusing to key: %r", e)
-                    # RE-AUDIT (P2, 3f): the deactivate is AMBIGUOUS — it may have TAKEN EFFECT (RX
-                    # now broken) before raising. Do NOT return leaving RX dead: best-effort
-                    # RE-ACTIVATE it and set the settle window so the reader drops the transient.
-                    with contextlib.suppress(Exception):
-                        self._dev.activateStream(self._rx_stream)
-                        self._rx_settle_until = time.monotonic() + _RX_SETTLE_S
+                    # RE-AUDIT (P2, 3f): the deactivate is AMBIGUOUS — it may have TAKEN
+                    # EFFECT (RX now broken) before raising. HARDWARE-SAFETY EXTENSION:
+                    # do NOT self-reactivate here — this command arrives with the
+                    # external T/R switch already on TX, so RX stays SUSPENDED and only
+                    # gs-client's resume_rx (after de-key + quiet proof + T/R back on RX
+                    # + settle) may bring it back.
+                    self.rx_suspended.set()
                     return BurstResult(accepted=0, total=n_complex, outcome="error",
                                        detail=f"RX break failed; refusing TX: {e!r}")
                 tx = None
@@ -1206,13 +1251,26 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
                             self._dev.deactivateStream(tx)
                         with contextlib.suppress(Exception):
                             self._dev.closeStream(tx)
-                    with contextlib.suppress(Exception):
-                        self._dev.activateStream(self._rx_stream)  # make RX again (R-15)
-                    # Reader discards until here — reactivation transient.
-                    self._rx_settle_until = time.monotonic() + _RX_SETTLE_S
+                    # HARDWARE-SAFETY EXTENSION (was R-15 self-reactivation): RX stays
+                    # STOPPED after the burst. The external T/R switch may still be on TX
+                    # and the PA may still be enabled when this returns — RX resumes ONLY
+                    # on gs-client's explicit resume_rx command, which arrives after the
+                    # de-key, the PA-quiet proof, the RX selection, and the 2 s settle.
+                    self.rx_suspended.set()
             return result
         finally:
             self.tx_active.clear()
+
+    def resume_rx(self) -> None:
+        """Re-activate RX after a burst — gs-client's explicit post-burst handshake.
+
+        Raises on failure: the command handler then fails the app (nonzero exit), the
+        pass fails, and RX stays stopped — never a silent best-effort resume."""
+        with self._lock:
+            self._dev.activateStream(self._rx_stream)
+            # Reader discards until here — reactivation transient (R-15).
+            self._rx_settle_until = time.monotonic() + _RX_SETTLE_S
+        self.rx_suspended.clear()
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -1263,6 +1321,10 @@ async def amain(args) -> int:
             # must `prepare_transmit` and receive `tx_prepared` BEFORE it keys the PA. An
             # orchestrator that ignores it and keys anyway gets a refusal, not a burst.
             "tx_prepare_required": True,
+            # HARDWARE-SAFETY EXTENSION: a burst leaves RX STOPPED. The orchestrator must
+            # de-key, prove the PA quiet, select RX on the external T/R switch, observe the
+            # settle, and only then send `resume_rx`; the app acks with `rx_resumed`.
+            "rx_resume_required": True,
         },
     )
 
@@ -1334,6 +1396,14 @@ async def amain(args) -> int:
         if not task.cancelled() and task.exception() is not None:
             _log.error("bidir TX: burst task raised (unexpected): %r", task.exception())
 
+    async def _on_resume_rx(_cmd: dict[str, object]) -> None:
+        """HARDWARE-SAFETY EXTENSION: gs-client's post-burst handshake. It arrives only
+        after the de-key, the PA-quiet proof, the external RX selection, and the 2 s
+        settle. A failing resume RAISES: run_command_loop reports handler-failed, the
+        app exits nonzero, the pass fails, and RX stays stopped — no best-effort path."""
+        await asyncio.to_thread(io.resume_rx)
+        await send_event(sockets.status_writer, {"event": "rx_resumed"})
+
     rx_task = asyncio.create_task(
         run_rx(args, sockets, params, io, stop_requested=stop_requested, doppler=doppler, tx=tx),
         name="bidir-rx",
@@ -1349,6 +1419,7 @@ async def amain(args) -> int:
         "prepare_transmit": _on_prepare_transmit,
         "transmit_frame": _on_transmit,
         "transmit_payload_file": _on_transmit,
+        "resume_rx": _on_resume_rx,
     }
     async def _shutdown_engine() -> None:
         """Idempotent engine teardown: settle the RX task and any in-flight TX burst, close the

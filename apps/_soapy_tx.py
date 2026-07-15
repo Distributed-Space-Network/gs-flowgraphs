@@ -33,6 +33,7 @@ unit-test the whole path with a fake device.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -143,6 +144,50 @@ def named_tx_gains(tx_settings: object) -> dict[str, float]:
             "GS_SDR_TX_GAINS with PAD."
         )
     return named
+
+
+# TX-CHAIN EXTENSION (2026-07-15): readback mismatch tolerance. LMS7/XTRX gain elements
+# quantize to ~1 dB steps at most; a readback further than this from the request means the
+# driver CLAMPED it (out-of-range request) and the transmitter would radiate an unintended
+# power. PAD is not dBm — but a wrong PAD is a wrong output, whatever the calibration says.
+NAMED_GAIN_READBACK_TOLERANCE_DB = 0.5
+
+
+def verify_named_tx_gains(
+    dev: object,
+    direction: int,
+    expected: dict[str, float],
+    *,
+    channel: int = 0,
+    tolerance_db: float = NAMED_GAIN_READBACK_TOLERANCE_DB,
+) -> dict[str, float]:
+    """Read back every named TX gain just applied and FAIL CLOSED on any deviation.
+
+    TX-CHAIN EXTENSION: after ``setGain(TX, ch, "PAD", value)`` the value is re-read via
+    ``getGain(TX, ch, "PAD")`` and the app must fail BEFORE ready/key when the readback
+    is unreadable, non-finite, or does not match the request within ``tolerance_db``
+    (a silently-clamped PAD radiates the wrong power). Returns the readback map."""
+    got_map: dict[str, float] = {}
+    for name, want in expected.items():
+        try:
+            got = float(dev.getGain(direction, channel, name))  # type: ignore[attr-defined]
+        except Exception as e:
+            raise TxGainConfigError(
+                f"TX gain {name!r} readback FAILED ({e!r}) — refusing to trust an "
+                f"unverified TX drive"
+            ) from e
+        if not math.isfinite(got):
+            raise TxGainConfigError(
+                f"TX gain {name!r} readback is non-finite ({got!r}) — refusing to key"
+            )
+        if abs(got - float(want)) > tolerance_db:
+            raise TxGainConfigError(
+                f"TX gain {name!r} readback {got:.2f} dB does not match the requested "
+                f"{float(want):.2f} dB (clamped/quantized beyond {tolerance_db} dB) — "
+                f"refusing to key at an unintended drive"
+            )
+        got_map[name] = got
+    return got_map
 
 
 def poll_tx_status(

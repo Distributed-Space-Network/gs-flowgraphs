@@ -793,3 +793,84 @@ def test_a_staged_burst_aborts_before_the_write():
     result = io.transmit_burst(np.zeros(2000, np.int16), should_abort=lambda: True)
     assert result.outcome == "cancelled"
     assert result.accepted == 0
+
+
+# ------------------- HARDWARE-SAFETY EXTENSION: the post-burst resume_rx handshake
+
+
+def test_the_app_ADVERTISES_the_rx_resume_handshake():
+    """A burst leaves RX STOPPED (the external T/R switch may still be on TX and the PA
+    energized when transmit_complete is emitted). The app must say so in `ready`, register
+    the resume command, and ack it — or an orchestrator would assume RX came back."""
+    import inspect
+
+    src = inspect.getsource(bidir.amain)
+    assert '"rx_resume_required": True' in src
+    assert '"resume_rx": _on_resume_rx' in src
+    assert '"event": "rx_resumed"' in src
+
+
+def test_resume_rx_round_trips_and_acks_rx_resumed():
+    """The handshake, protocol-shape (mirrors amain's handler like the stop test above):
+    gs-client — having de-keyed, proven the PA quiet, selected RX and settled 2 s — sends
+    resume_rx; the app resumes the io and acks rx_resumed. FileBidirIo is the explicit
+    SIMULATED implementation: the protocol round-trips identically with no device."""
+    from _spawn_contract import run_command_loop, send_event
+
+    async def _run():
+        io = bidir.FileBidirIo(None, None)
+        socks = _FakeSockets()
+
+        async def _on_resume_rx(_cmd):
+            await asyncio.to_thread(io.resume_rx)
+            await send_event(socks.status_writer, {"event": "rx_resumed"})
+
+        async def _on_stop(_cmd):
+            return None
+
+        handlers = {"resume_rx": _on_resume_rx, "stop": _on_stop}
+        reader = asyncio.StreamReader()
+        for obj in ({"cmd": "resume_rx"}, {"cmd": "stop"}):
+            reader.feed_data((json.dumps(obj) + "\n").encode())
+        reader.feed_eof()
+        reason = await asyncio.wait_for(
+            run_command_loop(reader, handlers, socks.status_writer), timeout=5.0
+        )
+        return reason, _events(socks)
+
+    reason, evs = asyncio.run(_run())
+    assert reason == "stop"
+    assert any(e["event"] == "rx_resumed" for e in evs)
+
+
+def test_a_failing_resume_rx_fails_the_command_loop_and_never_acks():
+    """Failure keeps RX stopped and fails the pass: a raising resume makes
+    run_command_loop report handler-failed (amain converts that to a NONZERO exit), and
+    no rx_resumed ack is ever emitted — there is no best-effort resume."""
+    from _spawn_contract import run_command_loop, send_event
+
+    class _RefusingIo:
+        def resume_rx(self):
+            msg = "activate refused"
+            raise RuntimeError(msg)
+
+    async def _run():
+        io = _RefusingIo()
+        socks = _FakeSockets()
+
+        async def _on_resume_rx(_cmd):
+            await asyncio.to_thread(io.resume_rx)
+            await send_event(socks.status_writer, {"event": "rx_resumed"})
+
+        handlers = {"resume_rx": _on_resume_rx}
+        reader = asyncio.StreamReader()
+        reader.feed_data((json.dumps({"cmd": "resume_rx"}) + "\n").encode())
+        reader.feed_eof()
+        reason = await asyncio.wait_for(
+            run_command_loop(reader, handlers, socks.status_writer), timeout=5.0
+        )
+        return reason, _events(socks)
+
+    reason, evs = asyncio.run(_run())
+    assert reason == "handler-failed"
+    assert not any(e.get("event") == "rx_resumed" for e in evs)

@@ -316,7 +316,7 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
 
     NOTE: TX gain LEVELS are BENCH-PENDING — validate actual PA drive on the bench before a
     real uplink; this only ensures the front-end is configured at all."""
-    from _soapy_tx import named_tx_gains
+    from _soapy_tx import named_tx_gains, verify_named_tx_gains
 
     endpoint = _SoapyDeviceAdapter(dev, direction)
     tx_settings = merge_sdr_params_tx(params)
@@ -326,6 +326,10 @@ def configure_tx_sink(dev, direction: int, params, sample_rate: float) -> dict:
     if isinstance(tx_settings.get("sdr_antenna"), str):
         tx_only["sdr_antenna"] = tx_settings["sdr_antenna"]
     applied = configure_soapy_source(endpoint, tx_only, default_gain_db=None)
+    # TX-CHAIN EXTENSION: read back the named PAD just applied — unreadable, non-finite,
+    # or clamped readback fails the spawn BEFORE ready/key (never radiate an unintended
+    # drive). Raises TxGainConfigError.
+    verify_named_tx_gains(dev, direction, named)
     applied.update(apply_corrections(endpoint, ppm=sdr_env()["ppm"], dc_removal=False))
     with contextlib.suppress(Exception):  # bandwidth setting is optional per driver
         dev.setBandwidth(direction, 0, float(sample_rate))

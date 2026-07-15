@@ -118,6 +118,7 @@ def _bidir_io(dev, *, hw_rate: float = 96_000.0):
     io._hw_rate = hw_rate
     io._lock = threading.Lock()
     io.tx_active = threading.Event()
+    io.rx_suspended = threading.Event()
     io._rx_stream = _RX_STREAM
     io._rx_settle_until = 0.0
     return io
@@ -206,16 +207,22 @@ def test_bidir_transmit_does_not_sleep_between_activate_and_write(monkeypatch):
     assert write_idx == activate_idx + 1
 
 
-def test_bidir_transmit_preserves_rx_break_before_make(monkeypatch):
+def test_bidir_transmit_breaks_rx_first_and_leaves_it_suspended(monkeypatch):
+    # HARDWARE-SAFETY EXTENSION: RX deactivated FIRST, TX opened/activated/written, TX
+    # torn down — and RX left STOPPED (rx_suspended set). The external T/R switch may
+    # still be on TX and the PA energized when the burst returns; only gs-client's
+    # resume_rx (after de-key + quiet proof + RX selection + settle) brings RX back.
     _no_sleep(monkeypatch)
     dev = _FakeSdrDev()
     io = _bidir_io(dev)
 
     io.transmit_burst(_cs16(300))
 
-    # R-15: RX deactivated FIRST, TX opened/activated/written, TX torn down, RX returned LAST.
     assert dev.ops[0] == ("deactivate", _RX_STREAM)
-    assert dev.ops[-1] == ("activate", _RX_STREAM)
+    assert ("activate", _RX_STREAM) not in dev.ops, (
+        "the burst self-reactivated RX before transmit_complete/resume_rx"
+    )
+    assert io.rx_suspended.is_set()
     tx = _tx_stream(dev)
     order = [op[0] for op in dev.ops]
     assert order.index("write") < order.index("close")
@@ -224,10 +231,43 @@ def test_bidir_transmit_preserves_rx_break_before_make(monkeypatch):
     assert sum(1 for op in dev.ops if op[0] == "status") == 1
 
 
+def test_resume_rx_reactivates_and_clears_suspension(monkeypatch):
+    _no_sleep(monkeypatch)
+    dev = _FakeSdrDev()
+    io = _bidir_io(dev)
+    io.transmit_burst(_cs16(300))
+    assert io.rx_suspended.is_set()
+
+    before = time.monotonic()
+    io.resume_rx()
+
+    assert dev.ops[-1] == ("activate", _RX_STREAM)
+    assert not io.rx_suspended.is_set()
+    assert io._rx_settle_until >= before  # reader discards the reactivation transient
+
+
+def test_resume_rx_failure_propagates_and_keeps_rx_suspended(monkeypatch):
+    # A failing resume must RAISE (handler-failed -> nonzero exit -> pass fails); RX
+    # stays suspended — there is no best-effort resume.
+    _no_sleep(monkeypatch)
+
+    class _RefusingDev(_FakeSdrDev):
+        def activateStream(self, stream, *args):
+            raise RuntimeError("activate refused")
+
+    dev = _RefusingDev()
+    io = _bidir_io(dev)
+    io.rx_suspended.set()
+    with pytest.raises(RuntimeError, match="activate refused"):
+        io.resume_rx()
+    assert io.rx_suspended.is_set()
+
+
 def test_bidir_transmit_refuses_when_rx_deactivate_fails(monkeypatch):
     # (3e) if RX cannot be cleanly broken, TX is REFUSED — never keyed on an un-broken stream.
-    # RE-AUDIT (3f/P2): the RX deactivate is AMBIGUOUS (it may have TAKEN EFFECT before raising), so
-    # RX must be best-effort RE-ACTIVATED — not left dead — before the refusal returns.
+    # HARDWARE-SAFETY EXTENSION: the ambiguous deactivate no longer self-reactivates —
+    # the command arrives with the external switch already on TX, so RX stays SUSPENDED
+    # until gs-client's resume_rx handshake.
     _no_sleep(monkeypatch)
     dev = _FakeSdrDev(deactivate_fail=lambda s: s == _RX_STREAM)
     io = _bidir_io(dev)
@@ -238,14 +278,15 @@ def test_bidir_transmit_refuses_when_rx_deactivate_fails(monkeypatch):
     assert "RX break failed" in result.detail
     # No TX stream was ever opened / written (TX refused)...
     assert not any(op[0] in ("setup", "write") for op in dev.ops)
-    # ...but RX was RE-ACTIVATED after the ambiguous deactivate (not left dead).
+    # ...and RX was NOT self-reactivated: it stays suspended for the handshake.
     assert ("deactivate", _RX_STREAM) in dev.ops
-    assert ("activate", _RX_STREAM) in dev.ops
+    assert ("activate", _RX_STREAM) not in dev.ops
+    assert io.rx_suspended.is_set()
     assert not io.tx_active.is_set()
 
 
 def test_bidir_transmit_cleanup_is_independent_when_tx_deactivate_fails(monkeypatch):
-    # (3f) TX deactivate failing must NOT skip TX close or the RX restore.
+    # (3f) TX deactivate failing must NOT skip TX close; RX stays suspended either way.
     _no_sleep(monkeypatch)
     dev = _FakeSdrDev(
         deactivate_fail=lambda s: isinstance(s, tuple) and len(s) == 3 and s[0] == "stream"
@@ -258,10 +299,11 @@ def test_bidir_transmit_cleanup_is_independent_when_tx_deactivate_fails(monkeypa
     assert result.complete  # the write itself succeeded; only teardown deactivate failed
     assert ("deactivate", tx) in dev.ops  # attempted...
     assert ("close", tx) in dev.ops       # ...and close still attempted despite it
-    assert dev.ops[-1] == ("activate", _RX_STREAM)  # ...and RX still restored
+    assert ("activate", _RX_STREAM) not in dev.ops
+    assert io.rx_suspended.is_set()
 
 
-def test_bidir_transmit_returns_rx_even_on_write_error(monkeypatch):
+def test_bidir_transmit_write_error_still_leaves_rx_suspended(monkeypatch):
     _no_sleep(monkeypatch)
     dev = _FakeSdrDev(write_ret=[-7])  # driver error on the first write
     io = _bidir_io(dev)
@@ -269,8 +311,9 @@ def test_bidir_transmit_returns_rx_even_on_write_error(monkeypatch):
     result = io.transmit_burst(_cs16(300))
 
     assert result.outcome == "error"  # truthful, not a fabricated success
-    # a write error must NOT skip the RX return (the finally runs regardless)
-    assert dev.ops[-1] == ("activate", _RX_STREAM)
+    # a write error must NOT self-reactivate RX either — the handshake owns the resume
+    assert ("activate", _RX_STREAM) not in dev.ops
+    assert io.rx_suspended.is_set()
     assert not io.tx_active.is_set()
 
 
@@ -304,6 +347,19 @@ class _GainDev:
 
     def setGain(self, *a):
         self.set_gain_calls.append(a)
+        if len(a) == 4:  # (dir, ch, name, value) — remember for the readback echo
+            self._named = getattr(self, "_named", {})
+            self._named[(a[0], a[1], a[2])] = float(a[3])
+
+    def getGain(self, direction, channel, name):
+        # TX-CHAIN EXTENSION: faithful echo of the last named set, unless the test
+        # scripts a clamp/failure via `gain_readback`.
+        rb = getattr(self, "gain_readback", None)
+        if rb is not None:
+            if isinstance(rb, Exception):
+                raise rb
+            return rb
+        return getattr(self, "_named", {})[(direction, channel, name)]
 
 
 def test_configure_tx_sink_uses_named_pad_not_overall_setgain(monkeypatch):
@@ -331,6 +387,48 @@ def test_configure_tx_sink_without_named_pad_refuses(monkeypatch):
     with pytest.raises(TxGainConfigError):
         txapp.configure_tx_sink(dev, _TX, {}, 2_000_000.0)
     assert dev.set_gain_calls == []  # nothing was configured before the refusal
+
+
+def test_configure_tx_sink_refuses_a_clamped_pad_readback(monkeypatch):
+    # TX-CHAIN EXTENSION: the driver clamping the requested PAD (readback != request)
+    # must fail the spawn BEFORE ready/key — never radiate at an unintended drive.
+    monkeypatch.delenv("GS_SDR_TX_GAINS", raising=False)
+    monkeypatch.delenv("GS_SDR_TX_GAIN_DB", raising=False)
+    dev = _GainDev()
+    dev.gain_readback = -12.0  # driver clamped the requested -40 to -12
+
+    with pytest.raises(TxGainConfigError, match="does not match"):
+        txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": -40.0}}, 2_000_000.0)
+
+
+def test_configure_tx_sink_refuses_an_unreadable_pad_readback(monkeypatch):
+    monkeypatch.delenv("GS_SDR_TX_GAINS", raising=False)
+    monkeypatch.delenv("GS_SDR_TX_GAIN_DB", raising=False)
+    dev = _GainDev()
+    dev.gain_readback = RuntimeError("getGain not supported")
+
+    with pytest.raises(TxGainConfigError, match="readback FAILED"):
+        txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": -40.0}}, 2_000_000.0)
+
+
+def test_configure_tx_sink_refuses_a_non_finite_pad_readback(monkeypatch):
+    monkeypatch.delenv("GS_SDR_TX_GAINS", raising=False)
+    monkeypatch.delenv("GS_SDR_TX_GAIN_DB", raising=False)
+    dev = _GainDev()
+    dev.gain_readback = float("nan")
+
+    with pytest.raises(TxGainConfigError, match="non-finite"):
+        txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": -40.0}}, 2_000_000.0)
+
+
+def test_verified_pad_readback_passes_within_tolerance(monkeypatch):
+    # A faithful (or ≤0.5 dB quantized) readback is accepted.
+    monkeypatch.delenv("GS_SDR_TX_GAINS", raising=False)
+    monkeypatch.delenv("GS_SDR_TX_GAIN_DB", raising=False)
+    dev = _GainDev()
+
+    applied = txapp.configure_tx_sink(dev, _TX, {"sdr_tx_gains": {"PAD": -40.0}}, 2_000_000.0)
+    assert applied  # configured and verified without raising
 
 
 # ------------------------------------------------- ax25 pre-key CS16 builder (3a / 3g)
@@ -429,5 +527,35 @@ def test_rx_chunks_raises_on_persistent_timeout_deaf_radio(monkeypatch, fake_soa
     tmo = fake_soapysdr.SOAPY_SDR_TIMEOUT  # -1
     io = _bidir_io(_ScriptedRxDev([tmo] * 50))
     with pytest.raises(bidir.EngineFailure, match="deaf/stalled"):
+        for _ in io.rx_chunks():
+            pass
+
+
+def test_rx_chunks_parks_while_rx_is_suspended(monkeypatch, fake_soapysdr):
+    """HARDWARE-SAFETY EXTENSION: while rx_suspended is set (post-burst, awaiting the
+    resume_rx handshake) the reader must PARK — no readStream calls, and the deaf
+    deadline must not fire (the pause is intentional, not a dead radio)."""
+    fake_soapysdr.SOAPY_SDR_OVERFLOW = -4
+    monkeypatch.setattr(bidir, "_RX_DEAF_TIMEOUT_S", -1.0)  # any read would trip instantly
+
+    class _Park(Exception):
+        pass
+
+    calls = {"n": 0}
+
+    def _sleep(_s):
+        calls["n"] += 1
+        if calls["n"] >= 5:
+            raise _Park
+
+    monkeypatch.setattr(bidir.time, "sleep", _sleep)
+
+    class _MustNotRead:
+        def readStream(self, *_a, **_k):
+            raise AssertionError("readStream called while RX was suspended")
+
+    io = _bidir_io(_MustNotRead())
+    io.rx_suspended.set()
+    with pytest.raises(_Park):  # parked through 5 sleep ticks without a single read
         for _ in io.rx_chunks():
             pass
