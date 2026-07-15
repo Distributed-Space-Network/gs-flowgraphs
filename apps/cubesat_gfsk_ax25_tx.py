@@ -612,6 +612,14 @@ async def amain(args) -> int:
     handlers = {"start": _on_start, "stop": _on_stop}
     try:
         reason = await run_command_loop(sockets.control_reader, handlers, sockets.status_writer)
+        # SWEEP-3 (P1 #3): request the in-flight burst to ABORT before awaiting it. run_command_loop
+        # returns on `stop` (stop_requested already set by _on_stop), on EOF (transport loss =
+        # orchestrator gone = authority revoked), or on a handler failure — in ALL of these the pass
+        # is ending, so the burst's cooperative should_abort must fire. Without setting it here, an
+        # EOF / handler-failed exit awaited the burst to COMPLETION and kept writing to the keyed TX
+        # stream after authority was revoked (violating _soapy_tx's never-write-after-revoke
+        # contract). Matches the bidir _shutdown_engine, which sets stop_requested before awaiting.
+        stop_requested.set()
         # Settle the in-flight burst so its transmit_complete/error is flushed and any failure is
         # observed BEFORE we decide the exit code or ack the stop.
         t = burst_task["t"]

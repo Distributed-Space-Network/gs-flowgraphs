@@ -89,6 +89,34 @@ def test_amain_stays_responsive_to_stop_during_burst_and_exits_0(monkeypatch: An
     assert b'"stopped"' in bytes(status.buf), "no stopped ack after a clean stop"
 
 
+def test_amain_aborts_burst_on_control_eof(monkeypatch: Any) -> None:
+    """SWEEP-3 (P1 #3): control EOF mid-burst = transport loss = orchestrator gone = authority lost.
+    The burst must be ABORTED (should_abort fires), not radiated to completion after authority was
+    revoked. amain must set stop_requested before awaiting the in-flight burst on the EOF path."""
+
+    async def _run() -> tuple[int, bool]:
+        running = asyncio.Event()
+        aborted = {"v": False}
+
+        async def _emit(_status: Any, *_a: Any, should_abort: Any, **_k: Any) -> None:
+            running.set()
+            while not should_abort():
+                await asyncio.sleep(0.001)
+            aborted["v"] = True
+
+        reader, _status = _harness(monkeypatch, _emit)
+        amain_task = asyncio.create_task(txapp.amain(_args()))
+        reader.feed_data(b'{"cmd":"start"}\n')
+        await asyncio.wait_for(running.wait(), timeout=5.0)
+        reader.feed_eof()  # control EOF mid-burst — no `stop` was ever sent
+        rc = await asyncio.wait_for(amain_task, timeout=5.0)
+        return rc, aborted["v"]
+
+    rc, aborted = asyncio.run(_run())
+    assert aborted, "control EOF mid-burst must ABORT the burst (authority revoked), not radiate on"
+    assert rc == 1, "control EOF without stop is transport loss — nonzero exit"
+
+
 def test_amain_burst_failure_exits_nonzero_even_without_a_stop(monkeypatch: Any) -> None:
     """AUDIT ROUND 4 P0 preserved: a burst that RAISES must fail the pass (nonzero exit). The
     done-callback records the failure and feeds control EOF so amain returns 1 even though no `stop`

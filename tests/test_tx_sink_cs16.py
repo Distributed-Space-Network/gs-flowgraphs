@@ -418,10 +418,10 @@ def test_rx_chunks_error_count_resets_on_timeout(monkeypatch, fake_soapysdr):
 
 
 def test_rx_chunks_raises_on_persistent_timeout_deaf_radio(monkeypatch, fake_soapysdr):
-    """SWEEP-2 (gap#1): the far more common deaf-radio mode returns SOAPY_SDR_TIMEOUT forever (stalled
-    RX DMA / dead LNA), which RESETS the hard-error counter every read — so the SWEEP-1 backstop never
-    fired. A time-based no-progress deadline must fail the pass when NOTHING is delivered for the deaf
-    window. With the window at 0, the first timeout past t0 raises."""
+    """SWEEP-2 (gap#1): the far more common deaf-radio mode returns SOAPY_SDR_TIMEOUT forever
+    (stalled RX DMA / dead LNA), which RESETS the hard-error counter every read — so the SWEEP-1
+    backstop never fired. A time-based no-progress deadline must fail the pass when NOTHING is
+    delivered for the deaf window. With a negative window, the first timeout past t0 raises."""
     fake_soapysdr.SOAPY_SDR_OVERFLOW = -4
     # Negative window so the first timeout past t0 trips deterministically (a fast test loop may not
     # advance the coarse monotonic clock past 0 within a few iterations).
