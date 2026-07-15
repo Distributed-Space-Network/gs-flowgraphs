@@ -355,23 +355,41 @@ async def amain(args) -> int:  # type: ignore[no-untyped-def]
         )
         return 1
     started.set()
-    probe = first_sample_probe(ctx.recorder)
-    first: bool | None = None
-    if probe is not None:
-        first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)
-        if not first:
-            log.error("SDR stream active but delivered no samples — failing closed (R-11)")
-            await send_event(
-                sockets.status_writer,
-                {
-                    "event": "error",
-                    "code": "engine-no-samples",
-                    "detail": f"no samples within {_FIRST_SAMPLE_TIMEOUT_S:.0f}s",
-                },
-            )
-            tb.stop()
-            tb.wait()
-            return 1
+    # CA-FLOW-002: the proof must not depend on the unrelated recording flag — with
+    # recording off, the probe now falls back to the SDR source's own delivered-item
+    # counter. And when NO proof can be constructed at all, ready is REFUSED (fail
+    # closed) instead of being declared on zero evidence.
+    probe = first_sample_probe(ctx.recorder, source=ctx.src)
+    if probe is None:
+        log.error(
+            "no first-sample proof can be constructed (recording off, source not "
+            "probeable) — refusing ready; a deaf radio would be undetectable"
+        )
+        await send_event(
+            sockets.status_writer,
+            {
+                "event": "error",
+                "code": "engine-no-proof",
+                "detail": "no first-sample proof available (recorder off, source unprobeable)",
+            },
+        )
+        tb.stop()
+        tb.wait()
+        return 1
+    first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)
+    if not first:
+        log.error("SDR stream active but delivered no samples — failing closed (R-11)")
+        await send_event(
+            sockets.status_writer,
+            {
+                "event": "error",
+                "code": "engine-no-samples",
+                "detail": f"no samples within {_FIRST_SAMPLE_TIMEOUT_S:.0f}s",
+            },
+        )
+        tb.stop()
+        tb.wait()
+        return 1
 
     await send_event(
         sockets.status_writer,

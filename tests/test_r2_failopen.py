@@ -231,6 +231,21 @@ class TestTheDeafRadioProofDoesNotDependOnRecording:
             src = (_APPS / app).read_text(encoding="utf-8")
             assert 'source=getattr(ctx, "src", None)' in src, app
 
+    def test_the_fm_rx_app_passes_its_source_and_fails_closed(self) -> None:
+        """CA-FLOW-002: the FM app was the one RX app still deriving the proof from the
+        recorder alone — recording off meant probe None, the check was SKIPPED, and
+        ready carried first_samples=null for a deaf source. It must pass its source AND
+        refuse ready when no proof can be constructed at all."""
+        src = (_APPS / "amateur_fm_narrowband_rx.py").read_text(encoding="utf-8")
+        assert "first_sample_probe(ctx.recorder, source=ctx.src)" in src
+        assert '"engine-no-proof"' in src, "an unprovable stream must REFUSE ready"
+        assert "if probe is None:" in src, "the probe-None case must fail closed, not skip"
+
+    def test_no_proof_available_returns_none(self) -> None:
+        from _recorder import first_sample_probe
+
+        assert first_sample_probe(None) is None  # nothing to prove with — caller must refuse
+
 
 class TestIqViewsDoesNotShipPhantomOrMislabelledProducts:
     def test_a_png_that_was_never_written_is_not_reported(self, tmp_path) -> None:
