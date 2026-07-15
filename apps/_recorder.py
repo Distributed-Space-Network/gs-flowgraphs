@@ -108,26 +108,109 @@ _log = logging.getLogger("gs_flowgraphs._recorder")
 
 
 # ---------------------------------------------------------------- waterfall PNG
+#
+# EXT-WF-001: docs/waterfall_guide.md is the CONTRACT for this pipeline — complex
+# Hann-windowed FFTs (an IQ real-cast would mirror the spectrum), 75 % overlap
+# with several FFTs averaged per row in LINEAR power, power normalized by
+# sum(window)² so every value is ABSOLUTE dBFS (a full-scale tone peaks at
+# 0 dBFS), the DC bins interpolated (no black centre line), and ONE global
+# display window for the whole image — never per-row/AGC normalization, which
+# stretches noise across the colormap and washes weak signals out entirely.
+
+_WF_NFFT = 2048            # ~23 Hz/bin at 48 kHz
+_WF_STEP_DIV = 4           # 75 % overlap -> step = nfft // 4
+_WF_N_AVG = 8              # FFTs averaged per waterfall row (linear domain)
+_WF_MAX_ROWS = 1024        # bounds image height AND total FFT work
+_WF_DC_BINS = 3            # centre bins replaced by neighbour interpolation (bin-relative: leakage
+                           # is ±1 bin at ANY sample rate, so 3 is universal)
+_WF_LOG_FLOOR = 1e-30      # keeps log10(0) finite (guide §4.5)
+# Global display window geometry (guide §6). The guide's literal -95..-62 dBFS
+# assumes the reference station's ≈ -85 dBFS/bin noise floor — dBFS-per-bin moves
+# with front-end gain, analog bandwidth and sample rate, so a hard-coded window is
+# NOT universal. We keep the guide's GEOMETRY (floor sits 10 dB above the dark
+# end; 33 dB contrast span) anchored to each capture's MEASURED global floor:
+# a capture at the reference floor reproduces -95..-62 exactly, and any other
+# gain/rate/bandwidth gets the same SatNOGS look. Still ONE window per image.
+_WF_SPAN_DB = 33.0
+_WF_FLOOR_TO_VMIN_DB = 10.0
+# SatNOGS 13-stop colormap (guide §7): dark purple -> blue -> cyan -> green ->
+# yellow. The hottest signal is YELLOW — there is deliberately no red.
+_WF_CMAP_STOPS = [
+    (0.067, 0.004, 0.118), (0.125, 0.031, 0.271), (0.161, 0.094, 0.392),
+    (0.165, 0.180, 0.463), (0.137, 0.278, 0.463), (0.106, 0.376, 0.439),
+    (0.114, 0.502, 0.412), (0.180, 0.627, 0.349), (0.322, 0.749, 0.259),
+    (0.522, 0.827, 0.153), (0.722, 0.878, 0.094), (0.878, 0.902, 0.094),
+    (0.965, 0.902, 0.125),
+]
 
 
-def _spectrogram_db(iq: np.ndarray, *, nfft: int = 1024, max_rows: int = 1024) -> np.ndarray:
-    """STFT magnitude in dB, shape (time, freq), DC-centered. Hops are sized so the
-    whole capture fits in ≤ ``max_rows`` time slices (so the image stays bounded)."""
+def _spectrogram_dbfs(
+    iq: np.ndarray, *, nfft: int = _WF_NFFT, max_rows: int = _WF_MAX_ROWS,
+    n_avg: int = _WF_N_AVG,
+) -> np.ndarray:
+    """Absolute-dBFS spectrogram, shape (time, freq), DC-centred, per the guide.
+
+    Each row is the LINEAR-domain mean of ``n_avg`` complex Hann FFTs whose
+    starts are spread evenly across the row's time span, normalized by
+    sum(window)² (0 dBFS = full-scale tone). Long captures keep ≤ ``max_rows``
+    rows by widening each row's span — every row still averages real data
+    (the old implementation hopped over the gap, so a burst between hops
+    simply never appeared). The ``_WF_DC_BINS`` centre bins are interpolated
+    from their neighbours (an SDR DC spike would otherwise paint a line)."""
     if iq.size < nfft:
         # Audit round 2: this used to return a zeros row, which write_waterfall_png
         # then normalized into a perfectly valid-looking uniform PNG — a fabricated
         # spectrogram for a capture that is too short to have one. An empty array
         # makes the caller skip the artifact instead of inventing it.
         return np.zeros((0, nfft), dtype=np.float32)
-    slices = max(1, (iq.size - nfft) // nfft + 1)
-    hop = max(nfft, ((iq.size - nfft) // max_rows) + 1) if slices > max_rows else nfft
+    step = max(1, nfft // _WF_STEP_DIV)
+    total_ffts = 1 + (iq.size - nfft) // step
+    rows_n = int(min(max_rows, max(1, total_ffts // n_avg)))
+    starts = (
+        np.linspace(0, iq.size - nfft, rows_n * n_avg).astype(np.int64)
+        .reshape(rows_n, n_avg)
+    )
     win = np.hanning(nfft).astype(np.float32)
-    starts = range(0, iq.size - nfft + 1, hop)
-    rows = [
-        20.0 * np.log10(np.abs(np.fft.fftshift(np.fft.fft(iq[s : s + nfft] * win))) + 1e-12)
-        for s in starts
-    ]
-    return np.asarray(rows, dtype=np.float32)
+    norm = float(np.sum(win)) ** 2
+    out = np.empty((rows_n, nfft), dtype=np.float32)
+    for r in range(rows_n):
+        # np.asarray keeps memmap reads chunked to one row's segments at a time.
+        segs = np.stack([np.asarray(iq[s : s + nfft]) for s in starts[r]])
+        segs = segs.astype(np.complex64, copy=False) * win  # COMPLEX windowing — never a real cast
+        power = np.abs(np.fft.fftshift(np.fft.fft(segs, axis=1), axes=1)) ** 2 / norm
+        out[r] = 10.0 * np.log10(power.mean(axis=0) + _WF_LOG_FLOOR)
+    _interpolate_dc_bins(out)
+    return out
+
+
+def _interpolate_dc_bins(spec_db: np.ndarray, *, dc_bins: int = _WF_DC_BINS) -> None:
+    """Replace the ``dc_bins`` centre bins with a linear ramp between their
+    outer neighbours, in place (guide §5 — never NaN: NaN renders black)."""
+    if spec_db.shape[0] == 0 or spec_db.shape[1] < dc_bins + 2:
+        return
+    center = spec_db.shape[1] // 2
+    half = dc_bins // 2
+    left = spec_db[:, center - half - 1]
+    right = spec_db[:, center + half + 1]
+    for j, d in enumerate(range(-half, half + 1)):
+        t = (j + 1) / (dc_bins + 1)
+        spec_db[:, center + d] = left * (1.0 - t) + right * t
+
+
+def _display_window_dbfs(spec_db: np.ndarray) -> tuple[float, float]:
+    """The ONE global display window for the whole image (guide §6) — never per-row.
+
+    Anchored to the capture's measured GLOBAL noise floor: the median dBFS over
+    every bin of every row (robust — real signals occupy few bins; the anti-alias
+    band edges pull it down only slightly), placed ``_WF_FLOOR_TO_VMIN_DB`` above
+    the dark end with the guide's ``_WF_SPAN_DB`` contrast span. This holds at any
+    sample rate, bandwidth or front-end gain; a floor at the guide's reference
+    level (≈ -85 dBFS/bin) reproduces its literal -95..-62 dBFS window exactly.
+    Known limit: interference occupying >50 % of all bins raises the floor
+    estimate and darkens weak signals — still global, never per-row AGC."""
+    floor = float(np.median(spec_db))
+    vmin = floor - _WF_FLOOR_TO_VMIN_DB
+    return vmin, vmin + _WF_SPAN_DB
 
 
 def _encode_png_gray(img: np.ndarray) -> bytes:
@@ -154,48 +237,73 @@ def _encode_png_gray(img: np.ndarray) -> bytes:
 
 def _write_waterfall_matplotlib(
     path: Path, spec: np.ndarray, *, sample_rate_hz: float, duration_s: float,
-    center_hz: float, title: str | None,
+    center_hz: float, title: str | None, vmin: float, vmax: float,
 ) -> None:
-    """SatNOGS-style colored waterfall: viridis, a Power(dB) colorbar, Frequency(kHz) X + Time(s) Y.
-    Raises when matplotlib is unavailable so :func:`write_waterfall_png` falls back to grayscale."""
+    """SatNOGS-style colored waterfall per the guide: the 13-stop SatNOGS colormap
+    (max = yellow, no red), dark theme, a Power(dBFS) colorbar, Frequency(kHz) X +
+    Time(s) Y, one FIXED global scale, and a processing-parameters footer.
+    Raises when matplotlib is unavailable so :func:`write_waterfall_png` falls back
+    to grayscale."""
     import matplotlib  # noqa: PLC0415 — optional; falls back to grayscale when absent
 
     matplotlib.use("Agg")  # headless (no display on the bench)
     import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib.colors import LinearSegmentedColormap  # noqa: PLC0415
 
+    cmap = LinearSegmentedColormap.from_list("satnogs", _WF_CMAP_STOPS, N=256)
     half = (sample_rate_hz / 2.0) / 1e3 if sample_rate_hz > 0 else 0.5  # kHz, DC-centered
     dur = duration_s if duration_s > 0 else float(spec.shape[0])
-    lo, hi = float(np.percentile(spec, 5.0)), float(np.percentile(spec, 99.5))
-    fig, ax = plt.subplots(figsize=(7, 11))
+    fig = plt.figure(figsize=(9, 13), dpi=100, facecolor="black")
+    ax = fig.add_subplot(111)
     im = ax.imshow(
-        spec, aspect="auto", origin="lower", cmap="viridis",
-        extent=(-half, half, 0.0, dur), vmin=lo, vmax=(hi if hi > lo else lo + 1.0),
-        interpolation="nearest",
+        # flipud + default (upper) origin with extent 0..dur renders time
+        # increasing upward, matching the guide's reference renders.
+        np.flipud(spec), aspect="auto", cmap=cmap,
+        extent=(-half, half, 0.0, dur), vmin=vmin, vmax=vmax,
+        interpolation="bilinear",
     )
-    ax.set_xlabel("Frequency (kHz)")
-    ax.set_ylabel("Time (seconds)")
-    ax.set_title(title or (f"{center_hz/1e6:.4f} MHz" if center_hz else "waterfall"))
-    fig.colorbar(im, ax=ax, label="Power (dB)")
+    ax.set_facecolor("black")
+    ax.set_xlabel("Frequency (kHz)", fontsize=10, fontweight="bold", color="#cccccc")
+    ax.set_ylabel("Time (seconds)", fontsize=10, fontweight="bold", color="#cccccc")
+    ax.set_title(
+        title or (f"Waterfall - {center_hz/1e6:.4f} MHz" if center_hz else "waterfall"),
+        fontsize=12, fontweight="bold", color="#dddddd",
+    )
+    ax.grid(True, alpha=0.12, color="#888888", linewidth=0.3)
+    ax.tick_params(colors="#888888", labelsize=8)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label("Power (dBFS)", color="#cccccc", fontsize=9)
+    cbar.ax.yaxis.set_tick_params(color="#888888")
+    plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="#888888")
+    info = (
+        f"FS: {sample_rate_hz/1e3:.0f} kHz | FFT: {spec.shape[1]} | 75% Overlap | "
+        f"Avg: {_WF_N_AVG}\nHann Window | Floor-anchored Global Scale: {vmin:.0f} to "
+        f"{vmax:.0f} dBFS | Duration: {dur:.0f}s | Complex FFT | No per-row AGC"
+    )
+    ax.text(0.5, -0.045, info, transform=ax.transAxes, fontsize=6,
+            ha="center", va="top", color="#666666", fontfamily="monospace")
     fig.tight_layout()
-    fig.savefig(str(path), dpi=100)
+    fig.savefig(str(path), dpi=100, facecolor="black", edgecolor="none")
     plt.close(fig)
 
 
 def write_waterfall_png(
-    path: Path, iq: np.ndarray, *, nfft: int = 1024,
+    path: Path, iq: np.ndarray, *, nfft: int = _WF_NFFT,
     sample_rate_hz: float = 0.0, center_hz: float = 0.0, title: str | None = None,
 ) -> bool:
-    """Write a whole-pass waterfall (time on Y, frequency on X) from the IQ. Colored SatNOGS-style
-    (viridis + Power/Frequency/Time axes) via matplotlib when available; otherwise a dependency-free
-    8-bit grayscale PNG (so the recorder never fails a pass just because matplotlib is missing).
-    ``sample_rate_hz`` scales the frequency axis to kHz; without it the frequency axis is unlabeled
-    (normalized).
+    """Write a whole-pass waterfall (time on Y, frequency on X) from the IQ, per
+    docs/waterfall_guide.md: absolute dBFS with one GLOBAL display window (never
+    per-row AGC), linear-domain FFT averaging, DC bins interpolated, SatNOGS
+    colormap via matplotlib when available; otherwise a dependency-free 8-bit
+    grayscale PNG mapped through the SAME global window (so the recorder never
+    fails a pass just because matplotlib is missing). ``sample_rate_hz`` scales
+    the frequency axis to kHz; without it the frequency axis is unlabeled.
 
     Returns True when a PNG was written, False when the write was SKIPPED (capture
     shorter than one FFT window). CA-FLOW-007: callers must use this explicit
     outcome — probing ``path.exists()`` mistakes a stale PNG left in a reused pass
     workspace for the product of THIS run."""
-    spec = _spectrogram_db(np.asarray(iq, dtype=np.complex64), nfft=nfft)
+    spec = _spectrogram_dbfs(np.asarray(iq), nfft=nfft)
     if spec.shape[0] == 0:
         # Audit round 2: a capture shorter than one FFT window has no spectrogram. We
         # used to fabricate one (a zeros row -> a uniform, perfectly plausible PNG).
@@ -208,18 +316,19 @@ def write_waterfall_png(
         )
         return False
     duration_s = (float(len(iq)) / sample_rate_hz) if sample_rate_hz > 0 else 0.0
+    vmin, vmax = _display_window_dbfs(spec)
     try:
         _write_waterfall_matplotlib(
             path, spec, sample_rate_hz=sample_rate_hz, duration_s=duration_s,
-            center_hz=center_hz, title=title)
+            center_hz=center_hz, title=title, vmin=vmin, vmax=vmax)
         return True
     except Exception as e:  # noqa: BLE001 — matplotlib absent/broken → grayscale, never fail the pass
         logging.getLogger("gs_flowgraphs._recorder").info(
             "waterfall: matplotlib unavailable (%s); writing grayscale PNG", e)
-    lo, hi = np.percentile(spec, 5.0), np.percentile(spec, 99.5)
-    rng = hi - lo if hi > lo else 1.0
-    img = np.clip((spec - lo) / rng * 255.0, 0, 255).astype(np.uint8)
-    path.write_bytes(_encode_png_gray(img))
+    # Same GLOBAL window as the colour path — grayscale must not reintroduce an
+    # auto-stretch that renders every capture's noise floor differently.
+    img = np.clip((spec - vmin) / (vmax - vmin) * 255.0, 0, 255).astype(np.uint8)
+    path.write_bytes(_encode_png_gray(np.flipud(img)))
     return True
 
 

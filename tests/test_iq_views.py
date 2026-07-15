@@ -42,7 +42,7 @@ def test_stale_png_in_reused_workspace_is_not_reported_as_produced(tmp_path: Pat
     # FFT window, so the writer skips — the stale PNG must be neither reported as
     # produced nor left on disk to be swept up as this pass's product.
     cf32 = tmp_path / "retry.cf32"
-    _capture(cf32, n=100)  # < one 1024-point FFT window: waterfall write is skipped
+    _capture(cf32, n=100)  # < one 2048-point FFT window: waterfall write is skipped
     stale = cf32.with_suffix(".png")
     stale.write_bytes(b"\x89PNG stale artifact from the previous attempt")
     written = derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("png",))

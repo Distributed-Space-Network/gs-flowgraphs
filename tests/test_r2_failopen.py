@@ -154,18 +154,18 @@ class TestTheRecorderDoesNotInventArtifacts:
         """A zeros row became a uniform, perfectly plausible PNG — an operator reads that
         as 'the band was quiet'. An absent waterfall is honest; an invented one is not."""
         import numpy as np
-        from _recorder import _spectrogram_db
+        from _recorder import _spectrogram_dbfs
 
-        spec = _spectrogram_db(np.zeros(64, dtype=np.complex64), nfft=1024)
+        spec = _spectrogram_dbfs(np.zeros(64, dtype=np.complex64), nfft=1024)
         assert spec.shape[0] == 0, "a capture shorter than one FFT window has NO waterfall"
 
     def test_a_real_capture_still_produces_rows(self) -> None:
         import numpy as np
-        from _recorder import _spectrogram_db
+        from _recorder import _spectrogram_dbfs
 
         iq = (np.random.default_rng(0).standard_normal(4096)
               + 1j * np.random.default_rng(1).standard_normal(4096)).astype(np.complex64)
-        assert _spectrogram_db(iq, nfft=1024).shape[0] > 0
+        assert _spectrogram_dbfs(iq, nfft=1024).shape[0] > 0
 
     def test_the_sidecar_write_failure_is_logged_not_suppressed(self) -> None:
         src = (_APPS / "_recorder.py").read_text(encoding="utf-8")
