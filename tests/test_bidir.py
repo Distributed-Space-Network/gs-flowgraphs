@@ -874,3 +874,98 @@ def test_a_failing_resume_rx_fails_the_command_loop_and_never_acks():
     reason, evs = asyncio.run(_run())
     assert reason == "handler-failed"
     assert not any(e.get("event") == "rx_resumed" for e in evs)
+
+
+# ------------------------ CA-FLOW-001: `ready` must PROVE the downlink is alive
+
+
+class _AmainSockets:
+    def __init__(self) -> None:
+        self.status_writer = _FakeWriter()
+        self.data_writer = _FakeWriter()
+        self.control_reader = asyncio.StreamReader()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _amain_args(tmp_path, rx: str):
+    return argparse.Namespace(
+        params_file=None, sample_rate=_SR, center_freq_hz=401_500_000.0,
+        sdr_args=f"file:{rx}", output_dir=str(tmp_path), record_iq=False,
+        record_formats="",
+    )
+
+
+def _run_amain(monkeypatch, args, *, feed_eof: bool = False) -> tuple[int, list[dict]]:
+    box: dict = {}
+
+    async def _fake_connect(_args):
+        # StreamReader must be constructed INSIDE the running loop (3.12).
+        socks = _AmainSockets()
+        if feed_eof:
+            socks.control_reader.feed_eof()
+        box["socks"] = socks
+        return socks
+
+    monkeypatch.setattr(bidir, "connect_spawn_sockets", _fake_connect)
+    rc = asyncio.run(asyncio.wait_for(bidir.amain(args), timeout=20.0))
+    return rc, _events(box["socks"])
+
+
+def test_empty_input_emits_no_ready_and_exits_nonzero(tmp_path, monkeypatch):
+    """THE REPRO: FileBidirIo with a missing rx file returns immediately (the 'normal
+    empty-file return'). The old app emitted `ready` before the RX task even existed
+    and the command loop stayed alive behind a dead engine."""
+    args = _amain_args(tmp_path, rx=str(tmp_path / "missing.cf32"))
+    rc, evs = _run_amain(monkeypatch, args, feed_eof=True)
+    assert rc == 1
+    assert not any(e.get("event") == "ready" for e in evs), "ready without a live downlink"
+    assert any(e.get("code") == "rx-not-alive" for e in evs)
+
+
+def test_one_sample_permits_exactly_one_ready_and_early_end_fails(tmp_path, monkeypatch):
+    """One delivered sample licenses exactly ONE ready — and the engine ENDING
+    normally before a requested stop (finite file exhausted) must still fail the
+    pass (engine-ended), never linger behind a live command loop."""
+    rx = tmp_path / "live.cf32"
+    np.zeros(200_000, np.complex64).tofile(str(rx))
+    args = _amain_args(tmp_path, rx=str(rx))
+    rc, evs = _run_amain(monkeypatch, args)  # no stop is ever sent
+    readies = [e for e in evs if e.get("event") == "ready"]
+    assert len(readies) == 1, f"expected exactly one ready, got {len(readies)}"
+    assert any(e.get("code") == "engine-ended" for e in evs), (
+        "premature normal engine completion did not fail the pass"
+    )
+    assert rc == 1
+
+
+def test_deaf_source_times_out_without_ready(tmp_path, monkeypatch):
+    """A source that never delivers a sample (and never ends) must time out the
+    first-sample bound: no ready, explicit rx-not-alive, nonzero exit."""
+    import threading as _threading
+    import time as _time
+
+    monkeypatch.setattr(bidir, "_READY_FIRST_SAMPLE_TIMEOUT_S", 0.3)
+
+    class _DeafIo(bidir.FileBidirIo):
+        def __init__(self) -> None:
+            super().__init__(None, None)
+            self._stopped = _threading.Event()
+
+        def rx_chunks(self):
+            while not self._stopped.is_set():
+                _time.sleep(0.005)
+            return
+            yield  # pragma: no cover — makes this a generator
+
+        def close(self) -> None:
+            self._stopped.set()
+
+    monkeypatch.setattr(bidir, "_open_bidir_io", lambda _a, _p: _DeafIo())
+    args = _amain_args(tmp_path, rx="ignored")
+    rc, evs = _run_amain(monkeypatch, args, feed_eof=True)
+    assert rc == 1
+    assert not any(e.get("event") == "ready" for e in evs)
+    deaf = [e for e in evs if e.get("code") == "rx-not-alive"]
+    assert deaf and "deaf" in deaf[0].get("detail", "")

@@ -195,7 +195,15 @@ class TestTheWatcherCannotSwallowAnEngineFailure:
         assert events == []
         assert not eof
 
-    def test_a_clean_engine_exit_is_not_a_failure(self) -> None:
+    def test_a_clean_engine_exit_before_stop_is_engine_ended(self) -> None:
+        # CA-FLOW-001: a NORMAL engine return before a requested stop is an engine that
+        # ENDED (source EOF / empty input). The old watcher ignored it, leaving a deaf
+        # pass behind a live command loop; it must now fail the pass explicitly.
         events, eof = self._watch(None, stopping=False)
+        assert events and events[0]["code"] == "engine-ended"
+        assert eof
+
+    def test_a_clean_engine_exit_during_a_requested_stop_stays_quiet(self) -> None:
+        events, eof = self._watch(None, stopping=True)
         assert events == []
         assert not eof

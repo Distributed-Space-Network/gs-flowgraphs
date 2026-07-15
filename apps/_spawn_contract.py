@@ -385,15 +385,23 @@ def watch_engine_death(
         # must be reported even when stop_requested is set, because the engine's own
         # teardown sets that flag before it raises (which is exactly how this guard came to
         # swallow a dead SDR: exception raised, flag set, nothing reported).
-        if exc is None or (stop_requested.is_set() and not isinstance(exc, EngineFailure)):
+        if stop_requested.is_set() and not isinstance(exc, EngineFailure):
             return
-        log.error("engine task died: %r — failing the pass (R-11)", exc)
+        if exc is None:
+            # CA-FLOW-001: a NORMAL engine return before a requested stop is an engine
+            # that ENDED (source EOF / empty input) — the pass must FAIL, not linger
+            # deaf behind a live command loop that keeps answering the orchestrator.
+            code, detail = "engine-ended", "engine completed before a requested stop"
+            log.error("engine task ended before a requested stop — failing the pass (CA-FLOW-001)")
+        else:
+            code, detail = "engine-died", repr(exc)
+            log.error("engine task died: %r — failing the pass (R-11)", exc)
 
         async def _fail() -> None:
             with contextlib.suppress(Exception):
                 await send_event(
                     status_writer,
-                    {"event": "error", "code": "engine-died", "detail": repr(exc)},
+                    {"event": "error", "code": code, "detail": detail},
                 )
             control_reader.feed_eof()
 

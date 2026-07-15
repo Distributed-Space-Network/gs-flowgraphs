@@ -101,6 +101,10 @@ _MAX_CONSECUTIVE_RX_ERRORS = 200
 # quiet sky.
 # Generous enough never to false-trip a live pass; well under a typical pass length.
 _RX_DEAF_TIMEOUT_S = 15.0
+# CA-FLOW-001: bound on the first delivered RX sample before `ready` may be emitted.
+# Must stay under gs-client's spawn READY_TIMEOUT_S (30 s) so a deaf source fails as
+# THIS app's explicit rx-not-alive error, not as an opaque supervisor ready-timeout.
+_READY_FIRST_SAMPLE_TIMEOUT_S = 15.0
 # Finding #17: a data-socket peer that stays CONNECTED but stops reading (its TCP
 # receive buffer fills) makes an unbounded ``data_writer.drain()`` await forever —
 # ConnectionReset/BrokenPipe never fire — so the decode loop cannot observe a stop
@@ -824,6 +828,9 @@ async def run_rx(
     stop_requested: asyncio.Event,
     doppler: dict[str, float],
     tx: _TxController,
+    # CA-FLOW-001: set (threadsafe) when the FIRST IQ chunk is delivered — amain
+    # withholds `ready` until this fires, bounded.
+    first_sample: asyncio.Event | None = None,
 ) -> None:
     """Continuous downlink demod: reader thread → queue → StreamDecoder, a decode loop draining
     frames, and periodic RSSI. Mirrors the RX app's dsp engine but endurosat-only. RX pauses while a
@@ -835,10 +842,15 @@ async def run_rx(
     queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue(maxsize=64)
     nco_phase = 0.0
     last_signal = 0.0
+    # CA-FLOW-001: INTERNAL teardown signal for the reader/decoder. run_rx's finally
+    # used to set the SHARED stop_requested, which made the death watcher read every
+    # normal engine end as a "requested stop" and stay silent — the exact mechanism
+    # that let an exhausted/empty source leave a deaf pass behind a live command loop.
+    rx_teardown = asyncio.Event()
 
-    # Backpressure put, interruptible on stop — shared X-02 primitive (the
+    # Backpressure put, interruptible on teardown — shared X-02 primitive (the
     # cubesat dsp engine uses the same one; one implementation, one test).
-    _put = make_backpressure_put(queue, loop, stop_requested)
+    _put = make_backpressure_put(queue, loop, rx_teardown)
 
     # Audit round 2 (silent-success class): the reader used to swallow its own death —
     # the except logged, and the finally pushed the SAME `None` terminator a clean EOF
@@ -850,11 +862,14 @@ async def run_rx(
     def _reader() -> None:
         try:
             for chunk in io.rx_chunks():
-                if stop_requested.is_set():
+                if stop_requested.is_set() or rx_teardown.is_set():
                     break
                 if tx.tx_active.is_set():
                     continue  # antenna on the PA path — RX is meaningless during a burst
                 arr = np.asarray(chunk, dtype=np.complex64)
+                if first_sample is not None and not first_sample.is_set():
+                    # CA-FLOW-001: the downlink provably delivered a sample.
+                    loop.call_soon_threadsafe(first_sample.set)
                 if recorder is not None:
                     recorder.write(arr)
                 _put(arr)
@@ -871,10 +886,10 @@ async def run_rx(
 
     async def _decode_loop() -> None:
         errors = 0
-        while not stop_requested.is_set():
+        while not rx_teardown.is_set():
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(stop_requested.wait(), _DECODE_PERIOD_S)
-            if stop_requested.is_set():
+                await asyncio.wait_for(rx_teardown.wait(), _DECODE_PERIOD_S)
+            if rx_teardown.is_set():
                 break
             try:
                 bodies = await asyncio.to_thread(decoder.decode_new)
@@ -910,7 +925,10 @@ async def run_rx(
                 await emit_signal(sockets, _rssi_dbm(chunk))
             decoder.push(chunk)
     finally:
-        stop_requested.set()
+        # CA-FLOW-001: tear down the INTERNAL machinery only. Setting the shared
+        # stop_requested here made a normal engine end indistinguishable from a
+        # requested stop, silencing the death watcher.
+        rx_teardown.set()
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
         try:
             leftovers = await asyncio.to_thread(decoder.flush)
@@ -1304,6 +1322,51 @@ async def amain(args) -> int:
     if isinstance(io_flag, threading.Event):
         tx.tx_active = io_flag
 
+    # CA-FLOW-001: `ready` must PROVE the downlink is alive. Create RX FIRST, then wait
+    # (bounded) for its first delivered sample — the old order emitted `ready` before the
+    # RX task even existed, so a deaf/empty source produced a "ready" pass that captured
+    # nothing behind a live command loop.
+    first_sample = asyncio.Event()
+    rx_task = asyncio.create_task(
+        run_rx(
+            args, sockets, params, io,
+            stop_requested=stop_requested, doppler=doppler, tx=tx,
+            first_sample=first_sample,
+        ),
+        name="bidir-rx",
+    )
+    # R-11 / audit: a dead RX engine must FAIL the pass, not linger behind a live command
+    # loop that keeps cheerfully answering the orchestrator. CA-FLOW-001 extends this to
+    # NORMAL premature completion (engine-ended).
+    watch_engine_death(rx_task, sockets.status_writer, sockets.control_reader, stop_requested)
+    first_wait = asyncio.create_task(first_sample.wait(), name="bidir-first-sample")
+    done, _pending = await asyncio.wait(
+        {first_wait, rx_task},
+        timeout=_READY_FIRST_SAMPLE_TIMEOUT_S,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if first_wait not in done:
+        first_wait.cancel()
+        reason = (
+            "the RX engine ended before delivering a single sample"
+            if rx_task in done
+            else f"no RX sample within {_READY_FIRST_SAMPLE_TIMEOUT_S:.0f}s (deaf source)"
+        )
+        _log.error("bidir: NOT ready — %s; failing the spawn", reason)
+        with contextlib.suppress(Exception):
+            await send_event(
+                sockets.status_writer,
+                {"event": "error", "code": "rx-not-alive", "detail": reason},
+            )
+        stop_requested.set()
+        # Close the io BEFORE settling the RX task: a genuinely deaf source only
+        # unblocks its reader when the stream is torn down under it.
+        with contextlib.suppress(Exception):
+            io.close()
+        await asyncio.gather(rx_task, return_exceptions=True)
+        await sockets.aclose()
+        return 1
+
     await send_event(
         sockets.status_writer,
         {
@@ -1404,14 +1467,7 @@ async def amain(args) -> int:
         await asyncio.to_thread(io.resume_rx)
         await send_event(sockets.status_writer, {"event": "rx_resumed"})
 
-    rx_task = asyncio.create_task(
-        run_rx(args, sockets, params, io, stop_requested=stop_requested, doppler=doppler, tx=tx),
-        name="bidir-rx",
-    )
-    # R-11 / audit: a dead RX engine must FAIL the pass, not linger behind a live command
-    # loop that keeps cheerfully answering the orchestrator. This app was the ONE engine
-    # that never wired the watcher, which is why a dead SDR still looked like a clean stop.
-    watch_engine_death(rx_task, sockets.status_writer, sockets.control_reader, stop_requested)
+    # (CA-FLOW-001: rx_task + watch_engine_death are created BEFORE `ready`, above.)
     handlers = {
         "start": _on_start,
         "stop": _on_stop,
