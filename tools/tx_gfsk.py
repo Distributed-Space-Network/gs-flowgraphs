@@ -68,6 +68,11 @@ _TX_CS16_PEAK = 32767.0
 XTRX_LOW_RATE_EXPLICIT_CHANNELS_HZ = 1_000_000.0
 XTRX_VERY_LOW_RATE_CF32_HZ = 500_000.0
 XTRX_YOCTO_LOGLEVEL = 5
+# CA-FLOW-010: the XTRX ANALOG filter floor (~0.8 MHz). Below it the analog chain
+# goes silent (bench-proven on RX; the TX probe applies the same lift). Channel
+# selectivity belongs in DSP — the analog BW tracks the sample rate. Matches
+# probe_soapy_tx_write.XTRX_MIN_TX_BW_HZ; change them together with HIL evidence.
+XTRX_MIN_TX_BW_HZ = 800_000.0
 
 
 def _configure_xtrx_loglevel(device: str, loglevel: int) -> None:
@@ -177,7 +182,22 @@ def _is_xtrx_device(args) -> bool:
 
 
 def _resolve_tx_bw(args, used_rate: float) -> float:
-    return float(args.bw) if args.bw else float(used_rate)
+    bw = float(args.bw) if args.bw else float(used_rate)
+    # CA-FLOW-010: restore the XTRX narrow-BW guard the WIP snapshot dropped —
+    # an analog TX filter below the ~0.8 MHz floor silences the chain. Lift it
+    # unless the operator explicitly forces narrow (--allow-narrow-bw).
+    if (
+        _is_xtrx_device(args)
+        and bw < XTRX_MIN_TX_BW_HZ
+        and not getattr(args, "allow_narrow_bw", False)
+    ):
+        log.warning(
+            "tx: analog TX bandwidth %.0f Hz is below the XTRX analog floor — lifting to "
+            "%.0f Hz (channel selectivity belongs in DSP; --allow-narrow-bw to force)",
+            bw, XTRX_MIN_TX_BW_HZ,
+        )
+        return XTRX_MIN_TX_BW_HZ
+    return bw
 
 
 def _resolve_tx_chunk(requested: int, mtu: int) -> int:
