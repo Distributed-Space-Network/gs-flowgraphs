@@ -416,6 +416,15 @@ def watch_engine_death(
 # ----------------------------------------------------------------------
 
 
+class ParamsFileError(RuntimeError):
+    """CA-FLOW-003: an EXPLICITLY supplied ``--params-file`` could not be used.
+
+    The orchestrator VALIDATED these parameters (engine, framing, rates, gains,
+    uplink settings) before writing the file — silently falling back to the app's
+    built-in defaults substitutes a different, unvalidated configuration on exactly
+    the passes where the operator most needs the declared one. The spawn must fail."""
+
+
 def load_params(args: argparse.Namespace) -> dict[str, object]:
     """Load the per-pass parameters file the orchestrator wrote (if
     any), returning the parsed JSON object as a plain dict.
@@ -427,25 +436,28 @@ def load_params(args: argparse.Namespace) -> dict[str, object]:
     flowgraphs can interpret their own keys (baud rate, deviation,
     decoder choice, etc.) without coordinating with the orchestrator.
 
-    Returns ``{}`` if ``--params-file`` was not passed, the file is
-    missing, or the file is malformed (rather than raising — a bad
-    params file should let the flowgraph fall back to defaults, not
-    crash the pass). Logs a warning on the missing-or-malformed path.
-    """
+    Returns ``{}`` only when ``--params-file`` was NOT passed (the app runs on its
+    built-in defaults by explicit omission). CA-FLOW-003: an EXPLICIT file that is
+    missing, torn, unreadable, malformed, or not a JSON object raises
+    :class:`ParamsFileError` and fails the spawn — validated engine/framing/rates/
+    uplink settings must never silently revert to app defaults."""
     if not args.params_file:
         return {}
     try:
         with open(args.params_file, encoding="utf-8") as f:
             obj = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        log.warning("params file %r not loadable: %s", args.params_file, e)
-        return {}
-    if not isinstance(obj, dict):
-        log.warning(
-            "params file %r is not a JSON object (got %s); ignoring",
-            args.params_file, type(obj).__name__,
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        msg = (
+            f"explicit params file {args.params_file!r} is not loadable ({e}) — "
+            f"refusing to run on app defaults in place of the validated parameters"
         )
-        return {}
+        raise ParamsFileError(msg) from e
+    if not isinstance(obj, dict):
+        msg = (
+            f"explicit params file {args.params_file!r} is not a JSON object "
+            f"(got {type(obj).__name__}) — refusing to run on app defaults"
+        )
+        raise ParamsFileError(msg)
     return obj
 
 
@@ -458,6 +470,7 @@ __all__ = [
     "build_argparser",
     "connect_spawn_sockets",
     "frame_received_event",
+    "ParamsFileError",
     "load_params",
     "parse_tcp_url",
     "pump_data_queue",
