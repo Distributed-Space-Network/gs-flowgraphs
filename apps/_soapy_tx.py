@@ -132,6 +132,17 @@ def named_tx_gains(tx_settings: object) -> dict[str, float]:
         for k, v in (gains or {}).items()
         if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
     }
+    # DS-016 (P1): reject a non-finite requested gain HERE, before it is pushed to the driver via
+    # setGain. A NaN/inf PAD would be written to the native driver AND defeats verify_named_tx_gains
+    # downstream (abs(readback - NaN) is nan, never > tolerance, so the clamped-or-garbage readback
+    # passes) — keying at an unintended drive. Reported before the PAD check so a NaN PAD reads as
+    # "non-finite", not the misleading "no PAD configured".
+    non_finite = sorted(k for k, v in named.items() if not math.isfinite(v))
+    if non_finite:
+        raise TxGainConfigError(
+            f"non-finite TX gain(s) {non_finite} configured — a NaN/inf drive would be written "
+            "to the SDR and defeats the gain readback check; refusing. Configure a finite dB value."
+        )
     # RE-AUDIT (P2): require PAD SPECIFICALLY, not merely "some named gain". PAD is the element that
     # sets the XTRX TX OUTPUT drive; any OTHER named gain alone (e.g. IAMP, a digital preamp) leaves
     # the output PAD at its default and radiates the wrong level (often deaf). The overall setGain
@@ -179,6 +190,14 @@ def verify_named_tx_gains(
         if not math.isfinite(got):
             raise TxGainConfigError(
                 f"TX gain {name!r} readback is non-finite ({got!r}) — refusing to key"
+            )
+        # DS-016 (P1): also reject a non-finite REQUESTED value here. named_tx_gains already blocks
+        # it, but verify must not trust its caller: abs(got - NaN) is nan and never exceeds the
+        # tolerance, so a NaN request would otherwise pass at whatever drive the driver latched.
+        if not math.isfinite(float(want)):
+            raise TxGainConfigError(
+                f"TX gain {name!r} was REQUESTED as non-finite ({want!r}) — a NaN/inf request "
+                f"defeats the readback tolerance check; refusing to key"
             )
         if abs(got - float(want)) > tolerance_db:
             raise TxGainConfigError(

@@ -43,6 +43,7 @@ from _soapy_tx import (  # noqa: E402
     named_tx_gains,
     query_tx_mtu,
     to_cs16,
+    verify_named_tx_gains,
     write_burst,
 )
 
@@ -313,6 +314,36 @@ class TestNamedTxGains:
     def test_non_numeric_entries_are_ignored(self):
         with pytest.raises(TxGainConfigError):
             named_tx_gains({"sdr_gains": {"PAD": "loud", 7: 3, "IAMP": True}})
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_gain_is_a_config_error(self, bad):
+        # DS-016 (P1): a NaN/inf PAD would be written to the driver AND defeats the readback check
+        # (abs(readback - NaN) is never > tolerance). It must be refused before setGain.
+        with pytest.raises(TxGainConfigError, match="non-finite"):
+            named_tx_gains({"sdr_gains": {"PAD": bad}})
+
+
+class TestVerifyNamedTxGains:
+    """DS-016 (P1): verify_named_tx_gains must not trust a non-finite REQUESTED value even if the
+    readback is finite — abs(got - NaN) is nan and never exceeds tolerance, so a NaN request would
+    otherwise pass verification at whatever drive the driver actually latched."""
+
+    class _GainDev:
+        def __init__(self, readback: float) -> None:
+            self._readback = readback
+
+        def getGain(self, _direction, _channel, _name) -> float:
+            return self._readback
+
+    def test_finite_request_and_matching_readback_passes(self):
+        dev = self._GainDev(52.0)
+        assert verify_named_tx_gains(dev, 1, {"PAD": 52.0}) == {"PAD": 52.0}
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_request_is_refused_even_with_finite_readback(self, bad):
+        dev = self._GainDev(52.0)  # driver latched a plausible value
+        with pytest.raises(TxGainConfigError, match="non-finite"):
+            verify_named_tx_gains(dev, 1, {"PAD": bad})
 
     def test_write_burst_consumes_to_cs16_output_as_flat_cs16(self):
         # End-to-end: to_cs16 → write_burst treats it as flat CS16 (num_elems are
