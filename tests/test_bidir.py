@@ -10,6 +10,8 @@ import argparse
 import asyncio
 import base64
 import json
+import threading
+import time
 
 import cubesat_gfsk_endurosat_bidir as bidir
 import numpy as np
@@ -384,6 +386,51 @@ def test_run_rx_terminates_on_stop_with_unbounded_source(tmp_path):
         await asyncio.wait_for(task, timeout=10.0)  # must terminate, not hang
 
     asyncio.run(_run())
+
+
+def test_run_rx_terminates_when_the_source_is_PARKED_and_never_yields(tmp_path):
+    # DS-017 regression: a shared-device RX source parks (rx_suspended set after a burst that never
+    # got its resume_rx handshake) and spins WITHOUT yielding, so the reader's per-chunk stop check
+    # never runs. run_rx must signal the source to stop at teardown (io.request_stop) so the parked
+    # generator returns — otherwise the reader thread spins forever and gather() hangs the engine.
+    class _ParkingIo:
+        def __init__(self) -> None:
+            self._stop = threading.Event()
+            self.requested_stop = False
+
+        def rx_chunks(self):
+            # Mirrors _SoapyBidirIo's park branch: spin, never yield, until asked to stop.
+            while not self._stop.is_set():
+                time.sleep(0.005)
+            yield from ()  # a generator that produces no chunks
+
+        def request_stop(self) -> None:
+            self.requested_stop = True
+            self._stop.set()
+
+        def transmit_burst(self, iq):
+            return len(iq)
+
+        def close(self) -> None:
+            return None
+
+    io = _ParkingIo()
+    socks = _FakeSockets()
+    stop = asyncio.Event()
+    tx = bidir._TxController(io, sample_rate=_SR)
+
+    async def _run() -> None:
+        task = asyncio.create_task(
+            bidir.run_rx(
+                _rx_args(tmp_path), socks, {}, io, stop_requested=stop, doppler={"hz": 0.0}, tx=tx
+            )
+        )
+        await asyncio.sleep(0.2)  # let the reader reach the park spin
+        stop.set()
+        await asyncio.wait_for(task, timeout=10.0)  # must terminate, not hang
+
+    asyncio.run(_run())
+    assert io.requested_stop  # teardown reached the source's stop hook
 
 
 def test_run_rx_no_downlink_completes_clean(tmp_path):

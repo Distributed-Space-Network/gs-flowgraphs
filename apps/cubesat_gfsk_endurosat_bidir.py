@@ -929,6 +929,14 @@ async def run_rx(
         # stop_requested here made a normal engine end indistinguishable from a
         # requested stop, silencing the death watcher.
         rx_teardown.set()
+        # DS-017: a shared-device RX source PARKS internally (rx_suspended stays set after a burst
+        # that never got its resume_rx handshake, or tx_active during a burst) and never yields, so
+        # the reader's per-chunk stop check above never runs. Signal the source itself to stop so
+        # its parked generator returns and gather() below cannot hang forever on the reader thread.
+        _request_stop = getattr(io, "request_stop", None)
+        if callable(_request_stop):
+            with contextlib.suppress(Exception):
+                _request_stop()
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
         try:
             leftovers = await asyncio.to_thread(decoder.flush)
@@ -1020,6 +1028,9 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         # resume_rx() (gs-client's post-burst handshake: PA proven quiet, external T/R
         # switch back on RX, settle observed). The reader parks while it is set.
         self.rx_suspended = threading.Event()
+        # DS-017: teardown signal. rx_chunks parks (spins, no yield) while suspended/tx_active, so
+        # the reader cannot break it between chunks; request_stop() lets teardown end the generator.
+        self._stop = threading.Event()
         rate = resolve_sample_rate(args, params)  # integer sps — must match the modulator's IQ rate
         self._rate = rate
         dev = SoapySDR.Device(args.sdr_args)
@@ -1126,6 +1137,11 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         # mode is a benign-looking TIMEOUT storm that never trips the hard-error counter.
         last_progress = time.monotonic()
         while True:
+            if self._stop.is_set():
+                # DS-017: teardown requested — end the generator so the reader thread returns
+                # instead of spinning in the park branch below forever (a burst that never got its
+                # resume_rx handshake leaves rx_suspended set with nobody to clear it).
+                return
             if self.tx_active.is_set() or self.rx_suspended.is_set():
                 # RX is intentionally paused during a TX burst, and stays SUSPENDED after
                 # it until gs-client's resume_rx handshake (the external T/R switch may
@@ -1290,7 +1306,14 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
             self._rx_settle_until = time.monotonic() + _RX_SETTLE_S
         self.rx_suspended.clear()
 
+    def request_stop(self) -> None:
+        """DS-017: ask rx_chunks to end (used at teardown). Idempotent and thread-safe — the reader
+        thread may be parked (spinning on rx_suspended/tx_active without yielding), so the shared
+        stop flag is the only way to break it; close() alone cannot, as it never reaches a yield."""
+        self._stop.set()
+
     def close(self) -> None:
+        self._stop.set()
         with contextlib.suppress(Exception):
             self._dev.deactivateStream(self._rx_stream)
             self._dev.closeStream(self._rx_stream)
