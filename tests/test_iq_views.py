@@ -302,3 +302,96 @@ def test_synthetic_gfsk_ogg_decodes_through_audio_analyze(tmp_path: Path) -> Non
     audio, rate = sf.read(str(ogg), dtype="float32")
     frames = audio_analyze.decode_ax25_audio(audio, float(rate), 9600.0, window_s=1.0)
     assert any(frame == body for _, frame in frames)
+
+
+# --------------------------------------------------------------------------- Phase 2C (DS-020..023)
+
+
+def test_stale_ogg_in_reused_workspace_is_removed_before_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DS-020 (CA-FLOW-007 completion): the PNG branch removes its stale target first; the OGG
+    branch did not — a reused workspace's old .ogg survived a skipped/failed encode and was swept
+    up as THIS pass's audio. Skip is forced via the missing-soundfile path."""
+    import sys as _sys
+
+    monkeypatch.setitem(_sys.modules, "soundfile", None)  # encode import raises -> writer skips
+    cf32 = tmp_path / "retry.cf32"
+    _capture(cf32, n=20_000)
+    stale = cf32.with_suffix(".ogg")
+    stale.write_bytes(b"OggS stale audio from the previous attempt")
+    written = derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("ogg",))
+    assert not stale.exists(), "the stale .ogg from the previous attempt survived"
+    assert cf32.with_suffix(".ogg") not in written
+
+
+def test_sdf_failure_leaves_no_partial_final_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DS-021: SDF is written via tmp + atomic rename — an OSError mid-write must leave NO
+    truncated final .sdf (and no .tmp remnant)."""
+    cf32 = tmp_path / "cmd_47.cf32"
+    _capture(cf32)
+
+    def _boom(_arr: np.ndarray) -> bytes:
+        msg = "No space left on device"
+        raise OSError(28, msg)
+
+    monkeypatch.setattr(iq_views, "iq_to_sdf_bytes", _boom)
+    written = derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("sdf",))
+    assert written == []
+    assert not cf32.with_suffix(".sdf").exists(), "a truncated final .sdf was left behind"
+    assert not cf32.with_suffix(".sdf.tmp").exists(), "the .sdf.tmp remnant was left behind"
+
+
+def test_csv_failure_leaves_no_partial_final_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DS-021 (CSV half): same tmp+rename contract for the VSA CSV."""
+    cf32 = tmp_path / "cmd_47.cf32"
+    _capture(cf32)
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        msg = "No space left on device"
+        raise OSError(28, msg)
+
+    monkeypatch.setattr(iq_views, "write_vsa_csv", _boom)
+    written = derive_views(cf32, center_hz=0.0, sample_rate_hz=48_000.0, formats=("csv",))
+    assert written == []
+    assert not cf32.with_suffix(".csv").exists()
+    assert not cf32.with_suffix(".csv.tmp").exists()
+
+
+def test_vsa_timestamp_is_the_capture_start_not_the_last_write(tmp_path: Path) -> None:
+    """DS-022: TimeUtcString came from the cf32 mtime — the LAST write (LOS), shifting every VSA
+    timestamp by the whole pass duration. It must be the capture START (mtime - duration)."""
+    import datetime as dt
+    import os
+
+    fs = 48_000.0
+    n = 480_000  # 10 s capture
+    cf32 = tmp_path / "cmd_47.cf32"
+    _capture(cf32, n=n, fs=fs)
+    end = dt.datetime(2026, 7, 16, 12, 0, 10, tzinfo=dt.UTC)
+    os.utime(cf32, (end.timestamp(), end.timestamp()))
+
+    derive_views(cf32, center_hz=0.0, sample_rate_hz=fs, formats=("csv",), csv_seconds=0.01)
+    header = cf32.with_suffix(".csv").read_text(encoding="ascii")
+    line = next(ln for ln in header.splitlines() if ln.startswith("TimeUtcString"))
+    stamp = line.split(",", 1)[1]
+    assert stamp.startswith("2026-07-16T12:00:00"), (
+        f"TimeUtcString is {stamp!r} — expected the capture START (end 12:00:10 minus 10 s)"
+    )
+
+
+def test_main_rejects_unknown_format_tokens(tmp_path: Path) -> None:
+    """DS-023: an unknown --formats token is a config error (rc!=0), not a silent drop that
+    vanishes from the produced-vs-requested accounting."""
+    cf32 = tmp_path / "cmd_47.cf32"
+    _capture(cf32)
+    rc = main([
+        "--input", str(cf32), "--sample-rate", "48000",
+        "--formats", "sdf,waterfal",  # typo'd token
+    ])
+    assert rc == 2
+    assert not cf32.with_suffix(".sdf").exists(), "views were derived despite the config error"

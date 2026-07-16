@@ -1313,10 +1313,15 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
         self._stop.set()
 
     def close(self) -> None:
+        # DS-018: independent cleanup per step (the app's own (3f) rule) — one suppress wrapping
+        # both meant a raising deactivateStream SKIPPED closeStream, leaking the stream handle. And
+        # take the device lock so close() does not race the reader's in-flight readStream.
         self._stop.set()
-        with contextlib.suppress(Exception):
-            self._dev.deactivateStream(self._rx_stream)
-            self._dev.closeStream(self._rx_stream)
+        with self._lock:
+            with contextlib.suppress(Exception):
+                self._dev.deactivateStream(self._rx_stream)
+            with contextlib.suppress(Exception):
+                self._dev.closeStream(self._rx_stream)
 
 
 # ----------------------------------------------------------------------

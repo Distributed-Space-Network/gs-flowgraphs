@@ -560,3 +560,26 @@ def test_rx_chunks_parks_while_rx_is_suspended(monkeypatch, fake_soapysdr):
     with pytest.raises(_Park):  # parked through 5 sleep ticks without a single read
         for _ in io.rx_chunks():
             pass
+
+
+# --------------------------------------------------------------------------- DS-018 (Phase 2C)
+
+
+def test_close_runs_each_cleanup_step_independently():
+    """DS-018: one suppress wrapped BOTH deactivateStream and closeStream, so a raising deactivate
+    SKIPPED the close and leaked the stream handle. Each step must be attempted independently."""
+    calls: list[str] = []
+
+    class _Dev:
+        def deactivateStream(self, _s):
+            calls.append("deactivate")
+            msg = "device wedged"
+            raise RuntimeError(msg)
+
+        def closeStream(self, _s):
+            calls.append("close")
+
+    io = _bidir_io(_Dev())
+    io.close()
+    assert calls == ["deactivate", "close"], "closeStream was skipped after deactivate raised"
+    assert io._stop.is_set()  # close() also signals the reader (DS-017)

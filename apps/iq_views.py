@@ -295,7 +295,12 @@ def derive_views(
         log.warning("iq_views: %s has no samples", path)
         return []
 
-    started = _dt.datetime.fromtimestamp(path.stat().st_mtime, _dt.UTC)
+    # DS-022: the cf32 mtime is the LAST write (LOS/pass end), not the capture start — stamping it
+    # as TimeUtcString shifted every VSA timestamp by the whole pass duration. The capture START is
+    # derivable: last write minus the capture's duration (samples / rate).
+    ended = _dt.datetime.fromtimestamp(path.stat().st_mtime, _dt.UTC)
+    duration_s = (n_samp / sample_rate_hz) if sample_rate_hz > 0 else 0.0
+    started = ended - _dt.timedelta(seconds=duration_s)
     iq = np.memmap(path, dtype=np.complex64, mode="r", shape=(n_samp,))
     written: list[Path] = []
     if want_png:
@@ -321,21 +326,41 @@ def derive_views(
     if want_csv:
         n = max(1, int(sample_rate_hz * csv_seconds))
         csv = path.with_suffix(".csv")
-        write_vsa_csv(
-            csv,
-            np.asarray(iq[:n]),
-            center_hz=center_hz,
-            sample_rate_hz=sample_rate_hz,
-            started_utc=started,
-        )
-        written.append(csv)
+        # DS-021: tmp + atomic rename (as OGG does) — an OSError mid-write must never leave a
+        # silently truncated final .csv that downstream tooling then trusts.
+        csv_tmp = path.with_suffix(".csv.tmp")
+        _unlink_quiet(csv_tmp)
+        try:
+            write_vsa_csv(
+                csv_tmp,
+                np.asarray(iq[:n]),
+                center_hz=center_hz,
+                sample_rate_hz=sample_rate_hz,
+                started_utc=started,
+            )
+            csv_tmp.replace(csv)
+            written.append(csv)
+        except OSError:
+            log.exception("iq_views: CSV derivation failed for %s — no partial left", path.name)
+            _unlink_quiet(csv_tmp)
     if want_sdf:  # whole-pass Keysight int16 transcode, chunked so memory stays bounded
         sdf = path.with_suffix(".sdf")
-        with sdf.open("wb") as fh:
-            for off in range(0, n_samp, _SDF_CHUNK):
-                fh.write(iq_to_sdf_bytes(np.asarray(iq[off : off + _SDF_CHUNK])))
-        written.append(sdf)
+        sdf_tmp = path.with_suffix(".sdf.tmp")  # DS-021: same tmp+atomic-rename contract as OGG/CSV
+        _unlink_quiet(sdf_tmp)
+        try:
+            with sdf_tmp.open("wb") as fh:
+                for off in range(0, n_samp, _SDF_CHUNK):
+                    fh.write(iq_to_sdf_bytes(np.asarray(iq[off : off + _SDF_CHUNK])))
+            sdf_tmp.replace(sdf)
+            written.append(sdf)
+        except OSError:
+            log.exception("iq_views: SDF derivation failed for %s — no partial left", path.name)
+            _unlink_quiet(sdf_tmp)
     if want_ogg:  # optional FM-discriminator audio (48 kHz Vorbis), same selection policy as above
+        # DS-020 (CA-FLOW-007 completion): a REUSED pass workspace can hold an .ogg from an earlier
+        # attempt. The PNG branch removes its stale target first; the OGG branch did not, so a
+        # derivation that then failed/skipped left the WRONG capture's audio as this pass's product.
+        path.with_suffix(".ogg").unlink(missing_ok=True)
         ogg = write_discriminator_ogg(
             path, iq, sample_rate_hz=sample_rate_hz, ogg_channels=ogg_channels
         )
@@ -372,6 +397,16 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     fmts = tuple(f.strip().lower() for f in args.formats.split(",") if f.strip())
+    # DS-023: an unknown --formats token is a CONFIG ERROR (rc!=0), matching the config validator's
+    # reject-typo stance — silently dropping it made a requested-but-impossible view ("waterfal")
+    # vanish from the rc accounting and the pass reported clean.
+    unknown = sorted(set(fmts) - {"sdf", "csv", "png", "ogg"})
+    if unknown:
+        log.error(
+            "iq_views: unknown --formats token(s) %s (valid: sdf,csv,png,ogg) — refusing",
+            ",".join(unknown),
+        )
+        return 2
     try:
         written = derive_views(
             args.input,

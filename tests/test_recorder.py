@@ -256,3 +256,36 @@ def test_grayscale_fallback_uses_the_same_global_window(
     png = tmp_path / "wf_gray.png"
     assert write_waterfall_png(png, _tone(24 * _NFFT), sample_rate_hz=48000.0)
     assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+# --------------------------------------------------------------------------- DS-G8 (Phase 2C)
+
+
+def test_stream_recorder_write_failure_ends_the_recording_not_the_pass(tmp_path, caplog):
+    """DS-G8: a mid-pass write failure (ENOSPC) must end the RECORDING loudly — closing the file and
+    dropping later writes — NOT propagate into the reader thread (which would kill the whole pass,
+    frames included, for the sake of an optional capture)."""
+    import logging
+
+    import numpy as np
+    from _recorder import StreamRecorder
+
+    rec = StreamRecorder(tmp_path / "cap.cf32", 401_500_000.0, 48_000.0)
+    rec.write(np.zeros(16, dtype=np.complex64))  # a healthy write first
+
+    class _FullDisk:
+        closed = False
+
+        def write(self, _b):
+            msg = "No space left on device"
+            raise OSError(28, msg)
+
+        def close(self):
+            self.closed = True
+
+    rec._fh = _FullDisk()
+    with caplog.at_level(logging.CRITICAL):
+        rec.write(np.zeros(16, dtype=np.complex64))  # must NOT raise
+    assert rec._fh.closed, "the recorder did not close the file after the write failure"
+    assert "TRUNCATED" in caplog.text
+    rec.write(np.zeros(16, dtype=np.complex64))  # later writes drop cleanly

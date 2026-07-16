@@ -489,7 +489,28 @@ class StreamRecorder:
         return cls(iq_path, float(args.center_freq_hz), float(sample_rate_hz))
 
     def write(self, chunk: np.ndarray) -> None:
-        self._fh.write(np.asarray(chunk, dtype=np.complex64).tobytes())
+        # DS-G8: a mid-pass write failure (ENOSPC is the expected one on an unattended station) must
+        # end the RECORDING loudly — not propagate into the reader thread and kill the whole pass.
+        # Frames still decode and emit live over the socket; only the optional capture stops. The
+        # truncation is CRITICAL-logged once (never silent), and later writes are dropped cleanly.
+        if self._fh.closed:
+            return
+        try:
+            self._fh.write(np.asarray(chunk, dtype=np.complex64).tobytes())
+        except OSError as e:
+            try:
+                size = self.iq_path.stat().st_size
+            except OSError:
+                size = -1
+            _log.critical(
+                "IQ recording FAILED mid-pass (%s) — closing %s at %d bytes (TRUNCATED); the pass "
+                "continues WITHOUT further capture (frames still decode live). Check disk space.",
+                e, self.iq_path.name, size,
+            )
+            try:
+                self._fh.close()
+            except OSError:
+                _log.warning("IQ recorder close after write failure also failed")
 
     def close(self) -> None:
         if not self._fh.closed:
