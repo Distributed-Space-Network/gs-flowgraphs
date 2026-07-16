@@ -119,6 +119,7 @@ def _bidir_io(dev, *, hw_rate: float = 96_000.0):
     io._lock = threading.Lock()
     io.tx_active = threading.Event()
     io.rx_suspended = threading.Event()
+    io._stop = threading.Event()  # DS-017 teardown signal (rx_chunks checks it each loop)
     io._rx_stream = _RX_STREAM
     io._rx_settle_until = 0.0
     return io
