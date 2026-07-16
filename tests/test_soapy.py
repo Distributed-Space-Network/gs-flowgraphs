@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 from _soapy import (
     DEFAULT_LO_OFFSET_HZ,
     apply_corrections,
@@ -216,6 +217,37 @@ def test_channel_override() -> None:
     configure_soapy_source(src, {"sdr_gain_db": 12.0, "sdr_antenna": "RX2"}, channel=1)
     assert src.antenna == (1, "RX2")
     assert src.gains == [(1, 12.0)]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_per_element_gain_is_refused_before_the_driver(bad) -> None:
+    """VR-004/VR-011 (DS-016 root): configure_soapy_source is the ONE choke point every engine's
+    gain application goes through — a NaN/inf per-element gain must raise (fail the spawn closed),
+    never reach set_gain. This closes the amateur_fm_narrowband_tx bypass (it calls configure
+    directly, skipping named_tx_gains/verify_named_tx_gains) and NaN RX gains."""
+    src = FakeSoapy()
+    with pytest.raises(ValueError, match="non-finite"):
+        configure_soapy_source(src, {"sdr_gains": {"PAD": bad}}, default_gain_db=None)
+    assert src.gains == [], "a non-finite gain reached the driver"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_overall_gain_is_refused_before_the_driver(bad) -> None:
+    src = FakeSoapy()
+    with pytest.raises(ValueError, match="non-finite"):
+        configure_soapy_source(src, {"sdr_gain_db": bad}, default_gain_db=None)
+    assert src.gains == []
+
+
+def test_env_non_finite_gains_are_ignored_as_malformed(monkeypatch) -> None:
+    """VR-004: 'PAD=nan' / GS_SDR_GAIN_DB='inf' parse without ValueError in bare float() — they
+    must be dropped at env parse (like any malformed entry), not forwarded toward the driver."""
+    _clear_sdr_env(monkeypatch)
+    monkeypatch.setenv("GS_SDR_GAINS", "PAD=nan,IAMP=6")
+    monkeypatch.setenv("GS_SDR_GAIN_DB", "inf")
+    env = sdr_env()
+    assert env["gains"] == {"IAMP": 6.0}
+    assert env["gain_db"] is None
 
 
 # --------------------------------------------------------------------------

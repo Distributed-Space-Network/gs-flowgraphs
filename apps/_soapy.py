@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 from typing import Any, Protocol
 
@@ -45,6 +46,22 @@ class _SoapyEndpoint(Protocol):
 
 def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _require_finite_gain(value: float, what: str) -> float:
+    """VR-004/VR-011 (DS-016 root): a NaN/inf gain must NEVER reach the driver via setGain.
+
+    NaN defeats every readback-tolerance comparison (abs(x - nan) is never > tol) and inf/NaN
+    drive the native driver to an undefined level — on a TX path that keys the PA at an
+    unintended, unverified drive. This is the ONE choke point every engine's gain application
+    goes through (configure_soapy_source), so the guard lives here, not per-app."""
+    if not math.isfinite(value):
+        msg = (
+            f"non-finite {what} ({value!r}) — a NaN/inf gain would be pushed into the SDR driver "
+            f"and defeats every readback check; refusing to configure. Fix the config."
+        )
+        raise ValueError(msg)
+    return value
 
 
 def configure_soapy_source(
@@ -79,8 +96,9 @@ def configure_soapy_source(
         elems: dict[str, float] = {}
         for name, val in per_element.items():
             if isinstance(name, str) and _is_number(val):
-                src.set_gain(channel, name, float(val))
-                elems[name] = float(val)
+                db = _require_finite_gain(float(val), f"per-element gain {name!r}")
+                src.set_gain(channel, name, db)
+                elems[name] = db
                 gave_gain = True
         if elems:
             applied["gains"] = elems
@@ -92,8 +110,9 @@ def configure_soapy_source(
     # matching the dsp RX path's elif chain.
     overall = p.get("sdr_gain_db")
     if not gave_gain and _is_number(overall):
-        src.set_gain(channel, float(overall))  # type: ignore[arg-type]
-        applied["gain_db"] = float(overall)  # type: ignore[arg-type]
+        db = _require_finite_gain(float(overall), "overall gain sdr_gain_db")  # type: ignore[arg-type]
+        src.set_gain(channel, db)
+        applied["gain_db"] = db
         gave_gain = True
 
     # Nothing configured the gain and AGC is off -> apply a sane manual default
@@ -131,10 +150,16 @@ def _env_float(name: str) -> float | None:
     if not raw:
         return None
     try:
-        return float(raw)
+        val = float(raw)
     except ValueError:
         _log.warning("ignoring non-numeric %s=%r", name, raw)
         return None
+    # VR-004: float('nan')/float('inf') parse without ValueError — treat them as malformed too
+    # (a non-finite gain must never reach the driver; see _require_finite_gain).
+    if not math.isfinite(val):
+        _log.warning("ignoring non-finite %s=%r", name, raw)
+        return None
+    return val
 
 
 def _env_bool(name: str) -> bool:
@@ -154,9 +179,14 @@ def _env_gains(name: str) -> dict[str, float] | None:
         key, _, val = pair.partition("=")
         key = key.strip()
         try:
-            out[key] = float(val.strip())
+            db = float(val.strip())
         except ValueError:
             _log.warning("ignoring bad gain element %r in %s", pair.strip(), name)
+            continue
+        if not math.isfinite(db):  # VR-004: 'PAD=nan' parses clean but must not reach the driver
+            _log.warning("ignoring non-finite gain element %r in %s", pair.strip(), name)
+            continue
+        out[key] = db
     return out or None
 
 
@@ -278,8 +308,6 @@ def lo_phase_inc(sdr_rate_hz: float, lo_offset_hz: float, doppler_hz: float = 0.
     (``+doppler``) at baseband DOWN to DC: ``-2π(lo_offset + doppler)/sdr_rate``. Pure — so the
     LO/Doppler math is unit-testable without GNU Radio. Feed to ``blocks.rotator_cc`` /
     ``rotator.set_phase_inc`` (see :func:`make_lo_rotator` and each engine's ``set_doppler``)."""
-    import math  # noqa: PLC0415
-
     return -2.0 * math.pi * (float(lo_offset_hz) + float(doppler_hz)) / float(sdr_rate_hz)
 
 
