@@ -81,6 +81,26 @@ RAW_REFINE_MAX_ANCHORS = 2
 RAW_REFINE_MAX_VARIANTS = 256
 RAW_REPEAT_MIN_SIMILARITY = 0.65
 RAW_REPEAT_TIE_TOLERANCE = 0.005
+# --grind: time-resolved near-DC burst discovery for weak / recorder-only passes.  The whole-pass
+# spectrum_summary average dilutes a few short bursts to nothing (reports NO CARRIER), and the |iq|
+# burst gate is defeated by a drifting co-visible carrier (the cmd_107 failure).  Grind instead
+# scores each STFT frame by its near-DC peak-bin SNR over a CLEAN off-DC noise reference, then
+# reports each burst's IN-BAND SNR (occupied bandwidth) -- the number that says whether symbols are
+# recoverable, not whether a narrow carrier/pilot line is present.  Detection only, no deframer.
+GRIND_NFFT = 2048
+GRIND_HOP = 1024
+GRIND_DC_HALF_HZ = 2500.0  # near-DC half-width searched for the data carrier (rotated to DC)
+GRIND_NOISE_LO_HZ = 5000.0  # clean noise reference band (positive side, clear of a low interferer)
+GRIND_NOISE_HI_HZ = 18000.0
+GRIND_SNR_MARGIN_DB = 4.0  # a frame is "on" when its near-DC peak SNR exceeds the track median+this
+GRIND_MERGE_GAP_S = 1.5  # bridge sub-gaps within one physical burst
+GRIND_MIN_DUR_S = 0.3
+GRIND_VERIFY_BITS = 1500  # cross-burst identical-run search span (a sync/preamble is at the start)
+# Occupied-bandwidth half-width for the in-band SNR measurement.  Fixed (not tied to the labelled
+# baud, which may be wrong or a wide default) and narrow enough that the 3-6x reference band always
+# fits inside a 48 kHz capture; sized for the narrowband cubesat bursts grind targets near DC.  It
+# under-reads a genuinely wideband (>~5 kHz occupied) signal, which is not grind's weak-burst case.
+GRIND_INBAND_HALF_HZ = 1500.0
 
 
 @dataclass
@@ -1133,6 +1153,227 @@ def frame_bytes(bits: np.ndarray, *, order: str = "big") -> bytes:
     return np.packbits(b[:n], bitorder=order).tobytes() if n else b""
 
 
+def grind_burst_map(iq: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-STFT-frame near-DC peak-bin SNR + carrier over a clean off-DC noise reference.
+
+    Unlike :func:`spectrum_summary` (a whole-capture average that dilutes a few short bursts to
+    nothing), this keeps time resolution, so brief bursts beside a drifting co-visible carrier still
+    show up.  The bird is Doppler-rotated toward DC by the recorder, so the data carrier sits within
+    ``+-GRIND_DC_HALF_HZ``.  Returns ``(time_s, snr_db, carrier_hz)`` per frame."""
+    n = int(len(iq))
+    if n < GRIND_NFFT:
+        return np.empty(0), np.empty(0), np.empty(0)
+    win = np.hanning(GRIND_NFFT)
+    freqs = np.fft.fftshift(np.fft.fftfreq(GRIND_NFFT, d=1.0 / fs))
+    dc = np.abs(freqs) <= GRIND_DC_HALF_HZ
+    noise = (freqs >= GRIND_NOISE_LO_HZ) & (freqs <= GRIND_NOISE_HI_HZ)
+    if not noise.any():  # narrow capture: fall back to any off-DC bins for the reference
+        noise = np.abs(freqs) > GRIND_DC_HALF_HZ
+    nframes = (n - GRIND_NFFT) // GRIND_HOP
+    t = np.empty(nframes)
+    snr = np.empty(nframes)
+    car = np.empty(nframes)
+    for i in range(nframes):
+        seg = np.asarray(iq[i * GRIND_HOP : i * GRIND_HOP + GRIND_NFFT]) * win
+        p = np.abs(np.fft.fftshift(np.fft.fft(seg))) ** 2
+        t[i] = (i * GRIND_HOP + GRIND_NFFT / 2) / fs
+        pk = int(np.argmax(np.where(dc, p, 0.0)))
+        floor = float(np.median(p[noise])) + 1e-30
+        snr[i] = 10.0 * np.log10(float(p[pk]) / floor + 1e-30)
+        car[i] = float(freqs[pk])
+    return t, snr, car
+
+
+def grind_detect_bursts(
+    t: np.ndarray, snr: np.ndarray, car: np.ndarray,
+) -> list[tuple[float, float, float, float]]:
+    """Contiguous near-DC bursts from the SNR track as ``(t0, t1, carrier_hz, peak_snr_db)``."""
+    if not len(t):
+        return []
+    thr = float(np.median(snr)) + GRIND_SNR_MARGIN_DB
+    edges = np.diff((snr > thr).astype(np.int8), prepend=0, append=0)
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    merged: list[list[int]] = []
+    for s, e in zip(starts, ends, strict=False):
+        if merged and t[s] - t[merged[-1][1] - 1] < GRIND_MERGE_GAP_S:
+            merged[-1][1] = int(e)
+        else:
+            merged.append([int(s), int(e)])
+    out: list[tuple[float, float, float, float]] = []
+    for s, e in merged:
+        if t[e - 1] - t[s] < GRIND_MIN_DUR_S:
+            continue
+        out.append(
+            (float(t[s]), float(t[e - 1]), float(np.median(car[s:e])), float(snr[s:e].max()))
+        )
+    return out
+
+
+def grind_inband_snr_db(iq: np.ndarray, fs: float, carrier_hz: float, half_bw_hz: float) -> float:
+    """SNR of the OCCUPIED band (``carrier +- half_bw``) over an adjacent off-band reference.
+
+    This is the decodability number: a narrow carrier/pilot line can read 15-20 dB in a single FFT
+    bin while the wideband modulation it carries is only a couple of dB over the noise in its actual
+    occupied bandwidth -- far below what any demod needs.  ``nan`` when the window is too short."""
+    n = int(len(iq))
+    if n < 256 or half_bw_hz <= 0:
+        return float("nan")
+    x = np.asarray(iq) * np.hanning(n)
+    p = np.abs(np.fft.fftshift(np.fft.fft(x))) ** 2
+    f = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs))
+    off = np.abs(f - carrier_hz)
+    inband = off <= half_bw_hz
+    ref = (off >= 3.0 * half_bw_hz) & (off <= 6.0 * half_bw_hz)
+    if not inband.any() or not ref.any():
+        return float("nan")
+    nf = float(p[ref].mean()) + 1e-30
+    return 10.0 * np.log10(max(float(p[inband].mean()) - nf, 1e-30) / nf)
+
+
+def _longest_identical_run(a: np.ndarray, b: np.ndarray, *, min_overlap: int = 32) -> int:
+    """Longest run of consecutive identical bits between two hard-decision streams, over all lags.
+
+    A sync word / fixed header shared by two bursts shows up as a run well past the ``~log2(La*Lb)``
+    chance level -- the high-assurance signal that the demod recovered real symbols, not noise
+    (scrambling cannot forge it).  Streams are pre-clipped by the caller to bound cost."""
+    a = np.asarray(a, dtype=np.uint8)
+    b = np.asarray(b, dtype=np.uint8)
+    la, lb = len(a), len(b)
+    if la < min_overlap or lb < min_overlap:
+        return 0
+    best = 0
+    for lag in range(-(lb - min_overlap), la - min_overlap + 1):
+        i0, i1 = max(0, lag), min(la, lb + lag)
+        eq = (a[i0:i1] == b[i0 - lag : i1 - lag]).astype(np.int8)
+        if not eq.any():
+            continue
+        brk = np.flatnonzero(np.diff(np.concatenate(([0], eq, [0]))))
+        run = int((brk[1::2] - brk[0::2]).max())
+        if run > best:
+            best = run
+    return best
+
+
+def grind_pass(
+    iq: np.ndarray, fs: float, *, symbol_rate: float, bauds: tuple[float, ...],
+    framings_to_try: tuple[str, ...] = ("ax25", "endurosat"), channel_bw_hz: float = 0.0,
+    mod_index: float = DEFAULT_MOD_INDEX, bt: float = DEFAULT_BT, target_sps: int = 16,
+    correct_cfo: bool = True, recover_timing: bool = False,
+    raw_bits_dir: str | Path | None = None, capture_offset_s: float = 0.0,
+) -> None:
+    """Detect + characterize weak near-DC bursts and report whether they are decodable.
+
+    Diagnostic only: it does not decode any framing.  For each burst it prints the peak-bin SNR (the
+    carrier line), the IN-BAND SNR (the occupied-bandwidth number that decides recoverability), and
+    a best-effort demod with a high-assurance verifiability check (longest alternating preamble run
+    and the longest identical bit run shared across repeated bursts vs the chance level)."""
+    iq = np.asarray(iq, dtype=np.complex64)
+    t, snr, car = grind_burst_map(iq, fs)
+    bursts = grind_detect_bursts(t, snr, car)
+    baud_list = tuple(bauds) if bauds else (symbol_rate,)
+    print(f"grind: {len(bursts)} near-DC burst(s) (time-resolved peak SNR over a clean noise "
+          "floor; in-band SNR = decodability):")
+    guard = int(fs * 0.05)
+    streams: list[tuple[int, np.ndarray]] = []  # (baud, bits) per burst, for the cross-burst check
+    candidates: list[dict[str, object]] = []
+    for k, (t0, t1, carrier, psnr) in enumerate(bursts):
+        lo = max(0, int((t0) * fs) - guard)
+        hi = min(len(iq), int((t1) * fs) + guard)
+        seg = np.asarray(iq[lo:hi])
+        inband = grind_inband_snr_db(seg, fs, carrier, GRIND_INBAND_HALF_HZ)
+        best: tuple[int, int, np.ndarray | None] = (-1, int(symbol_rate), None)
+        for baud in baud_list:
+            ch = channel_bw_hz if channel_bw_hz > 0 else 2.0 * baud
+            bits = gfsk.demodulate_capture(
+                seg, fs, symbol_rate_hz=baud, mod_index=mod_index, bt=bt,
+                target_sps=max(2, int(target_sps)), carrier_hz=float(carrier), channel_bw_hz=ch,
+                correct_cfo=correct_cfo, recover_timing=recover_timing,
+            )
+            if not len(bits):
+                continue
+            alt = _longest_alt_run(bits)
+            if alt > best[0]:
+                best = (alt, int(baud), np.asarray(bits, dtype=np.uint8))
+        alt, bbaud, bbits = best
+        frames: list[tuple[str, bytes]] = []
+        if bbits is not None:
+            streams.append((bbaud, bbits))
+            for name in framings_to_try:
+                fr, _ = framings.deframe(bbits, name)
+                frames.extend((name, f) for f in fr)
+        inband_txt = "n/a" if math.isnan(inband) else f"{inband:+.1f}dB"
+        print(f"  burst {k}: t={t0:7.2f}..{t1:6.2f}s dur={t1 - t0:4.2f}s carrier={carrier:+6.0f}Hz "
+              f"peakSNR={psnr:4.1f}dB inbandSNR={inband_txt} | demod baud={bbaud} "
+              f"preamble-run={alt}b frames={len(frames)}")
+        for name, f in frames:
+            print(f"      !! {name} FRAME: {f.hex()}")
+        if raw_bits_dir is not None and bbits is not None:
+            candidates.append({
+                "capture_time_basis": "seconds from capture start",
+                "time_s": float(capture_offset_s + t0),
+                "window_s": float(t1 - t0),
+                "baud": int(bbaud),
+                "carrier_hz": float(carrier),
+                "peak_snr_db": float(psnr),
+                "inband_snr_db": None if math.isnan(inband) else float(inband),
+                "alternating_run_bits": int(alt),
+                "bit_count": int(len(bbits)),
+                "bit_format": "ASCII 0/1 hard decisions; first char is bit 0",
+                "reasons": ["grind_burst_detected"],
+                "_bits": bbits,
+            })
+    # High-assurance verifiability: a shared sync word across repeated bursts is the strongest proof
+    # a demod recovered real symbols.  Compare same-baud bursts and flag runs well past chance.
+    same: dict[int, list[np.ndarray]] = {}
+    for baud, bits in streams:
+        same.setdefault(baud, []).append(bits[:GRIND_VERIFY_BITS])
+    best_run, best_baud = 0, 0
+    for baud, group in same.items():
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                run = _longest_identical_run(group[i], group[j])
+                if run > best_run:
+                    best_run, best_baud = run, baud
+    if best_run:
+        span = min(GRIND_VERIFY_BITS, max(len(s) for _, s in streams))
+        chance = math.log2(max(span, 2) ** 2)
+        verdict = ("VERIFIED shared bit run (real symbols recovered)"
+                   if best_run >= chance + 12 else "at chance level -> NOT verifiable (noise-like)")
+        print(f"cross-burst check @{best_baud} Bd: longest shared identical run = {best_run} bits "
+              f"(chance ~{chance:.0f}) -> {verdict}")
+    if bursts:
+        inbands = [
+            grind_inband_snr_db(
+                np.asarray(iq[max(0, int(t0 * fs) - guard) : min(len(iq), int(t1 * fs) + guard)]),
+                fs, carrier, GRIND_INBAND_HALF_HZ,
+            )
+            for (t0, t1, carrier, _psnr) in bursts
+        ]
+        finite = [v for v in inbands if not math.isnan(v)]
+        if not finite:
+            state = "in-band SNR unavailable"
+        elif max(finite) >= 8.0:
+            state = f"possibly decodable (strongest in-band SNR {max(finite):+.1f}dB)"
+        else:
+            state = f"NOT recoverable: best in-band SNR {max(finite):+.1f}dB << ~8-10 dB needed"
+        print(f"grind verdict: {state}")
+    if raw_bits_dir is not None and candidates:
+        out_dir = Path(raw_bits_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for cand in candidates:
+            sign = "p" if float(cand["carrier_hz"]) >= 0 else "m"
+            stem = (f"grind_t{float(cand['time_s']):010.3f}_b{int(cand['baud'])}_"
+                    f"c{sign}{abs(int(round(float(cand['carrier_hz'])))):05d}")
+            arr = np.asarray(cand["_bits"], dtype=np.uint8)
+            meta = {key: val for key, val in cand.items() if not key.startswith("_")}
+            (out_dir / f"{stem}.rawbits").write_text(
+                "".join(map(str, arr.tolist())) + "\n", encoding="ascii")
+            (out_dir / f"{stem}.json").write_text(
+                json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"  grind: {len(candidates)} burst symbol stream(s) written to {out_dir.resolve()}")
+
+
 def analyze_file(
     path: str | Path, symbol_rate: float = DEFAULT_SYMBOL_RATE, sample_rate_hz: float = 0.0,
     *, run_ax25: bool = False, run_endurosat: bool = False, sweep_window_s: float = 0.0,
@@ -1146,6 +1387,7 @@ def analyze_file(
     raw_bits_dir: str | Path | None = None,
     raw_min_alt_run: int = 0,
     refine_raw: bool = True,
+    want_grind: bool = False,
 ) -> None:
     cap = load_capture(path, sample_rate_hz)
     dur = len(cap.iq) / cap.fs if cap.fs else 0.0
@@ -1162,6 +1404,16 @@ def analyze_file(
         write_waterfall_png(
             wf, cap.iq, sample_rate_hz=cap.fs, center_hz=cap.center_hz, title=Path(path).stem)
         print(f"waterfall: wrote {wf.name}")
+    if want_grind:
+        # Weak / recorder-only mode: the whole-pass average + |iq| gate below miss short near-DC
+        # bursts beside a drifting carrier.  Detect on time-resolved SNR; report in-band SNR.
+        grind_pass(
+            cap.iq, cap.fs, symbol_rate=symbol_rate,
+            bauds=_usable_sweep_bauds(cap.fs, symbol_rate), channel_bw_hz=channel_bw_hz,
+            mod_index=mod_index, bt=bt, target_sps=target_sps, correct_cfo=correct_cfo,
+            recover_timing=recover_timing, raw_bits_dir=raw_bits_dir,
+        )
+        return
     # Carrier check: is there ANY signal (weak/continuous too, not just bursts)? A NO CARRIER
     # verdict makes the demod/framing/baud debate moot — the capture is empty (freq/antenna/off).
     sp = spectrum_summary(cap.iq, cap.fs)
@@ -1325,6 +1577,9 @@ def main(argv: list[str] | None = None) -> int:
                         "refinement")
     p.add_argument("--waterfall", action="store_true",
                    help="write a colored spectrogram <capture>.analyze.png (needs matplotlib)")
+    p.add_argument("--grind", action="store_true",
+                   help="weak/recorder-only mode: time-resolved near-DC burst detection, per-burst "
+                        "in-band SNR decodability verdict, best-effort demod (no framing decode)")
     args = p.parse_args(argv)
     analyze_file(args.capture, symbol_rate=args.symbol_rate, sample_rate_hz=args.sample_rate,
                  run_ax25=args.ax25, run_endurosat=args.endurosat,
@@ -1337,7 +1592,7 @@ def main(argv: list[str] | None = None) -> int:
                  target_sps=args.target_sps, correct_cfo=not args.no_cfo,
                  recover_timing=args.recover_timing, raw_bits_dir=args.raw_bits_dir,
                  raw_min_alt_run=args.raw_min_alt_run, refine_raw=not args.no_refine_raw,
-                 carrier_hz=args.carrier_hz, want_waterfall=args.waterfall)
+                 carrier_hz=args.carrier_hz, want_waterfall=args.waterfall, want_grind=args.grind)
     return 0
 
 
