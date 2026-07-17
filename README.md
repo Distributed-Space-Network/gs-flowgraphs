@@ -39,21 +39,28 @@ gs-flowgraphs/
 
 ## Multi-mission decoding (gr-satellites)
 
-To be "prepared for everything", non-EnduroSat missions decode via **gr-satellites**
+The experimental multi-mission path can decode non-EnduroSat missions via **gr-satellites**
 (GPLv3) — the canonical library of public satellite framers/deframers across
 AFSK/FSK/GFSK/BPSK/GMSK/… with AX.25/AX.100/Mobitex/CCSDS/… framings. We *integrate*
 it rather than reimplement it: `satellite_rx.py` is a spawn-contract app that runs
 gr-satellites for a selected `satellite` (SatYAML id) and emits decoded frames, via
-the `gnuradio_satellites.py` bridge. **Bench-pending** (needs GNU Radio +
-gr-satellites + gr-soapy). Design + licensing (gr-satellites GPLv3; *not* the AGPL
+the `gnuradio_satellites.py` bridge. **It is disabled by default in production**
+(`GS_GRSAT_LIVE` is unset) because the bench integration has deadlocked/crashed and starved the IQ
+recorder. With it disabled, a known modem still demodulates and records channel IQ, but a framing
+without a local native deframer (AX.100, USP, Mobitex, …) reports `no deframer` and produces no
+frames. Native replacements are deferred to
+[`../docs/native_grsat_framing_implementation_plan.md`](../docs/native_grsat_framing_implementation_plan.md).
+Design + licensing (gr-satellites GPLv3; *not* the AGPL
 gr-satnogs/satnogs-client): see `../docs/07-multi-mission-framing.md`. The EnduroSat
 mission keeps its dedicated, tested `dsp` path (`cubesat_gfsk_ax25_rx.py
 --framing endurosat`).
 
 ## Universal modem + framing (docs/08)
 
-Beyond gr-satellites, the engine is a **three-registry composer** so it can demodulate + deframe
-*any documented downlink* (commercial/government/amateur), not just amateur AX.25. See
+Beyond gr-satellites, the engine is a **three-registry composer** whose target is documented
+commercial/government/amateur downlinks, not just amateur AX.25. The registry is also an honest
+capability planner: an advertised label is not production-decodable until a local native deframer
+exists or the experimental gr-satellites path is explicitly enabled. See
 [`../docs/08-universal-modem-framing-plan.md`](../docs/08-universal-modem-framing-plan.md) (plan) and
 [`../docs/09-universal-modem-framing-integration-changes.md`](../docs/09-universal-modem-framing-integration-changes.md)
 (the deferred backend/frontend/config changes it implies).
