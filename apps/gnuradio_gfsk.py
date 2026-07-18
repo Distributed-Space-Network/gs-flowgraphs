@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import math
-import queue
 
 import numpy as np
 from _recorder import PassRecorder
@@ -42,10 +41,23 @@ from _soapy import (
 )
 from gnuradio import analog, blocks, digital, gr
 from gnuradio import filter as gr_filter
+from native_framing.runtime_queue import BoundedQueue, QueueStats, require_lossless
 
 from gfsk_ax25 import endurosat
 
 _log = logging.getLogger("gnuradio_gfsk")
+
+_SYMBOL_QUEUE_CAPACITY_CHUNKS = 256
+_SYMBOL_QUEUE_CAPACITY_SYMBOLS = 1 << 20
+
+
+def _drain_symbol_queue(
+    handoff: BoundedQueue[np.ndarray], *, dtype: type[np.generic], label: str
+) -> np.ndarray:
+    stats = handoff.stats()
+    require_lossless(stats, label=label, unit_name="symbols")
+    chunks = handoff.drain()
+    return np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)
 
 
 class _BitSink(gr.sync_block):
@@ -53,20 +65,45 @@ class _BitSink(gr.sync_block):
 
     def __init__(self) -> None:
         gr.sync_block.__init__(self, name="bit_sink", in_sig=[np.uint8], out_sig=None)
-        self._q: queue.Queue[np.ndarray] = queue.Queue()
+        self._q = BoundedQueue[np.ndarray](
+            capacity_items=_SYMBOL_QUEUE_CAPACITY_CHUNKS,
+            capacity_units=_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
+        )
 
     def work(self, input_items, output_items):  # type: ignore[no-untyped-def]
-        self._q.put(np.array(input_items[0], dtype=np.uint8))
+        chunk = np.array(input_items[0], dtype=np.uint8)
+        self._q.offer(chunk, units=int(chunk.size))
         return len(input_items[0])
 
     def drain(self) -> np.ndarray:
-        out: list[np.ndarray] = []
-        while True:
-            try:
-                out.append(self._q.get_nowait())
-            except queue.Empty:
-                break
-        return np.concatenate(out) if out else np.empty(0, dtype=np.uint8)
+        return _drain_symbol_queue(self._q, dtype=np.uint8, label="hard-bit")
+
+    @property
+    def queue_stats(self) -> QueueStats:
+        return self._q.stats()
+
+
+class SoftSymbolSink(gr.sync_block):
+    """Collect post-timing-recovery float symbols for native soft-input deframers."""
+
+    def __init__(self) -> None:
+        gr.sync_block.__init__(self, name="soft_symbol_sink", in_sig=[np.float32], out_sig=None)
+        self._q = BoundedQueue[np.ndarray](
+            capacity_items=_SYMBOL_QUEUE_CAPACITY_CHUNKS,
+            capacity_units=_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
+        )
+
+    def work(self, input_items, output_items):  # type: ignore[no-untyped-def]
+        chunk = np.array(input_items[0], dtype=np.float64)
+        self._q.offer(chunk, units=int(chunk.size))
+        return len(input_items[0])
+
+    def drain(self) -> np.ndarray:
+        return _drain_symbol_queue(self._q, dtype=np.float64, label="soft-symbol")
+
+    @property
+    def queue_stats(self) -> QueueStats:
+        return self._q.stats()
 
 
 class _RmsAgc(gr.hier_block2):

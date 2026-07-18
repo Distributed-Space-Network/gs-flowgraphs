@@ -14,6 +14,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from native_framing.sample_clock import select_channel_rate
+
 # Samples/symbol the channel must give the demods. symbol_sync needs sps>1; ~4 is a
 # comfortable margin for GFSK/PSK timing recovery.
 CHANNEL_OVERSAMPLE = 4.0
@@ -66,21 +68,12 @@ def channel_rate_for(sample_rate: float, symbol_rate_hz: float, sdr_rate: float)
     rarely-exercised code path; snapping gives 102400 = 2.048M/20 = a clean ``1/20`` decimation.
     The LOW-baud path (channel == requested ``sample_rate``) is left untouched — it is the proven
     default and its mild resampler already records reliably."""
-    sr = float(sample_rate)
-    want = max(sr, CHANNEL_OVERSAMPLE * float(symbol_rate_hz or 0.0))
-    sdr = float(sdr_rate)
-    if want >= sdr:
-        return sdr                       # can't decimate to more than we sampled
-    if want <= sr:
-        return sr                        # low-baud: keep the requested rate (proven path)
-    # High-baud widening: largest integer decim that divides the capture rate and still leaves
-    # channel >= want (so the demod keeps >= CHANNEL_OVERSAMPLE sps). Falls back to the exact
-    # ``want`` (rational resampler, old behavior) only if no clean divisor fits.
-    sdr_i = int(round(sdr))
-    decim = int(sdr // want)             # floor => channel = sdr/decim >= want
-    while decim > 1 and sdr_i % decim != 0:
-        decim -= 1
-    return sdr / decim if decim >= 1 else want
+    return select_channel_rate(
+        sample_rate,
+        symbol_rate_hz,
+        sdr_rate,
+        minimum_samples_per_symbol=CHANNEL_OVERSAMPLE,
+    )
 
 
 def no_decode_reason(

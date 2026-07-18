@@ -52,6 +52,7 @@ install(
     apps/satellite_rx.py             # multi-mission gr-satellites receiver (bench)
     apps/iq_views.py                 # post-pass PNG/CSV/SDF from a .cf32 (run by gs-client)
     apps/iq_decode.py                # post-pass decode of the non-live framings from a .cf32 (docs/13)
+    apps/telemetry_preview.py        # derived, operator-only payload preview sidecar
   DESTINATION ${GS_APPS_INSTALL_DIR}
 )
 install(
@@ -80,6 +81,21 @@ install(
 # ``from gfsk_ax25 import ...`` resolves at runtime, like ``_spawn_contract``.
 install(
   DIRECTORY apps/gfsk_ax25
+  DESTINATION ${GS_APPS_INSTALL_DIR}
+  FILES_MATCHING PATTERN "*.py"
+)
+install(
+  DIRECTORY apps/native_framing
+  DESTINATION ${GS_APPS_INSTALL_DIR}
+  FILES_MATCHING PATTERN "*.py"
+)
+install(
+  DIRECTORY apps/native_lora
+  DESTINATION ${GS_APPS_INSTALL_DIR}
+  FILES_MATCHING PATTERN "*.py"
+)
+install(
+  DIRECTORY apps/native_telemetry
   DESTINATION ${GS_APPS_INSTALL_DIR}
   FILES_MATCHING PATTERN "*.py"
 )

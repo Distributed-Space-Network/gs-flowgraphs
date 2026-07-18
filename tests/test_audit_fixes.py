@@ -112,7 +112,7 @@ def test_engine_race_wiring_consults_race_winner():
     src = (_APPS / "gnuradio_satellites.py").read_text(encoding="utf-8")
     assert "compose.race_winner(" in src
     assert "race_framing" in src
-    drain = src[src.index("def drain_frames(self) -> list[tuple[str, bytes]]"):]
+    drain = src[src.index("def drain_frames(self) -> list[_DecodedFrame]"):]
     drain = drain[: drain.index("def _gate_off")]
     assert "compose.race_winner(" in drain
     assert 'if our_frames:\n                self._winner = "ours"' not in drain

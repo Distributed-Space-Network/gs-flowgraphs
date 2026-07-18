@@ -25,7 +25,6 @@ import json
 import logging
 import math
 import sys
-import time
 from pathlib import Path
 
 from _doppler import NullDopplerSource, make_doppler_source, run_doppler_poll
@@ -51,19 +50,46 @@ _DEFAULT_SAMPLE_RATE = 2_000_000
 _FIRST_SAMPLE_TIMEOUT_S = 15.0
 
 
-def _append_frame_record(output_dir: str | None, frame: bytes, decoder: str) -> None:
+def _append_frame_record(
+    output_dir: str | None,
+    frame: bytes,
+    decoder: str,
+    *,
+    framing: str = "",
+    source_start: int | None = None,
+    source_end: int | None = None,
+    source_offset_kind: str = "",
+    integrity: str = "",
+    polarity: str = "",
+    sync_distance: float | None = None,
+    corrected_symbols: int | None = None,
+) -> None:
     """Append a ``{raw, deframed}`` record to ``<output_dir>/frames.jsonl`` (lives in the
     pass dir → obeys the same IQ retention). For the multi-mission RX the decoded frame
     IS the deframed unit, so ``raw`` and ``deframed`` are the same on-wire bytes."""
     if not output_dir:
         return
-    rec = {
-        "ts": time.time(),
+    rec: dict[str, object] = {
         "decoder": decoder,
         "len": len(frame),
         "raw_hex": frame.hex(),
         "deframed_hex": frame.hex(),
+        "payload_hex": frame.hex(),
+        # No decoder/process wall-clock fallback: until an exact capture clock and raw-sample
+        # mapping are available, the record must say that UTC is unavailable.
+        "timestamp_status": "unavailable",
     }
+    optional = {
+        "framing": framing,
+        "source_start": source_start,
+        "source_end": source_end,
+        "source_offset_kind": source_offset_kind,
+        "integrity": integrity,
+        "polarity": polarity,
+        "sync_distance": sync_distance,
+        "corrected_symbols": corrected_symbols,
+    }
+    rec.update({key: value for key, value in optional.items() if value not in (None, "")})
     try:
         with (Path(output_dir) / "frames.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
@@ -72,17 +98,43 @@ def _append_frame_record(output_dir: str | None, frame: bytes, decoder: str) -> 
 
 
 async def _emit_frame(
-    sockets, frame: bytes, satellite: str, *, decoder: str = "gr-satellites", output_dir=None
+    sockets,
+    frame: bytes,
+    satellite: str,
+    *,
+    decoder: str = "gr-satellites",
+    output_dir=None,
+    framing: str = "",
+    source_start: int | None = None,
+    source_end: int | None = None,
+    source_offset_kind: str = "",
+    integrity: str = "",
+    polarity: str = "",
+    sync_distance: float | None = None,
+    corrected_symbols: int | None = None,
 ) -> None:
-    _append_frame_record(output_dir, frame, decoder)
+    metadata = {
+        "framing": framing,
+        "source_start": source_start,
+        "source_end": source_end,
+        "source_offset_kind": source_offset_kind,
+        "integrity": integrity,
+        "polarity": polarity,
+        "sync_distance": sync_distance,
+        "corrected_symbols": corrected_symbols,
+    }
+    _append_frame_record(output_dir, frame, decoder, **metadata)
     # R-18: the shared builder carries frame.id + crc_ok — without them the
     # orchestrator's parser defaulted crc_ok to False and every decoded frame
     # was counted INVALID (never downlink life). Both decode paths here are
-    # validity-gated by construction (gr-satellites deframers CRC/FEC-check
-    # their protocols; our fallback demods are CRC-gated).
-    event = frame_received_event(frame, crc_ok=True)
+    # Legacy gr-satellites/local outputs are validity-gated by construction. Native profiles
+    # state integrity explicitly; a profile with no integrity field must not become downlink-life
+    # evidence merely because it found a syncword.
+    crc_ok = not integrity or integrity == "passed"
+    event = frame_received_event(frame, crc_ok=crc_ok)
     event["decoder"] = decoder
     event["satellite"] = satellite
+    event.update({key: value for key, value in metadata.items() if value not in (None, "")})
     await send_event(sockets.status_writer, event)
     # NOTE: we deliberately do NOT tee frames to the data socket. The decoded-frames product
     # is frames.jsonl (appended above; gs-client uploads it post-pass). Streaming frames to the
@@ -157,9 +209,7 @@ async def amain(args) -> int:
     # the SDR delivers). No recorder → proof unavailable, reported as such.
     # R2-15: the proof must not depend on the RECORDING feature flag — fall back to the GR
     # source's own item count, so a deaf radio is caught even with recording off.
-    probe = first_sample_probe(
-        getattr(ctx, "recorder", None), source=getattr(ctx, "src", None)
-    )
+    probe = first_sample_probe(getattr(ctx, "recorder", None), source=getattr(ctx, "src", None))
     first: bool | None = None
     if probe is not None:
         first = await await_first_samples(probe, timeout_s=_FIRST_SAMPLE_TIMEOUT_S)
@@ -241,6 +291,24 @@ async def amain(args) -> int:
             decoder,
         )
         last_doppler = 0.0
+
+        async def _emit_decoded(decoded) -> None:  # type: ignore[no-untyped-def]
+            await _emit_frame(
+                sockets,
+                decoded.payload,
+                satellite,
+                decoder=decoded.source,
+                output_dir=out_dir,
+                framing=decoded.framing,
+                source_start=decoded.source_start,
+                source_end=decoded.source_end,
+                source_offset_kind=decoded.source_offset_kind,
+                integrity=decoded.integrity,
+                polarity=decoded.polarity,
+                sync_distance=decoded.sync_distance,
+                corrected_symbols=decoded.corrected_symbols,
+            )
+
         # Flowgraph OWNS Doppler: poll the source and drive ctx.set_doppler at the poll rate,
         # decoupled from the control socket. Runs until stop_requested; a source outage just keeps
         # the last offset (run_doppler_poll never raises). When no source resolved, this is skipped
@@ -250,9 +318,13 @@ async def amain(args) -> int:
         doppler_task = None
         if doppler_poll:
             doppler_task = asyncio.create_task(
-                run_doppler_poll(doppler_source, ctx.set_doppler, stop_requested,
-                                 period_s=poll_period_s,
-                                 fallback_offset=lambda: doppler["hz"]),
+                run_doppler_poll(
+                    doppler_source,
+                    ctx.set_doppler,
+                    stop_requested,
+                    period_s=poll_period_s,
+                    fallback_offset=lambda: doppler["hz"],
+                ),
                 name="doppler-poll",
             )
             log.info("doppler: flowgraph-owned poll @ %.0f Hz", 1.0 / poll_period_s)
@@ -268,16 +340,31 @@ async def amain(args) -> int:
                 # Decode is LIVE: gr-satellites and/or our one demod (the bird's backend mode),
                 # each frame tagged with the engine that produced it. Frames -> status events +
                 # frames.jsonl, which gs-client uploads post-pass. No bank, no post-pass decode.
-                for source, frame in ctx.drain_frames():
-                    await _emit_frame(
-                        sockets, frame, satellite, decoder=source, output_dir=out_dir
-                    )
+                for decoded in ctx.drain_frames():
+                    await _emit_decoded(decoded)
         finally:
             if doppler_task is not None:
                 doppler_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await doppler_task
+            # Stop/wait first so every scheduler buffer reaches the sinks, then drain once more
+            # and finalize each native streaming decoder. This is the only safe place to capture
+            # a frame ending immediately before the pass stop command.
             ctx.stop()
+            for decoded in ctx.drain_frames():
+                await _emit_decoded(decoded)
+            for decoded in ctx.flush_frames():
+                await _emit_decoded(decoded)
+            shadow = ctx.finalize_shadow()
+            if shadow is not None:
+                await send_event(
+                    sockets.status_writer,
+                    {
+                        "event": "native_shadow_summary",
+                        "comparison": "payload",
+                        **shadow.as_dict(),
+                    },
+                )
             ctx.wait()
 
     engine_task = asyncio.create_task(_engine(), name="gr-satellites")

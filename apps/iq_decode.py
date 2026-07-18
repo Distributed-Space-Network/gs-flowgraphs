@@ -7,8 +7,8 @@ time; this sweeps the recorded IQ for the framings they do NOT run live
 (``framings.POST_PASS_FRAMINGS`` — the other CRC-gated local link layers, currently ``ccsds_tm``),
 so a pass that carried one of those still yields frames. ``kiss`` is NOT swept by default (it has
 no integrity check, so a blind whole-pass sweep would emit noise "frames") — request it explicitly
-if a pass is known KISS. gr-satellites-only framings (USP, AX100, …) are not handled here at all;
-they need the GNU Radio engine.
+if a pass is known KISS. Labels with an available native profile are decoded through the shared
+streaming registry; labels that remain planned (USP, AX100, …) still require the GNU Radio engine.
 
 **Doppler.** The recorded ``.cf32`` is RAW — captured BEFORE the live Doppler NCO — so it carries
 the full pass Doppler swing (±~9 kHz at 400 MHz LEO), which is larger than a burst CFO estimate can
@@ -36,17 +36,120 @@ import argparse
 import json
 import logging
 import sys
-import time
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 
 import framings
+import modem
 import numpy as np
+from native_framing import (
+    AfskConfig,
+    BpskConfig,
+    FrameResult,
+    SampleClock,
+    SymbolInput,
+    build_decoder,
+    demodulate_afsk,
+    demodulate_bpsk,
+    resolve_profile,
+)
+from native_framing.modem_matrix import RxExecution, plan_native_rx_pairing
+from native_framing.output import utc_from_sample_offset
 
 from gfsk_ax25 import gfsk
 
 log = logging.getLogger("iq_decode")
 _DEFAULT_SYMBOL_RATE_HZ = 9600.0
 _DEFAULT_WINDOW_S = 1.0  # short enough that any residual offset is ~constant across the window
+
+
+def _optional_bool(
+    name: str, explicit: bool | None, parameters: Mapping[str, object]
+) -> bool | None:
+    if explicit is not None or name not in parameters:
+        return explicit
+    value = parameters[name]
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be bool")
+    return value
+
+
+def _optional_float(
+    name: str,
+    explicit: float | None,
+    parameters: Mapping[str, object],
+    default: float,
+) -> float:
+    value = explicit if explicit is not None else parameters.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be numeric")
+    return float(value)
+
+
+def _decoder_parameters(profile, supplied: Mapping[str, object]) -> dict[str, object]:
+    """Select this profile's parameters from the directive-wide waveform map.
+
+    Protobuf ``Struct`` represents every JSON number as ``double``.  Preserve strict
+    profile validation while restoring integral values for parameters declared as
+    integers; otherwise a valid backend ``frame_size: 256`` arrives here as ``256.0``
+    and is rejected before the decoder can be constructed.
+    """
+
+    selected: dict[str, object] = {}
+    for key, spec in profile.parameters.items():
+        if key not in supplied:
+            continue
+        value = supplied[key]
+        if spec.value_type is int and isinstance(value, float) and value.is_integer():
+            value = int(value)
+        selected[key] = value
+    return selected
+
+
+def _symbols_for_profile(bits: np.ndarray, symbol_input: SymbolInput) -> np.ndarray:
+    """Adapt hard GFSK decisions to the native profile's declared symbol convention.
+
+    The offline demodulator currently exposes hard decisions.  Soft-input deframers can
+    still consume those decisions at unit confidence, with the package-wide convention
+    ``positive => bit 1``.  This is less informative than true discriminator values but
+    is type-correct and deterministic; it must never pass 0/1 values as soft amplitudes.
+    """
+
+    hard = np.asarray(bits, dtype=np.uint8)
+    if symbol_input is SymbolInput.HARD_BITS:
+        return hard
+    return hard.astype(np.float64) * 2.0 - 1.0
+
+
+def _afsk_tones(parameters: Mapping[str, object]) -> tuple[float, float]:
+    """Return mark/space audio tones from the JSON-safe waveform map."""
+
+    value = parameters.get("tones_hz", (1_200.0, 2_200.0))
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("tones_hz must contain exactly two numeric frequencies")
+    if any(isinstance(item, bool) for item in value):
+        raise ValueError("tones_hz must contain exactly two numeric frequencies")
+    try:
+        one_hz, zero_hz = (float(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "tones_hz must contain exactly two numeric frequencies"
+        ) from exc
+    return one_hz, zero_hz
+
+
+def _fm_discriminator(iq: np.ndarray) -> np.ndarray:
+    """Recover bounded real FM audio while retaining the IQ sample clock."""
+
+    samples = np.asarray(iq)
+    if samples.ndim != 1 or not np.iscomplexobj(samples):
+        raise ValueError("AFSK replay requires one-dimensional complex IQ")
+    audio = np.zeros(samples.size, dtype=np.float64)
+    if samples.size > 1:
+        audio[1:] = np.angle(samples[1:] * np.conjugate(samples[:-1]))
+        audio[0] = audio[1]
+    return audio
 
 
 def _derotate_doppler(
@@ -73,14 +176,30 @@ def decode_capture(
     symbol_rate_hz: float = _DEFAULT_SYMBOL_RATE_HZ,
     framings_to_try: tuple[str, ...] = framings.POST_PASS_FRAMINGS,
     doppler_track: list[tuple[float, float]] | None = None,
+    capture_start_unix_s: float = 0.0,
     window_s: float = _DEFAULT_WINDOW_S,
-    mod_index: float = 0.5,
-    bt: float = 0.5,
+    framing_parameters: Mapping[str, object] | None = None,
+    modulation: str | None = None,
+    differential: bool | None = None,
+    manchester: bool | None = None,
+    mod_index: float | None = None,
+    bt: float | None = None,
+    native_evaluation: bool = False,
 ) -> list[dict]:
     """Doppler-de-rotate (from ``doppler_track``) + windowed demod + deframe of ``cf32`` with each
     framing in ``framings_to_try``. Returns the decoded frame records (also appended to
     ``<pass>/frames.jsonl`` when any are found)."""
     path = Path(cf32)
+    supplied_parameters = dict(framing_parameters or {})
+    modulation_value = modulation if modulation is not None else supplied_parameters.get(
+        "modulation", "gfsk"
+    )
+    if not isinstance(modulation_value, str) or not modulation_value.strip():
+        raise ValueError("modulation must be a non-empty string")
+    differential = _optional_bool("differential", differential, supplied_parameters)
+    manchester = _optional_bool("manchester", manchester, supplied_parameters)
+    mod_index_value = _optional_float("mod_index", mod_index, supplied_parameters, 0.5)
+    bt_value = _optional_float("bt", bt, supplied_parameters, 0.5)
     if not framings_to_try:
         return []
     if not path.exists():
@@ -100,6 +219,27 @@ def decode_capture(
         log.warning("iq_decode: %s has no samples", path)
         return []
     iq = np.memmap(path, dtype=np.complex64, mode="r", shape=(n_samp,))
+    sample_clock = SampleClock(sample_rate_hz, symbol_rate_hz)
+    modulation_spec = modem.modulation_spec(modulation_value)
+    if modulation_spec is None:
+        raise ValueError(f"unknown post-pass modulation: {modulation_value!r}")
+    binary_fsk = modulation_spec.family == "fsk" and modulation_spec.order == 2
+    binary_afsk = modulation_spec.family == "afsk"
+    binary_psk = (
+        modulation_spec.family == "psk"
+        and modulation_spec.order == 2
+        and not modulation_spec.offset
+    )
+    if not binary_fsk and not binary_afsk and not binary_psk:
+        raise ValueError(
+            f"no native post-pass IQ replay for modulation {modulation_spec.kind!r}"
+        )
+    psk_differential = (
+        modulation_spec.differential if differential is None else bool(differential)
+    )
+    psk_manchester = (
+        modulation_spec.manchester if manchester is None else bool(manchester)
+    )
     # We do NOT de-rotate the whole capture up front: that materialises a complex128 phase array +
     # exp over the ENTIRE pass (multi-GB on a long capture → OOM on a constrained station). Instead
     # each window is sliced from the memmap and de-rotated locally, bounding memory to one window.
@@ -123,45 +263,147 @@ def decode_capture(
             wtrack = [(t - t_off, o) for t, o in doppler_track or []]
             seg = _derotate_doppler(seg, sample_rate_hz, wtrack)
         try:
-            bits = gfsk.demodulate_capture(
-                seg,
-                sample_rate_hz,
-                symbol_rate_hz=symbol_rate_hz,
-                mod_index=mod_index,
-                bt=bt,
-                # With the track applied the window is already near DC → correct only the small
-                # residual. Without a track, this per-window CFO is the (weaker) sole correction.
-                correct_cfo=True,
-                # Max-eye sampling (NOT Gardner): demodulate_capture is tuned for it — Gardner's
-                # timing recovery diverges on a capture, so recover_timing=True yields no frames.
-                recover_timing=False,
-            )
+            if binary_fsk:
+                hard_symbols = gfsk.demodulate_capture(
+                    seg,
+                    sample_rate_hz,
+                    symbol_rate_hz=symbol_rate_hz,
+                    mod_index=mod_index_value,
+                    bt=bt_value,
+                    # With the track applied the window is already near DC → correct only the
+                    # small residual. Without a track, this per-window CFO is the (weaker) sole
+                    # correction.
+                    correct_cfo=True,
+                    # Max-eye sampling (NOT Gardner): demodulate_capture is tuned for it —
+                    # Gardner's timing recovery diverges on a capture, so recover_timing=True
+                    # yields no frames.
+                    recover_timing=False,
+                )
+                soft_symbols = hard_symbols.astype(np.float64) * 2.0 - 1.0
+                sample_for_symbol = sample_clock.sample_offset_for_symbol
+            elif binary_afsk:
+                one_hz, zero_hz = _afsk_tones(supplied_parameters)
+                replay = demodulate_afsk(
+                    _fm_discriminator(seg),
+                    AfskConfig(
+                        sample_rate_hz,
+                        symbol_rate_hz,
+                        one_hz=one_hz,
+                        zero_hz=zero_hz,
+                    ),
+                )
+                hard_symbols = replay.hard_bits
+                soft_symbols = replay.soft_symbols
+                sample_for_symbol = replay.sample_offset
+            else:
+                replay = demodulate_bpsk(
+                    seg,
+                    BpskConfig(
+                        sample_rate_hz,
+                        symbol_rate_hz,
+                        differential=psk_differential,
+                        manchester=psk_manchester,
+                    ),
+                )
+                hard_symbols = replay.hard_bits
+                soft_symbols = replay.soft_symbols
+                sample_for_symbol = replay.sample_offset
         except Exception:  # noqa: BLE001 — one bad window must not abort the whole sweep
             log.exception("iq_decode: demod failed on window @%d", off)
             continue
-        if not len(bits):
+        if not len(hard_symbols):
             continue
         for name in framings_to_try:
+            profile = resolve_profile(name)
+            candidates: list[tuple[bytes, str, int | None, FrameResult | None]]
             try:
-                frames, matched = framings.deframe(bits, name)
+                if profile is not None and profile.decoder_available:
+                    pairing = plan_native_rx_pairing(
+                        name,
+                        modulation_spec.kind,
+                        sample_rate_hz=sample_rate_hz,
+                        symbol_rate_hz=symbol_rate_hz,
+                        capture_rate_hz=sample_rate_hz,
+                        execution=RxExecution.POST_PASS,
+                        evaluation=native_evaluation,
+                    )
+                    if not pairing.accepted:
+                        log.warning(
+                            "iq_decode: rejected native pairing for %s: %s",
+                            name,
+                            pairing.reason,
+                        )
+                        continue
+                    decoder = build_decoder(
+                        name, _decoder_parameters(profile, supplied_parameters)
+                    )
+                    symbols = (
+                        hard_symbols
+                        if profile.symbol_input is SymbolInput.HARD_BITS
+                        else soft_symbols
+                    )
+                    native = decoder.push(symbols) + decoder.flush()
+                    candidates = [
+                        (
+                            result.payload,
+                            result.canonical_framing,
+                            result.source_start,
+                            result,
+                        )
+                        for result in native
+                    ]
+                else:
+                    frames, matched = framings.deframe(hard_symbols, name)
+                    candidates = [(body, matched or name, None, None) for body in frames]
             except Exception:  # noqa: BLE001 — a deframer bug must not abort the sweep
                 log.exception("iq_decode: %s deframe failed @%d", name, off)
                 continue
-            for body in frames:
-                key = (matched or name, body.hex())
+            for body, matched_name, symbol_offset, native_result in candidates:
+                key = (matched_name, body.hex())
                 if key in seen:  # a boundary frame re-decoded in the overlapping next window
                     continue
                 seen.add(key)
-                records.append(
-                    {
-                        "ts": round(time.time(), 3),
-                        "framing": matched or name,
-                        "len": len(body),
-                        "crc_ok": True,
-                        "payload_hex": body.hex(),
-                        "post_pass": True,  # distinguishes these from the live-decoded frames
-                    }
-                )
+                if symbol_offset is None:
+                    source_sample_offset = off
+                    offset_kind = "window_start"
+                else:
+                    source_sample_offset = off + sample_for_symbol(symbol_offset)
+                    offset_kind = "demodulated_symbol_estimate"
+                record = {
+                    "framing": matched_name,
+                    "len": len(body),
+                    "crc_ok": (
+                        native_result.integrity.value == "passed"
+                        if native_result is not None
+                        else True
+                    ),
+                    "payload_hex": body.hex(),
+                    "post_pass": True,
+                    "source_sample_offset": source_sample_offset,
+                    "source_offset_kind": offset_kind,
+                }
+                if native_result is not None:
+                    record.update(
+                        {
+                            "source_start": native_result.source_start,
+                            "source_end": native_result.source_end,
+                            "source_sample_end_offset": off
+                            + sample_for_symbol(native_result.source_end),
+                            "integrity": native_result.integrity.value,
+                            "polarity": native_result.polarity.value,
+                            "sync_distance": native_result.sync_distance,
+                            "corrected_symbols": native_result.corrected_symbols,
+                            "metadata": dict(native_result.metadata),
+                        }
+                    )
+                if capture_start_unix_s > 0:
+                    pass_start = datetime.fromtimestamp(capture_start_unix_s, tz=timezone.utc)
+                    frame_time = utc_from_sample_offset(
+                        pass_start, source_sample_offset, sample_rate_hz
+                    )
+                    record["ts"] = round(frame_time.timestamp(), 3)
+                    record["timestamp"] = frame_time.isoformat().replace("+00:00", "Z")
+                records.append(record)
     if records:
         _append_frames(path, records)
     log.info(
@@ -207,6 +449,15 @@ def _load_track(path_str: str) -> list[tuple[float, float]]:
         return []
 
 
+def _load_framing_parameters(raw_json: str) -> dict[str, object]:
+    if not raw_json:
+        return {}
+    value = json.loads(raw_json)
+    if not isinstance(value, dict):
+        raise ValueError("--framing-parameters-json must contain a JSON object")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="iq_decode",
@@ -230,21 +481,64 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--window-s", type=float, default=_DEFAULT_WINDOW_S, help="demod window (s); keep short"
     )
-    p.add_argument("--mod-index", type=float, default=0.5)
-    p.add_argument("--bt", type=float, default=0.5)
+    p.add_argument(
+        "--modulation",
+        default=None,
+        help="native post-pass modem; default follows framing parameters, then GFSK",
+    )
+    p.add_argument(
+        "--differential",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override differential BPSK decisions; default follows the modulation label",
+    )
+    p.add_argument(
+        "--manchester",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override Manchester BPSK recovery; default follows the modulation label",
+    )
+    p.add_argument("--mod-index", type=float, default=None)
+    p.add_argument("--bt", type=float, default=None)
+    p.add_argument(
+        "--framing-parameters-json",
+        default="{}",
+        help="directive waveform/framing parameters as one JSON object",
+    )
+    p.add_argument(
+        "--capture-start-unix-s",
+        type=float,
+        default=0.0,
+        help="UTC Unix seconds of source sample zero; zero leaves frame UTC unavailable",
+    )
+    p.add_argument(
+        "--native-evaluation",
+        action="store_true",
+        help=(
+            "allow evaluation-only native profiles; default permits only profiles whose "
+            "post-pass production gate is open"
+        ),
+    )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     fmts = tuple(f.strip().lower() for f in args.framings.split(",") if f.strip())
     try:
+        framing_parameters = _load_framing_parameters(args.framing_parameters_json)
         decode_capture(
             args.input,
             sample_rate_hz=args.sample_rate,
             symbol_rate_hz=args.symbol_rate,
             framings_to_try=fmts,
             doppler_track=_load_track(args.doppler_track) or None,
+            capture_start_unix_s=args.capture_start_unix_s,
             window_s=args.window_s,
+            framing_parameters=framing_parameters,
+            modulation=args.modulation,
+            differential=args.differential,
+            manchester=args.manchester,
             mod_index=args.mod_index,
             bt=args.bt,
+            native_evaluation=args.native_evaluation,
         )
     except Exception:
         log.exception("iq_decode: failed on %s", args.input)

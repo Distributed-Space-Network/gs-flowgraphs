@@ -36,8 +36,12 @@ def test_channel_rate_25kbd_snaps_off_the_heavy_resampler():
 
 
 def test_channel_rate_capped_at_sdr_rate():
-    # Can't decimate to more than we sampled.
-    assert channel_rate_for(48_000, 1_000_000, 2_048_000) == 2_048_000
+    # Four samples/symbol at 1 MBd would require 4 MHz from a 2.048 MHz capture. Silently
+    # capping this used to construct a graph that could not satisfy its timing contract.
+    import pytest
+
+    with pytest.raises(ValueError, match="cannot provide"):
+        channel_rate_for(48_000, 1_000_000, 2_048_000)
 
 
 def test_channel_rate_handles_missing_symbol_rate():

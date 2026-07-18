@@ -170,12 +170,13 @@ class RSCodec:
             e[err_pos[i]] = self._mul(y, self._inv(denom))
         return self._poly_add(msg, e)
 
-    def decode(self, codeword, erase_pos=None):
-        """Correct ``codeword`` (255 bytes) and return the ``255-nsym`` message bytes, or ``None``
-        when beyond the correction capability. Errors-and-erasures: ``erase_pos`` (byte indexes
-        known-bad from the demodulator, e.g. low-confidence symbols) each cost ONE parity symbol
-        instead of two — capability is ``2·errors + erasures ≤ nsym`` (so up to ``nsym`` pure
-        erasures, vs ``nsym//2`` pure errors)."""
+    def decode_with_count(self, codeword, erase_pos=None):
+        """Decode and return ``(message, corrected_symbols)`` or ``None``.
+
+        Errors-and-erasures: ``erase_pos`` (byte indexes known-bad from the
+        demodulator) each cost one parity symbol instead of two. Capability is
+        ``2*errors + erasures <= nsym``.
+        """
         msg = list(bytes(bytearray(int(b) & 0xFF for b in codeword)))
         n = len(msg)
         erase = sorted(set(int(p) for p in (erase_pos or [])))
@@ -187,7 +188,7 @@ class RSCodec:
             msg[p] = 0  # erased values are untrusted; zero them for a defined syndrome
         synd = self._syndromes(msg)
         if max(synd) == 0:
-            return bytes(msg[:n - self.nsym])
+            return bytes(msg[:n - self.nsym]), 0
         coord = [n - 1 - p for p in erase]  # erasure locations as x-exponents
         fsynd = self._forney_syndromes(synd, coord)
         # BM on the Forney syndromes finds the UNKNOWN-position errors only; the erasures'
@@ -199,4 +200,10 @@ class RSCodec:
         fixed = self._correct(msg, synd, erase + err_pos)
         if fixed is None or max(self._syndromes(fixed)) != 0:
             return None
-        return bytes(fixed[:n - self.nsym])
+        return bytes(fixed[:n - self.nsym]), len(set(erase + err_pos))
+
+    def decode(self, codeword, erase_pos=None):
+        """Correct a codeword and return message bytes, or ``None`` when uncorrectable."""
+
+        result = self.decode_with_count(codeword, erase_pos)
+        return result[0] if result is not None else None

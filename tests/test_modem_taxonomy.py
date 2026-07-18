@@ -34,6 +34,11 @@ def test_differential_and_offset_flags():
     assert modem.modulation_spec("qpsk").differential is False
     assert modem.modulation_spec("oqpsk").offset is True
     assert modem.modulation_spec("qpsk").offset is False
+    assert modem.modulation_spec("BPSK Manchester").manchester is True
+    dbpsk_manchester = modem.modulation_spec("DBPSK Manchester")
+    assert dbpsk_manchester is not None
+    assert dbpsk_manchester.differential is True
+    assert dbpsk_manchester.manchester is True
 
 
 @pytest.mark.parametrize(

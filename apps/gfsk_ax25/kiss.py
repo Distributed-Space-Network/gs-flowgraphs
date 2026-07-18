@@ -99,6 +99,30 @@ def kiss_decode(stream: bytes, *, strict: bool = False) -> list[bytes]:
     return out
 
 
+def kiss_decode_commands(stream: bytes, *, strict: bool = True) -> list[tuple[int, int, bytes]]:
+    """Decode KISS frames while preserving their port and command nibbles.
+
+    Unlike :func:`kiss_decode`, this is suitable for control records such as
+    SatNOGS command ``0x09`` timestamps. Invalid escaping is rejected when
+    ``strict`` is true. Empty payloads are retained because control commands
+    define their own payload rules.
+    """
+
+    chunks = bytes(stream).split(bytes([FEND]))
+    if strict:
+        chunks = chunks[1:-1] if len(chunks) >= 2 else []
+    output: list[tuple[int, int, bytes]] = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+        payload, _ = _unescape(chunk[1:], strict=strict)
+        if payload is None:
+            continue
+        type_byte = chunk[0]
+        output.append((type_byte >> 4, type_byte & 0x0F, payload))
+    return output
+
+
 def slip_encode(frame: bytes) -> bytes:
     """Wrap ``frame`` in a SLIP frame: END, escaped payload, END (no command byte)."""
     return bytes([FEND]) + _escape(bytes(frame)) + bytes([FEND])

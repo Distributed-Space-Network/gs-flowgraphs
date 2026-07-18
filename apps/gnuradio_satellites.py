@@ -28,8 +28,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import queue
 import tempfile
+from dataclasses import dataclass
 
 import compose  # decode composer (plan + race decision); numpy-only, import-safe
 import framings  # framing registry (deframe dispatch); numpy-only, import-safe
@@ -58,15 +58,54 @@ from _soapy import (
     tune_below,
 )
 from gnuradio import gr
+from native_framing.modem_matrix import RxExecution, plan_native_rx_pairing
+from native_framing.registry import build_decoder, resolve_profile
+from native_framing.runtime_queue import BoundedQueue, QueueStats, require_lossless
+from native_framing.shadow_runtime import ShadowReconciler, ShadowStats
+from native_framing.types import FrameResult, IntegrityStatus, Polarity, SymbolInput
 
 # gr-satellites flowgraph component. Import name/shape may vary by version
 # (e.g. ``satellites.core.gr_satellites_flowgraph``); confirm on the bench.
 from satellites.core import gr_satellites_flowgraph
 
 _log = logging.getLogger("gr_satellites_rx")
+_FRAME_QUEUE_CAPACITY_FRAMES = 1024
+_FRAME_QUEUE_CAPACITY_BYTES = 16 * 1024 * 1024
 # Decode is fully backend-driven: demod params present -> the ONE backend-specified demod
 # (built via the modem registry); only a NORAD -> gr-satellites alone. There is no
 # brute-force fallback bank (GS_FALLBACK_DEMODS is deprecated and unused).
+
+
+@dataclass(frozen=True)
+class _DecodedFrame:
+    """One live frame plus the source-domain metadata the decoder can prove."""
+
+    source: str
+    payload: bytes
+    framing: str = ""
+    source_start: int | None = None
+    source_end: int | None = None
+    source_offset_kind: str = ""
+    integrity: str = ""
+    polarity: str = ""
+    sync_distance: float | None = None
+    corrected_symbols: int | None = None
+
+
+def _decoded_from_result(source: str, frame: FrameResult) -> _DecodedFrame:
+    offsets_available = bool(frame.metadata.get("source_offsets_available", True))
+    return _DecodedFrame(
+        source=source,
+        payload=frame.payload,
+        framing=frame.canonical_framing,
+        source_start=frame.source_start if offsets_available else None,
+        source_end=frame.source_end if offsets_available else None,
+        source_offset_kind="demodulated_symbol" if offsets_available else "",
+        integrity=frame.integrity.value,
+        polarity=frame.polarity.value,
+        sync_distance=frame.sync_distance,
+        corrected_symbols=frame.corrected_symbols,
+    )
 
 
 class _FrameSink(gr.basic_block):
@@ -74,7 +113,10 @@ class _FrameSink(gr.basic_block):
 
     def __init__(self) -> None:
         gr.basic_block.__init__(self, name="frame_sink", in_sig=None, out_sig=None)
-        self._q: queue.Queue[bytes] = queue.Queue()
+        self._q = BoundedQueue[bytes](
+            capacity_items=_FRAME_QUEUE_CAPACITY_FRAMES,
+            capacity_units=_FRAME_QUEUE_CAPACITY_BYTES,
+        )
         self.message_port_register_in(pmt.intern("in"))
         self.set_msg_handler(pmt.intern("in"), self._on_msg)
 
@@ -82,15 +124,16 @@ class _FrameSink(gr.basic_block):
         # gr-satellites emits a PDU: (metadata, u8-vector). Extract the bytes.
         payload = pmt.cdr(msg)
         data = bytes(pmt.u8vector_elements(payload))
-        self._q.put(data)
+        self._q.offer(data, units=len(data))
 
     def drain(self) -> list[bytes]:
-        out: list[bytes] = []
-        while True:
-            try:
-                out.append(self._q.get_nowait())
-            except queue.Empty:
-                return out
+        stats = self._q.stats()
+        require_lossless(stats, label="gr-satellites frame", unit_name="bytes")
+        return self._q.drain()
+
+    @property
+    def queue_stats(self) -> QueueStats:
+        return self._q.stats()
 
 
 class _SatContext:
@@ -110,15 +153,16 @@ class _SatContext:
         valve_grsat=None,
         sdr_applied: dict | None = None,
         no_decode_reason: str = "",
+        shadow_enabled: bool = False,
     ) -> None:
         self.tb = tb
         self.src = src
         self._sink = sink
         self._center = center_hz
         self._lo_offset = lo_offset_hz
-        self._rotator = rotator        # software LO+Doppler NCO (Phase 1); None ⇒ no retune
+        self._rotator = rotator  # software LO+Doppler NCO (Phase 1); None ⇒ no retune
         self._sdr_rate = sdr_rate_hz
-        self.recorder = recorder       # public: the app's R-11 first-sample probe reads it
+        self.recorder = recorder  # public: the app's R-11 first-sample probe reads it
         self.sdr_applied = dict(sdr_applied or {})  # R-21: what configure/corrections applied
         # Frames come from gr-satellites (``sink``) and/or our own demod (``fallbacks``, one
         # demod for the bird's known mode). With demod params present AND the bird catalogued
@@ -130,6 +174,11 @@ class _SatContext:
         self._valve_ours = valve_ours
         self._valve_grsat = valve_grsat
         self._winner: str | None = None
+        self._shadow = (
+            ShadowReconciler[_DecodedFrame](key=lambda frame: frame.payload)
+            if shadow_enabled
+            else None
+        )
         # R2-02: did we build ANY decoder at all? A pass with no demod params (the backend
         # transmitter has a null/zero baud) and gr-satellites gated off degrades to a
         # RECORDER-ONLY graph — it captures IQ and produces exactly zero frames. That is a
@@ -165,18 +214,18 @@ class _SatContext:
     def wait(self) -> None:
         self.tb.wait()
 
-    def drain_frames(self) -> list[tuple[str, bytes]]:
+    def drain_frames(self) -> list[_DecodedFrame]:
         # Each frame tagged with the engine that produced it (kept separate so we know who
         # decoded). ``our_frames`` carry the demod name (e.g. "gfsk2400"); gr-satellites PDUs
         # are "gr-satellites".
-        our_frames: list[tuple[str, bytes]] = []
+        our_frames: list[_DecodedFrame] = []
         our_matched: list[str] = []  # framings that produced our NEW frames (race gating input)
         for fb in list(self._fallbacks):
             got = fb.drain_frames()
-            our_frames.extend((fb.name, f) for f in got)
+            our_frames.extend(_decoded_from_result(fb.name, frame) for frame in got)
             if fb.race_framing is not None:
                 our_matched.append(fb.race_framing)
-        gr_frames: list[tuple[str, bytes]] = [("gr-satellites", f) for f in self._sink.drain()]
+        gr_frames = [_DecodedFrame(source="gr-satellites", payload=f) for f in self._sink.drain()]
         # Race: the first to produce a CRC-valid frame wins; gate off the loser. Only while
         # both ran (both valves set). The decision is compose.race_winner (pure, unit-tested):
         # only a CRC/FCS/RS-gated framing may declare OUR win — checksum-less KISS "frames"
@@ -192,13 +241,24 @@ class _SatContext:
                 self._gate_off(self._valve_ours, "our engine")
         # Dedup WITHIN this drain only (a frame both engines decoded in the same window) — NOT
         # across drains, so genuine repeat beacons (identical payloads over time) are kept.
-        fresh: list[tuple[str, bytes]] = []
-        seen: set[bytes] = set()
-        for source, f in (*our_frames, *gr_frames):
-            if f not in seen:
-                seen.add(f)
-                fresh.append((source, f))
-        return fresh
+        if self._shadow is not None:
+            return self._shadow.reconcile(our_frames, gr_frames)
+        return [*our_frames, *gr_frames]
+
+    def flush_frames(self) -> list[_DecodedFrame]:
+        """Finalize streaming decoders after the stopped graph has been drained."""
+
+        output: list[_DecodedFrame] = []
+        for fb in list(self._fallbacks):
+            output.extend(_decoded_from_result(fb.name, frame) for frame in fb.flush_frames())
+        if self._shadow is not None:
+            return self._shadow.reconcile(output, [])
+        return output
+
+    def finalize_shadow(self) -> ShadowStats | None:
+        """Finalize bounded comparison accounting after the decoder flush."""
+
+        return self._shadow.finalize() if self._shadow is not None else None
 
     def _gate_off(self, valve, name: str) -> None:
         if valve is None:
@@ -212,23 +272,42 @@ class _SatContext:
         # rotator shifts the +lo_offset+doppler carrier to DC. No PLL settle glitch, and it
         # composes with the fixed lo_offset. No rotator (shouldn't happen) ⇒ no-op.
         if self._rotator is not None and self._sdr_rate:
-            self._rotator.set_phase_inc(
-                lo_phase_inc(self._sdr_rate, self._lo_offset, offset_hz))
+            self._rotator.set_phase_inc(lo_phase_inc(self._sdr_rate, self._lo_offset, offset_hz))
 
 
 class _FallbackDemod:
     """One fallback demod tapping the SDR source: a demodulator chain + a deframer.
-    ``drain_frames`` returns the bytes of any frames recovered since the last call."""
+    ``drain_frames`` returns typed results recovered since the last call."""
 
     _LOCK_AFTER = 2  # matches of the SAME framing before locking (one CRC hit can be spurious)
     _TAIL_BITS = 4096  # carry-over so a frame straddling a drain boundary isn't lost (~2 AX.25)
 
-    def __init__(self, name: str, sink, framing: str | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        sink,
+        framing: str | None = None,
+        framing_parameters: dict | None = None,
+        native_enabled: bool = False,
+    ) -> None:
         self.name = name
         self._sink = sink
         # Backend framing hint, VERBATIM (SatYAML label or local token) — framings.deframe
         # normalizes it to a local deframer; unknown labels deframe upstream (gr-satellites).
         self._framing = (framing or "").strip() or None
+        self._native_profile = resolve_profile(self._framing) if self._framing else None
+        self._native_decoder = None
+        if (
+            native_enabled
+            and self._native_profile is not None
+            and self._native_profile.decoder_available
+            and self._native_profile.symbol_input is SymbolInput.HARD_BITS
+        ):
+            supplied = framing_parameters or {}
+            profile_parameters = {
+                key: supplied[key] for key in self._native_profile.parameters if key in supplied
+            }
+            self._native_decoder = build_decoder(self._framing, profile_parameters)
         self._locked: str | None = None  # framing discovered this pass when no hint was given
         self._hits: dict[str, int] = {}  # per-framing match count, to lock only on a confident one
         self._tail = np.empty(0, dtype=np.uint8)  # bits carried across drain boundaries
@@ -236,15 +315,23 @@ class _FallbackDemod:
         # gate feeds this to compose.race_winner: only a CRC-gated framing may win (MED-1).
         self.race_framing: str | None = None
 
-    def drain_frames(self) -> list[bytes]:
+    def drain_frames(self) -> list[FrameResult]:
         # Backend gave the framing → use only that. Otherwise try all; once ONE framing has
         # matched _LOCK_AFTER times (a single CRC hit can be a ~1/65536 fluke), lock to it for
         # the rest of the pass so a spurious early match can't strand the real framing.
         use = self._framing or self._locked
         fresh = self._sink.drain()
+        if self._native_decoder is not None:
+            out = self._native_decoder.push(fresh)
+            self.race_framing = (
+                self._native_profile.canonical
+                if any(frame.integrity is IntegrityStatus.PASSED for frame in out)
+                else None
+            )
+            return out
         prev_tail = self._tail
         bits = np.concatenate([prev_tail, fresh]) if prev_tail.size else fresh
-        self._tail = bits[-self._TAIL_BITS:].copy() if bits.size else self._tail
+        self._tail = bits[-self._TAIL_BITS :].copy() if bits.size else self._tail
         frames, matched = framings.deframe(bits, use)
         # POSITIONAL dedup of the carry-over: frames decodable from the carried tail ALONE were
         # already returned last drain — subtract exactly those, WITH multiplicity. (A payload-set
@@ -263,7 +350,29 @@ class _FallbackDemod:
             self._hits[matched] = self._hits.get(matched, 0) + 1
             if self._hits[matched] >= self._LOCK_AFTER:
                 self._locked = matched
-        return out
+        # Legacy deframers have no source-coordinate contract. Wrap their payloads so the live
+        # writer can preserve that distinction rather than inventing offsets or timestamps.
+        return [
+            FrameResult(
+                canonical_framing=matched or str(use or "legacy"),
+                payload=frame,
+                integrity=(
+                    IntegrityStatus.PASSED
+                    if framings.is_crc_gated(matched or use)
+                    else IntegrityStatus.NOT_PRESENT
+                ),
+                source_start=0,
+                source_end=0,
+                polarity=Polarity.AMBIGUOUS,
+                metadata={"source_offsets_available": False},
+            )
+            for frame in out
+        ]
+
+    def flush_frames(self) -> list[FrameResult]:
+        if self._native_decoder is None:
+            return []
+        return self._native_decoder.flush()
 
 
 # Deframing (``framings.deframe``) and the modulation→demod dispatch (``modem.build_demod``)
@@ -273,8 +382,15 @@ class _FallbackDemod:
 
 
 def _build_fallbacks(
-    tb, demod_src, sample_rate: float, modes=None, framing=None, differential=None,
+    tb,
+    demod_src,
+    sample_rate: float,
+    modes=None,
+    framing=None,
+    differential=None,
     channel_bw_hz=None,
+    framing_parameters=None,
+    native_enabled=False,
 ) -> tuple[list[_FallbackDemod], object]:
     """Build the demod(s) tapping ``demod_src`` (already at the channel rate) and return
     ``(fallbacks, soft_tap)``: the list of our numpy-deframer fallbacks, plus the FLOAT
@@ -297,15 +413,66 @@ def _build_fallbacks(
         # recording — skip it and keep the others.
         try:
             sink, soft = modem.build_demod(
-                kind, tb, demod_src, sample_rate, float(rate or 0.0),
-                differential=differential, channel_bw_hz=channel_bw_hz)
+                kind,
+                tb,
+                demod_src,
+                sample_rate,
+                float(rate or 0.0),
+                differential=differential,
+                channel_bw_hz=channel_bw_hz,
+            )
         except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
             _log.warning("fallback demod %s@%s failed to build (%s); skipping", kind, rate, e)
             continue
         if sink is None:
             _log.warning("fallback demod %s@%s not implemented; skipping", kind, rate)
             continue
-        out.append(_FallbackDemod(f"{kind}{int(rate or 0)}", sink, framing))
+        native_for_demod = native_enabled
+        if native_enabled and framing:
+            pairing = plan_native_rx_pairing(
+                framing,
+                kind,
+                sample_rate_hz=sample_rate,
+                symbol_rate_hz=float(rate or 0.0),
+                capture_rate_hz=sample_rate,
+                execution=RxExecution.LIVE,
+                evaluation=True,
+            )
+            native_for_demod = pairing.accepted
+            if not pairing.accepted:
+                _log.warning(
+                    "native live pairing rejected before decoder construction: %s/%s (%s)",
+                    kind,
+                    framing,
+                    pairing.reason,
+                )
+        native_sink = sink
+        native_profile = resolve_profile(framing) if framing else None
+        if (
+            native_for_demod
+            and native_profile is not None
+            and native_profile.symbol_input is SymbolInput.SOFT_SYMBOLS
+        ):
+            if soft is None:
+                native_for_demod = False
+                _log.warning(
+                    "native live soft profile %s has no demodulator soft tap; rejecting",
+                    framing,
+                )
+            else:
+                from gnuradio_gfsk import SoftSymbolSink  # noqa: PLC0415 - GNU Radio path only
+
+                native_sink = SoftSymbolSink()
+                tb.connect(soft, native_sink)
+        out.append(
+            _FallbackDemod(
+                f"{kind}{int(rate or 0)}",
+                native_sink,
+                framing,
+                framing_parameters=framing_parameters,
+                native_enabled=native_for_demod,
+            )
+        )
         if soft is not None:
             soft_tap = soft
     return out, soft_tap
@@ -336,7 +503,10 @@ def _build_grsatellites(selector, channel_rate: float, satellite):
         return None
     try:
         fg = gr_satellites_flowgraph(
-            samp_rate=channel_rate, iq=True, grc_block=True, **selector  # gr-satellites resamples
+            samp_rate=channel_rate,
+            iq=True,
+            grc_block=True,
+            **selector,  # gr-satellites resamples
         )
         _log.info("gr-satellites: decoder for %s (%r) @ %.0f Hz", satellite, selector, channel_rate)
         return fg
@@ -414,8 +584,13 @@ def _synthetic_satyaml_path(satellite, params: dict | None, frequency_hz: float)
     fd, path = tempfile.mkstemp(prefix="grsat_synth_", suffix=".yml")
     os.close(fd)
     out = grsat_synth.write_synthetic_satyaml(
-        path, norad, p.get("modulation"), symbol_rate_hz_of(p) or None,
-        p.get("framing"), frequency_hz, name=(s or None),
+        path,
+        norad,
+        p.get("modulation"),
+        symbol_rate_hz_of(p) or None,
+        p.get("framing"),
+        frequency_hz,
+        name=(s or None),
     )
     if out is None:
         with contextlib.suppress(OSError):
@@ -455,8 +630,9 @@ def build_satellites_rx(
     # frequency). tune_below puts the carrier at +lo_offset at baseband; the software rotator
     # (make_lo_rotator) shifts it to DC and the decimator's LPF rejects the spike left at
     # -lo_offset. Honors an explicit GS_SDR_LO_OFFSET, else a 100 kHz default (docs/12 Phase 1).
-    lo = auto_lo_offset(sdr_rate, channel_rate, env["lo_offset_hz"],
-                        default_offset_hz=DEFAULT_LO_OFFSET_HZ)
+    lo = auto_lo_offset(
+        sdr_rate, channel_rate, env["lo_offset_hz"], default_offset_hz=DEFAULT_LO_OFFSET_HZ
+    )
     tb = gr.top_block("gr_satellites_rx")
     src = make_source(args.sdr_args)  # centralized gr-soapy signature (see _soapy)
     src.set_sample_rate(0, sdr_rate)
@@ -470,8 +646,13 @@ def build_satellites_rx(
     _log.info(
         "front-end: center=%.0f Hz lo_offset=%.0f Hz (%s, sw-rotator) | capture=%.0f Hz "
         "channel=%.0f Hz decimate=%s | dc_removal=%s",
-        float(args.center_freq_hz), lo, "ON-CENTER" if not lo else "OFFSET",
-        sdr_rate, channel_rate, decimate, env["dc_removal"],
+        float(args.center_freq_hz),
+        lo,
+        "ON-CENTER" if not lo else "OFFSET",
+        sdr_rate,
+        channel_rate,
+        decimate,
+        env["dc_removal"],
     )
 
     # Software LO+Doppler rotator right after the source (at the capture rate): brings the
@@ -511,9 +692,22 @@ def build_satellites_rx(
         differential = None  # absent/garbage → PSK demod keeps its robust default
     mode = _backend_mode(params)  # (modulation, symbol_rate) when both present
     grsat_live = os.environ.get("GS_GRSAT_LIVE", "").strip().lower() in ("1", "true", "yes", "on")
+    native_live = os.environ.get("GS_NATIVE_FRAMING_LIVE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     if not grsat_live:
-        _log.info("gr-satellites decode gated off (GS_GRSAT_LIVE unset → the recorder can never be "
-                  "starved); our numpy engine only. Set GS_GRSAT_LIVE=1 to also run gr-satellites.")
+        _log.info(
+            "gr-satellites decode gated off (GS_GRSAT_LIVE unset → the recorder can never be "
+            "starved); our numpy engine only. Set GS_GRSAT_LIVE=1 to also run gr-satellites."
+        )
+    if native_live:
+        _log.warning(
+            "native framing live path enabled for bench/shadow evaluation; exact raw-sample UTC "
+            "mapping remains unavailable"
+        )
     # The monolithic flowgraph (own demod on raw IQ, deadlock-prone) is ONLY for the no-mode
     # catalogued case — with demod params we use the decoupled deframers below instead.
     fg = None
@@ -529,8 +723,16 @@ def build_satellites_rx(
     if mode:
         # Our demod ONCE → (numpy-deframer fallbacks, FSK float soft tap).
         fallbacks, soft = _build_fallbacks(
-            tb, demod_tap, channel_rate, modes=[mode], framing=framing, differential=differential,
-            channel_bw_hz=float(args.bandwidth_hz or 0) or None)
+            tb,
+            demod_tap,
+            channel_rate,
+            modes=[mode],
+            framing=framing,
+            differential=differential,
+            channel_bw_hz=float(args.bandwidth_hz or 0) or None,
+            framing_parameters=params,
+            native_enabled=native_live,
+        )
         # Decoupled gr-satellites deframers on the soft tap (FLOAT valve, message out → the SAME
         # sink), racing our numpy deframers off one demod. Gated; empty for a framing they don't
         # cover (our numpy engine / record-only carries it).
@@ -557,16 +759,24 @@ def build_satellites_rx(
             if fg is not None:
                 tb.connect(demod_tap, fg)
                 tb.msg_connect(fg, "out", sink, "in")
-                _log.info("gr-satellites monolithic (gated) for %s framing=%s (no decoupled "
-                          "deframer)", satellite, framing or "?")
+                _log.info(
+                    "gr-satellites monolithic (gated) for %s framing=%s (no decoupled deframer)",
+                    satellite,
+                    framing or "?",
+                )
         if not fallbacks and not grsat_deframers and fg is None:
             # Nothing consumes demod_tap (demod failed to build) → terminate so start() can't abort
             # the graph (and cost the recording). connect_gfsk_demod itself connects-last, so a
             # partial chain never dangles; this covers the "build returned None" case.
             tb.connect(demod_tap, blocks.null_sink(gr.sizeof_gr_complex))
-        _log.info("our demod %s@%.0f on %.0f Hz channel (framing=%s)%s",
-                  mode[0], mode[1], channel_rate, framing or "auto",
-                  f" + {len(grsat_deframers)} gr-satellites deframer(s)" if grsat_deframers else "")
+        _log.info(
+            "our demod %s@%.0f on %.0f Hz channel (framing=%s)%s",
+            mode[0],
+            mode[1],
+            channel_rate,
+            framing or "auto",
+            f" + {len(grsat_deframers)} gr-satellites deframer(s)" if grsat_deframers else "",
+        )
     elif fg is not None:  # no demod params → catalogued monolithic gr-satellites only (gated)
         tb.connect(demod_tap, fg)
         tb.msg_connect(fg, "out", sink, "in")
@@ -584,8 +794,7 @@ def build_satellites_rx(
     # the backend rfLink implies. Construction above drives the graph; the plan is the explanation.
     try:
         catalogued = fg is not None or bool(grsat_deframers)
-        _log.info("decode plan: %s",
-                  compose.plan_decode(params, catalogued=catalogued).describe())
+        _log.info("decode plan: %s", compose.plan_decode(params, catalogued=catalogued).describe())
     except Exception as e:  # noqa: BLE001 — planning must never block decoding
         _log.debug("decode-plan compose failed (non-fatal): %s", e)
     # GNU Radio validates ALL stream ports at start(); a consumer-less tap would abort the whole
@@ -606,8 +815,25 @@ def build_satellites_rx(
     # outside our local vocabulary (AX.100 / USP / Mobitex / CCSDS Concatenated…) is
     # deframable only by gr-satellites, so with it gated off every drain returns
     # nothing while the graph looks perfectly healthy.
-    deframer_available = bool(grsat_deframers) or fg is not None or (
-        framings.normalize_framing(framing) is not None if framing else True
+    native_profile = resolve_profile(framing) if framing else None
+    native_pairing_available = False
+    if native_live and native_profile is not None and mode is not None:
+        native_pairing_available = plan_native_rx_pairing(
+            framing,
+            mode[0],
+            sample_rate_hz=channel_rate,
+            symbol_rate_hz=mode[1],
+            capture_rate_hz=channel_rate,
+            execution=RxExecution.LIVE,
+            evaluation=True,
+        ).accepted
+    deframer_available = (
+        bool(grsat_deframers)
+        or fg is not None
+        or (
+            native_pairing_available
+            or (framings.normalize_framing(framing) is not None if framing else True)
+        )
     )
     reason = no_decode_reason(
         has_decode_consumer=decode_consumers,
@@ -631,6 +857,7 @@ def build_satellites_rx(
         fallbacks=fallbacks,
         sdr_applied=sdr_applied,
         no_decode_reason=reason,
+        shadow_enabled=bool(fallbacks) and (bool(grsat_deframers) or fg is not None),
     )
 
 

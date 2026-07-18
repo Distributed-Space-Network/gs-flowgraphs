@@ -28,11 +28,13 @@ _MFSK = {"4fsk": 4, "mfsk": 4, "gfsk4": 4, "8fsk": 8}
 # PSK family → constellation order.
 _PSK_ORDER = {
     "bpsk": 2, "dbpsk": 2, "psk": 2,
+    "bpskmanchester": 2, "dbpskmanchester": 2,
     "qpsk": 4, "dqpsk": 4, "oqpsk": 4,
     "8psk": 8, "psk8": 8,
 }
-_DIFFERENTIAL = frozenset({"dbpsk", "dqpsk"})   # differential encoding (DxPSK)
+_DIFFERENTIAL = frozenset({"dbpsk", "dbpskmanchester", "dqpsk"})
 _OFFSET = frozenset({"oqpsk"})                   # offset QPSK (I/Q half-symbol stagger)
+_MANCHESTER = frozenset({"bpskmanchester", "dbpskmanchester"})
 # Tier 2 — higher-order / multicarrier. Classified into distinct families with a constellation
 # order; the demod/mod chains are GNU Radio (+ gr-dvbs2rx for DVB-S2), constructed on the bench.
 _QAM_ORDER = {"qam": 16, "qam16": 16, "qam32": 32, "qam64": 64, "qam128": 128, "qam256": 256}
@@ -54,6 +56,7 @@ class ModSpec:
     order: int = 2            # constellation / FSK levels (2 = binary)
     differential: bool = False
     offset: bool = False      # OQPSK I/Q stagger
+    manchester: bool = False  # two BPSK half-symbols per decoded symbol
     tier: int = 1             # 1 = built here; 2 = higher-order (routed elsewhere)
 
     @property
@@ -83,6 +86,7 @@ def modulation_spec(kind: str) -> ModSpec | None:
         return ModSpec(
             k, "psk", order=_PSK_ORDER[k],
             differential=k in _DIFFERENTIAL, offset=k in _OFFSET,
+            manchester=k in _MANCHESTER,
         )
     if k == "afsk":
         return ModSpec(k, "afsk", order=2)
@@ -165,6 +169,11 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
             tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate,
             channel_bw_hz=channel_bw_hz)
     if spec.family == "psk":
+        if spec.manchester:
+            logging.getLogger("modem").info(
+                "modem: %s Manchester recovery is post-pass-only", kind
+            )
+            return None, None
         # RX differential precedence: the backend's per-bird rfLink flag (``differential`` param)
         # when supplied wins; otherwise the robust default True — most cubesat PSK downlinks are
         # differentially encoded, a bare "bpsk" name doesn't say, and a "dbpsk" name agrees with

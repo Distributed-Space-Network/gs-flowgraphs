@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import ast
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,8 +40,26 @@ def _installed_entries() -> set[str]:
     return entries
 
 
+def _installed_packages() -> set[str]:
+    """apps/<package> directories named in install(DIRECTORY ...) stanzas."""
+    text = CMAKELISTS.read_text(encoding="utf-8")
+    entries: set[str] = set()
+    for line in text.splitlines():
+        line = line.split("#", 1)[0]
+        entries.update(re.findall(r"DIRECTORY\s+apps/([\w.]+)", line))
+    return entries
+
+
 def _apps_on_disk() -> set[str]:
     return {p.name for p in APPS.glob("*.py")}
+
+
+def _packages_on_disk() -> set[str]:
+    return {
+        path.name
+        for path in APPS.iterdir()
+        if path.is_dir() and (path / "__init__.py").exists()
+    }
 
 
 def _local_imports(path: Path, local_names: set[str]) -> set[str]:
@@ -78,17 +99,25 @@ def test_every_install_entry_exists_on_disk() -> None:
     assert stale == [], f"CMakeLists.txt installs files that do not exist: {stale}"
 
 
+def test_every_app_package_is_in_the_install_list() -> None:
+    missing = sorted(_packages_on_disk() - _installed_packages())
+    assert missing == [], (
+        f"apps/ packages absent from CMakeLists.txt install(DIRECTORY ...): {missing} — "
+        "their tests can pass from the source tree while the station install omits them"
+    )
+
+
 def test_installed_apps_only_import_installed_modules() -> None:
     """The closure check: an installed app importing a non-installed local
     module is exactly the deployed-import-crash the audit found."""
     installed = _installed_entries()
-    # Local importable module names: every apps/*.py plus package dirs (gfsk_ax25).
+    # Local importable module names: every apps/*.py plus package directories.
     local_names = {p.stem for p in APPS.glob("*.py")}
     local_names.update(
         p.name for p in APPS.iterdir() if p.is_dir() and (p / "__init__.py").exists()
     )
     installed_names = {e.removesuffix(".py") for e in installed}
-    installed_names.add("gfsk_ax25")  # installed via install(DIRECTORY apps/gfsk_ax25 ...)
+    installed_names.update(_installed_packages())
     problems: list[str] = []
     for entry in sorted(installed):
         path = APPS / entry
@@ -98,3 +127,38 @@ def test_installed_apps_only_import_installed_modules() -> None:
             if mod not in installed_names:
                 problems.append(f"{entry} imports {mod} which is not installed")
     assert problems == [], "\n".join(problems)
+
+
+def test_native_packages_import_from_a_staged_install_only(tmp_path: Path) -> None:
+    """Copy exactly the declared CMake payload and import it outside the source tree."""
+
+    staged = tmp_path / "bin"
+    staged.mkdir()
+    for entry in _installed_entries():
+        shutil.copy2(APPS / entry, staged / entry)
+    for package in _installed_packages():
+        shutil.copytree(
+            APPS / package,
+            staged / package,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+    package_names = ("native_framing", "native_lora", "native_telemetry")
+    code = (
+        "import importlib, pathlib, sys; "
+        f"root = pathlib.Path({str(staged)!r}).resolve(); "
+        "sys.path.insert(0, str(root)); "
+        f"names = {package_names!r}; "
+        "modules = [importlib.import_module(name) for name in names]; "
+        "assert all(pathlib.Path(module.__file__).resolve().is_relative_to(root) "
+        "for module in modules)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr

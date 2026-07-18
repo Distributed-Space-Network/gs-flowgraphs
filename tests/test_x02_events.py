@@ -98,6 +98,51 @@ def test_satellite_rx_emitter_contract(tmp_path: Path) -> None:
     assert evt["decoder"] == "gr-satellites" and evt["satellite"] == "CUTE-1"
 
 
+def test_satellite_rx_preserves_native_metadata_without_fake_utc(tmp_path: Path) -> None:
+    socks = _FakeSockets()
+    asyncio.run(
+        satellite_rx._emit_frame(
+            socks,
+            b"NATIVE",
+            "26390",
+            decoder="gfsk9600",
+            output_dir=str(tmp_path),
+            framing="tt64",
+            source_start=123,
+            source_end=651,
+            source_offset_kind="demodulated_symbol",
+            integrity="passed",
+            polarity="inverted",
+            sync_distance=1.0,
+            corrected_symbols=2,
+        )
+    )
+    evt = _events(socks)[0]
+    assert evt["frame"]["crc_ok"] is True
+    assert evt["framing"] == "tt64"
+    assert (evt["source_start"], evt["source_end"]) == (123, 651)
+    assert evt["corrected_symbols"] == 2
+    record = json.loads((tmp_path / "frames.jsonl").read_text(encoding="utf-8"))
+    assert record["timestamp_status"] == "unavailable"
+    assert "ts" not in record and "timestamp" not in record
+
+
+def test_satellite_rx_no_integrity_profile_is_not_crc_ok(tmp_path: Path) -> None:
+    socks = _FakeSockets()
+    asyncio.run(
+        satellite_rx._emit_frame(
+            socks,
+            b"SYNC-ONLY",
+            "44832",
+            decoder="gfsk5000",
+            output_dir=str(tmp_path),
+            framing="smogp_signalling",
+            integrity="not_present",
+        )
+    )
+    assert _events(socks)[0]["frame"]["crc_ok"] is False
+
+
 # ----------------------------------------------------------- signal truth
 
 
