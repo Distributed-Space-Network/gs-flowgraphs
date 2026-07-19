@@ -50,6 +50,7 @@ install(
     apps/cubesat_gfsk_ax25_tx.py
     apps/cubesat_gfsk_endurosat_bidir.py  # persistent bidirectional EnduroSat (uplink + downlink)
     apps/satellite_rx.py             # multi-mission gr-satellites receiver (bench)
+    apps/flowgraph_runtime_check.py   # no-hardware installed dependency/deframer preflight
     apps/iq_views.py                 # post-pass PNG/CSV/SDF from a .cf32 (run by gs-client)
     apps/iq_decode.py                # post-pass decode of the non-live framings from a .cf32 (docs/13)
     apps/telemetry_preview.py        # derived, operator-only payload preview sidecar

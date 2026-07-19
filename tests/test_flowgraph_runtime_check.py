@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import ModuleType
+
+import flowgraph_runtime_check as runtime_check
+
+
+def _module(name: str) -> ModuleType:
+    module = ModuleType(name)
+    module.__file__ = f"/opt/gs-flowgraphs/bin/{name.replace('.', '/')}.py"
+    return module
+
+
+def test_runtime_check_discovers_dependencies_from_installed_tree(tmp_path: Path) -> None:
+    (tmp_path / "receiver.py").write_text(
+        "import pmt\nfrom scipy import signal\nfrom native_framing import registry\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "native_framing").mkdir()
+    (tmp_path / "native_framing" / "registry.py").write_text(
+        "import construct\n",
+        encoding="utf-8",
+    )
+
+    assert runtime_check.discover_external_imports(tmp_path) == (
+        "construct",
+        "pmt",
+        "scipy",
+    )
+
+
+def test_runtime_check_reports_missing_dependency_without_hardware() -> None:
+    def importer(name: str) -> ModuleType:
+        if name == "pmt":
+            raise ModuleNotFoundError("No module named 'pmt'")
+        module = _module(name)
+        if name == "gnuradio_satellites":
+            module.make_grsat_deframers = lambda _label: [object()]  # type: ignore[attr-defined]
+        return module
+
+    result = runtime_check.check_runtime(
+        importer=importer,
+        required_modules=("scipy", "pmt"),
+        deframer_labels=("USP",),
+    )
+
+    assert result["ok"] is False
+    assert result["checks"][1] == {
+        "check": "import:pmt",
+        "ok": False,
+        "error": "ModuleNotFoundError: No module named 'pmt'",
+    }
+
+
+def test_runtime_check_constructs_priority_deframers() -> None:
+    built: list[str] = []
+
+    def importer(name: str) -> ModuleType:
+        module = _module(name)
+        if name == "gnuradio_satellites":
+            def build(label: str) -> list[object]:
+                built.append(label)
+                return [object()]
+
+            module.make_grsat_deframers = build  # type: ignore[attr-defined]
+        return module
+
+    labels = ("AX100 Mode 5", "AX100 Mode 6", "AX100 ASM+Golay", "USP")
+    result = runtime_check.check_runtime(
+        importer=importer,
+        required_modules=("scipy", "pmt"),
+        deframer_labels=labels,
+    )
+
+    assert result["ok"] is True
+    assert built == list(labels)
+    assert [check["count"] for check in result["checks"] if "count" in check] == [1] * 4
+
+
+def test_runtime_check_classifies_missing_pip_dependency_without_installing(
+    tmp_path: Path,
+) -> None:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        """
+[project]
+dependencies = ["PyYAML>=6.0"]
+
+[tool.gs-client.flowgraph-runtime]
+os-owned-modules = ["pmt"]
+optional-modules = ["dvbs2rx"]
+module-distributions = { yaml = "PyYAML" }
+""".strip(),
+        encoding="utf-8",
+    )
+
+    def importer(name: str) -> ModuleType:
+        if name == "yaml":
+            raise ModuleNotFoundError("No module named 'yaml'")
+        module = _module(name)
+        if name == "gnuradio_satellites":
+            module.make_grsat_deframers = lambda _label: [object()]  # type: ignore[attr-defined]
+        return module
+
+    result = runtime_check.check_runtime(
+        importer=importer,
+        required_modules=("yaml",),
+        deframer_labels=("USP",),
+        client_pyproject=pyproject,
+    )
+
+    missing = result["checks"][0]
+    assert missing["owner"] == "gs-client-pip"
+    assert missing["requirement"] == "PyYAML>=6.0"
+    assert result["suggested_actions"] == [
+        f"Run: sudo {runtime_check.shlex.quote(runtime_check.sys.executable)} "
+        f"-m pip install -c {runtime_check.shlex.quote(str(tmp_path / 'constraints.txt'))} "
+        "'PyYAML>=6.0'"
+    ]
