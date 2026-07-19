@@ -212,9 +212,9 @@ def grsat_deframer_plan(framing) -> list[tuple]:
     if f in ("ax25", "aprs"):  # both scramblings (mirrors :func:`deframe`)
         return [("ax25", False), ("ax25", True)]
     if "ax100" in f and ("5" in f or "asm" in f or "golay" in f):
-        return [("ax100", 5)]
+        return [("ax100", "ASM")]
     if "ax100" in f and ("6" in f or "rs" in f or "reed" in f):
-        return [("ax100", 6)]
+        return [("ax100", "RS")]
     if f == "usp":
         return [("usp",)]
     if f == "endurosat":

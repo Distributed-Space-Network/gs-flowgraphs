@@ -73,8 +73,10 @@ def test_deframe_autodetects_ax25_when_framing_unknown():
 def test_grsat_deframer_plan_matches_dotted_ax100_spelling():
     # BUG: the builder tested "ax100" in f but SatNOGS spells it "AX.100" (with a dot), so AX.100
     # birds (BRO/D-Orbit/SITRO) built NO deframer even with GS_GRSAT_LIVE=1. Dots are now stripped.
-    assert framings.grsat_deframer_plan("AX.100 Mode 5") == [("ax100", 5)]
-    assert framings.grsat_deframer_plan("FSK AX.100 Mode 6") == [("ax100", 6)]
+    assert framings.grsat_deframer_plan("AX.100 Mode 5") == [("ax100", "ASM")]
+    assert framings.grsat_deframer_plan("AX100 ASM+Golay") == [("ax100", "ASM")]
+    assert framings.grsat_deframer_plan("FSK AX.100 Mode 6") == [("ax100", "RS")]
+    assert framings.grsat_deframer_plan("AX100 Reed Solomon") == [("ax100", "RS")]
     assert framings.grsat_deframer_plan("USP") == [("usp",)]
     assert framings.grsat_deframer_plan("AX.25 G3RUH") == [("ax25", True)]
     assert framings.grsat_deframer_plan("ax25") == [("ax25", False), ("ax25", True)]
