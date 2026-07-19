@@ -222,6 +222,29 @@ def grsat_deframer_plan(framing) -> list[tuple]:
     return []
 
 
+def additive_grsat_deframer_plan(framing_labels) -> list[tuple[str, tuple]]:
+    """PURE bounded fan-out plan for several RF-equivalent framing labels.
+
+    Identical component configurations are emitted once, even when aliases or
+    repeated transmitter rows request them. The originating label is retained
+    so each decoded PDU can carry framing identity.
+    """
+    labels = (
+        tuple(dict.fromkeys(str(value).strip() for value in framing_labels if str(value).strip()))
+        if isinstance(framing_labels, (list, tuple))
+        else ((str(framing_labels).strip(),) if str(framing_labels or "").strip() else ())
+    )
+    output: list[tuple[str, tuple]] = []
+    seen: set[tuple] = set()
+    for label in labels:
+        for entry in grsat_deframer_plan(label):
+            if entry in seen:
+                continue
+            seen.add(entry)
+            output.append((label, entry))
+    return output
+
+
 def _valid_ax25_address(body: bytes) -> bool:
     """Reject a CRC-16 FALSE POSITIVE. AX.25's FCS is only 16 bits, so over a noisy pass a random
     flag-delimited chunk passes the CRC ~1/65536 of the time and is emitted as a "frame" of garbage

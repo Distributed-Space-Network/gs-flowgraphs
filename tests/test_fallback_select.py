@@ -6,7 +6,13 @@ The fallback-demod bank (``fallback_modes`` / ``GS_FALLBACK_DEMODS``) was remove
 """
 from __future__ import annotations
 
-from _fallback_select import CHANNEL_OVERSAMPLE, channel_rate_for, symbol_rate_hz_of
+from _fallback_select import (
+    CHANNEL_OVERSAMPLE,
+    MAX_ADDITIVE_FRAMINGS,
+    channel_rate_for,
+    requested_framings,
+    symbol_rate_hz_of,
+)
 
 
 def test_channel_rate_keeps_requested_rate_for_low_baud():
@@ -55,6 +61,27 @@ def test_bank_api_is_gone():
 
     assert not hasattr(_fallback_select, "fallback_modes")
     assert not hasattr(_fallback_select, "DEFAULT_FALLBACK_DEMODS")
+
+
+def test_additive_framings_keep_primary_dedupe_and_order() -> None:
+    assert requested_framings(
+        {"framing": "AX.25", "framings": ["EnduroSat", "AX.25", "EnduroSat"]}
+    ) == ("AX.25", "EnduroSat")
+    assert requested_framings({"framing": " USP "}) == ("USP",)
+    assert requested_framings({}) == ()
+
+
+def test_additive_framings_fail_closed_on_malformed_or_oversized_input() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="must be a list"):
+        requested_framings({"framings": "AX.25,EnduroSat"})
+    with pytest.raises(ValueError, match="entries must be strings"):
+        requested_framings({"framings": ["AX.25", 7]})
+    with pytest.raises(ValueError, match="profile limit"):
+        requested_framings(
+            {"framings": [f"profile-{index}" for index in range(MAX_ADDITIVE_FRAMINGS + 1)]}
+        )
 
 
 # ── symbol_rate_hz_of: baud / symbol_rate_hz are the SAME quantity, interchangeable ───────────

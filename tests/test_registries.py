@@ -84,6 +84,18 @@ def test_grsat_deframer_plan_matches_dotted_ax100_spelling():
     assert framings.grsat_deframer_plan("") == []  # unknown → numpy/record-only carries it
 
 
+def test_additive_grsat_plan_dedupes_components_and_retains_framing_identity():
+    assert framings.additive_grsat_deframer_plan(
+        ["AX.25", "EnduroSat", "AX.25", "USP"]
+    ) == [
+        ("AX.25", ("ax25", False)),
+        ("AX.25", ("ax25", True)),
+        ("EnduroSat", ("endurosat",)),
+        ("USP", ("usp",)),
+    ]
+    assert len(framings.additive_grsat_deframer_plan(["AX.25", "AX.25 G3RUH"])) == 2
+
+
 def test_ax25_address_check_rejects_crc16_false_positives():
     # AX.25's FCS is 16-bit → noise passes it ~1/65536; the address-field check rejects those, so a
     # decoded "frame" is trustworthy. Bytes are real bench data (cmd_101 IPoS pass).

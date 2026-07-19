@@ -23,6 +23,7 @@ CHANNEL_OVERSAMPLE = 4.0
 # Maximum live scheduler-handoff drain interval. The symbol queues also have an
 # item bound, so this is intentionally much shorter than a frame/report cadence.
 LIVE_DECODE_DRAIN_PERIOD_S = 0.05
+MAX_ADDITIVE_FRAMINGS = 32
 
 # The symbol rate reaches a flowgraph under different key names depending on the source:
 # gs-client's codec renames the SatNOGS ``baud`` field to ``symbol_rate_hz``, but a raw rfLink, a
@@ -32,6 +33,39 @@ LIVE_DECODE_DRAIN_PERIOD_S = 0.05
 # must not go dark because of the key name. This tuple is that single source of truth, in priority
 # order (the canonical ``symbol_rate_hz`` first). Keep it in sync wherever a rate is read.
 SYMBOL_RATE_KEYS = ("symbol_rate_hz", "baud", "baudrate", "baud_rate", "symbol_rate")
+
+
+def requested_framings(params: dict[str, Any] | None) -> tuple[str, ...]:
+    """Return the validated, bounded additive framing labels for one modem.
+
+    ``framing`` remains the legacy primary field. ``framings`` is additive and
+    may contain at most :data:`MAX_ADDITIVE_FRAMINGS` unique, non-empty labels.
+    Unknown labels are intentionally retained for gr-satellites; vocabulary
+    normalization belongs to the framing registries.
+    """
+    p = params or {}
+    raw = p.get("framings")
+    if raw is not None and not isinstance(raw, list):
+        raise ValueError("framings must be a list")
+    if isinstance(raw, list) and len(raw) > MAX_ADDITIVE_FRAMINGS:
+        raise ValueError(f"framings exceeds the {MAX_ADDITIVE_FRAMINGS}-profile limit")
+    labels: list[str] = []
+    for value in raw or []:
+        if not isinstance(value, str):
+            raise ValueError("framings entries must be strings")
+        label = value.strip()
+        if label and label not in labels:
+            labels.append(label)
+    primary = p.get("framing")
+    if primary not in (None, ""):
+        if not isinstance(primary, str):
+            raise ValueError("framing must be a string")
+        label = primary.strip()
+        if label:
+            if label in labels:
+                labels.remove(label)
+            labels.insert(0, label)
+    return tuple(labels)
 
 
 def symbol_rate_hz_of(params: dict[str, Any] | None, default: float = 0.0) -> float:
