@@ -82,3 +82,9 @@ def test_build_demod_unrecognized_returns_none_tuple():
     assert modem.build_demod("smoke-signals", None, None, 48_000.0, 1_200.0) == (None, None)
     assert modem.build_demod("", None, None, 48_000.0, 1_200.0) == (None, None)
     assert modem.modulation_spec(None) is None
+
+
+def test_soft_only_non_fsk_build_does_not_construct_an_unused_hard_queue():
+    assert modem.build_demod(
+        "bpsk", None, None, 48_000.0, 1_200.0, collect_hard=False
+    ) == (None, None)

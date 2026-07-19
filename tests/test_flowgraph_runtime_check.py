@@ -15,6 +15,10 @@ def _module(name: str) -> ModuleType:
             lambda *, mode, local_deframer_enabled, grsat_live: mode is not None
             and (local_deframer_enabled or grsat_live)
         )
+        module.should_collect_hard_symbols = (  # type: ignore[attr-defined]
+            lambda *, legacy_hard_enabled, native_hard_enabled: legacy_hard_enabled
+            or native_hard_enabled
+        )
     return module
 
 
@@ -89,6 +93,7 @@ def test_runtime_check_constructs_priority_deframers() -> None:
     } == {
         "safety:recorder-only-no-demod": True,
         "safety:decode-drain-period": True,
+        "safety:soft-only-no-hard-queue": True,
     }
 
 

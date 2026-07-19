@@ -20,6 +20,10 @@ def test_gnuradio_live_path_is_explicitly_gated_and_streaming() -> None:
     assert "plan_native_rx_pairing(" in source
     assert "native_pairing_available" in source
     assert "SoftSymbolSink" in source
+    assert "collect_hard=collect_hard" in source
+    assert "if native_sink is not None:" in source
+    gfsk = (_APPS / "gnuradio_gfsk.py").read_text(encoding="utf-8")
+    assert "blocks.null_sink(gr.sizeof_char)" in gfsk
     assert "tb.connect(soft, native_sink)" in source
     assert "ShadowReconciler[_DecodedFrame]" in source
     assert "self._shadow.reconcile(our_frames, gr_frames)" in source

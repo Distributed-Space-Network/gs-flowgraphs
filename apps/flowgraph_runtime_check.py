@@ -197,11 +197,17 @@ def _check_recorder_safety(importer: Callable[[str], ModuleType]) -> list[dict[s
             local_deframer_enabled=True,
             grsat_live=False,
         )
+        collect_hard = safety.should_collect_hard_symbols
+        soft_only_safe = not collect_hard(
+            legacy_hard_enabled=False,
+            native_hard_enabled=False,
+        )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         return [
             {"check": "safety:recorder-only-no-demod", "ok": False, "error": error},
             {"check": "safety:decode-drain-period", "ok": False, "error": error},
+            {"check": "safety:soft-only-no-hard-queue", "ok": False, "error": error},
         ]
     return [
         {
@@ -212,6 +218,10 @@ def _check_recorder_safety(importer: Callable[[str], ModuleType]) -> list[dict[s
             "check": "safety:decode-drain-period",
             "ok": bool(0.0 < period_s <= 0.05),
             "period_s": period_s,
+        },
+        {
+            "check": "safety:soft-only-no-hard-queue",
+            "ok": bool(soft_only_safe),
         },
     ]
 

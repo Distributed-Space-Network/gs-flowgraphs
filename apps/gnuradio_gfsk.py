@@ -177,7 +177,8 @@ class _RxContext:
 def connect_gfsk_demod(
     tb, src, sample_rate: float, profile: endurosat.LinkProfile, *,
     decimate: bool, sdr_rate: float, dc_block: bool = True, channel_bw_hz: float | None = None,
-) -> tuple[_BitSink, object]:
+    collect_hard: bool = True,
+) -> tuple[_BitSink | None, object]:
     """Connect a 2-GFSK/FSK/GMSK/MSK demod chain onto ``src`` and return ``(bit_sink, soft_tap)``:
     the hard-bit sink (``drain()`` → bits, fed to our numpy deframers) and the FLOAT soft-symbol
     tap (post clock-recovery, PRE-slicer) that gr-satellites deframer components consume.
@@ -195,7 +196,10 @@ def connect_gfsk_demod(
     bit sink is a terminal queue and the deframers on the soft tap emit messages, so nothing here
     can backpressure the recorder that taps the same channel stream. ``channel_bw_hz`` is accepted
     for call-compat but IGNORED — SatNOGS sizes the pre-discriminator LPF from the baud, never a
-    provisioned width. ``dc_block`` gates the (SatNOGS-default-on) discriminator dc_blocker_ff."""
+    provisioned width. ``dc_block`` gates the (SatNOGS-default-on) discriminator dc_blocker_ff.
+    When ``collect_hard`` is false, the slicer terminates in a GNU Radio null sink instead of an
+    undrained Python queue; the soft tap remains available to its actual consumer.
+    """
     _ = channel_bw_hz  # accepted for call-compat; SatNOGS sizes the LPF from baud, not bandwidth
     baud = float(profile.symbol_rate_hz)
     sps_in = sample_rate / baud                        # samples/symbol at the channel rate
@@ -235,9 +239,9 @@ def connect_gfsk_demod(
         out_sps, 2.0 * math.pi / 100.0, 0.5, 0.5 / 8.0, 0.01)
     # 6) Slice to hard bits (one 0/1 per byte) for our numpy deframers.
     slicer = digital.binary_slicer_fb()
-    sink = _BitSink()
-    tb.connect(src, *blocks_list, soft, slicer, sink)  # single connect; a raise above leaves clean
-    return sink, soft
+    hard_consumer = _BitSink() if collect_hard else blocks.null_sink(gr.sizeof_char)
+    tb.connect(src, *blocks_list, soft, slicer, hard_consumer)
+    return (hard_consumer if collect_hard else None), soft
 
 
 def connect_psk_demod(

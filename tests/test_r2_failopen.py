@@ -19,7 +19,11 @@ from pathlib import Path
 _APPS = Path(__file__).resolve().parents[1] / "apps"
 sys.path.insert(0, str(_APPS))
 
-from _fallback_select import no_decode_reason, should_build_demod  # noqa: E402
+from _fallback_select import (  # noqa: E402
+    no_decode_reason,
+    should_build_demod,
+    should_collect_hard_symbols,
+)
 
 
 class TestRecorderOnlyDoesNotBuildAnUndrainedDemod:
@@ -43,6 +47,16 @@ class TestRecorderOnlyDoesNotBuildAnUndrainedDemod:
         import satellite_rx
 
         assert satellite_rx._DECODE_PERIOD_S <= 0.05
+
+    def test_native_soft_only_path_does_not_collect_unused_hard_bits(self) -> None:
+        assert not should_collect_hard_symbols(
+            legacy_hard_enabled=False,
+            native_hard_enabled=False,
+        )
+        assert should_collect_hard_symbols(
+            legacy_hard_enabled=True,
+            native_hard_enabled=False,
+        )
 
 
 class TestADemodWithNoDeframerIsDecodeDead:

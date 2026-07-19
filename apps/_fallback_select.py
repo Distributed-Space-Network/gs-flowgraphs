@@ -96,6 +96,16 @@ def should_build_demod(
     return mode is not None and (local_deframer_enabled or grsat_live)
 
 
+def should_collect_hard_symbols(
+    *,
+    legacy_hard_enabled: bool,
+    native_hard_enabled: bool,
+) -> bool:
+    """Whether any enabled local decoder consumes the hard-bit demodulator output."""
+
+    return legacy_hard_enabled or native_hard_enabled
+
+
 def no_decode_reason(
     *,
     has_decode_consumer: bool,

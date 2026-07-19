@@ -125,8 +125,17 @@ def mod_families() -> set[str]:
 
 
 # ── Chain construction (GNU Radio, lazy) ─────────────────────────────────────────────────────
-def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
-                *, differential: bool | None = None, channel_bw_hz: float | None = None):
+def build_demod(
+    kind: str,
+    tb,
+    src,
+    sample_rate: float,
+    symbol_rate: float,
+    *,
+    differential: bool | None = None,
+    channel_bw_hz: float | None = None,
+    collect_hard: bool = True,
+):
     """Build the GNU Radio demod chain for ``kind`` tapping ``src`` (already at the channel rate)
     and return ``(bit_sink, soft_tap)``: the hard-bit sink (``drain()`` → hard bits) and — for the
     FSK family only — the FLOAT soft-symbol tap that gr-satellites deframer components consume
@@ -139,12 +148,19 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
 
     ``differential`` is the backend's per-bird DxPSK flag (rfLink → params ``differential``):
     True/False is honoured by the PSK chain; ``None`` (backend didn't say) keeps the robust
-    differential-on default — most cubesat PSK downlinks are differentially encoded."""
+    differential-on default — most cubesat PSK downlinks are differentially encoded.
+
+    ``collect_hard=False`` is for an FSK soft-only consumer such as native USP or a decoupled
+    gr-satellites deframer. The slicer is terminated without constructing a Python queue. Other
+    modem families have no soft tap, so they return no chain when hard symbols are not requested.
+    """
     import logging  # noqa: PLC0415
 
     spec = modulation_spec(kind)
     if spec is None:
         return None, None  # unrecognized — return BEFORE importing GNU Radio (import-safe)
+    if not collect_hard and spec.family != "fsk":
+        return None, None
     if spec.tier == 2:
         return _build_tier2_demod(spec, tb, src, sample_rate, symbol_rate), None
     if spec.tier == 3:
@@ -167,7 +183,7 @@ def build_demod(kind: str, tb, src, sample_rate: float, symbol_rate: float,
         # the gr-satellites deframers (docs/12 §L.7 Phase 3).
         return connect_gfsk_demod(
             tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate,
-            channel_bw_hz=channel_bw_hz)
+            channel_bw_hz=channel_bw_hz, collect_hard=collect_hard)
     if spec.family == "psk":
         if spec.manchester:
             logging.getLogger("modem").info(

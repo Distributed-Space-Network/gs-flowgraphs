@@ -40,6 +40,7 @@ from _fallback_select import (  # pure, testable, no GNU Radio
     channel_rate_for,
     no_decode_reason,
     should_build_demod,
+    should_collect_hard_symbols,
     symbol_rate_hz_of,
 )
 from _recorder import PassRecorder
@@ -409,25 +410,6 @@ def _build_fallbacks(
         kind = str(kind or "").strip().lower()
         if not kind:
             continue
-        # Guarded: a demod that can't be built for this channel (e.g. symbol_sync needs sps>1,
-        # so the rate exceeds ~sample_rate/2) must NOT crash the engine or cost us the IQ
-        # recording — skip it and keep the others.
-        try:
-            sink, soft = modem.build_demod(
-                kind,
-                tb,
-                demod_src,
-                sample_rate,
-                float(rate or 0.0),
-                differential=differential,
-                channel_bw_hz=channel_bw_hz,
-            )
-        except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
-            _log.warning("fallback demod %s@%s failed to build (%s); skipping", kind, rate, e)
-            continue
-        if sink is None:
-            _log.warning("fallback demod %s@%s not implemented; skipping", kind, rate)
-            continue
         native_for_demod = native_enabled
         if native_enabled and framing:
             pairing = plan_native_rx_pairing(
@@ -447,8 +429,40 @@ def _build_fallbacks(
                     framing,
                     pairing.reason,
                 )
-        native_sink = sink
         native_profile = resolve_profile(framing) if framing else None
+        legacy_hard_enabled = (
+            framings.normalize_framing(framing) is not None if framing else True
+        )
+        native_hard_enabled = bool(
+            native_for_demod
+            and native_profile is not None
+            and native_profile.symbol_input is SymbolInput.HARD_BITS
+        )
+        collect_hard = should_collect_hard_symbols(
+            legacy_hard_enabled=legacy_hard_enabled,
+            native_hard_enabled=native_hard_enabled,
+        )
+        # Guarded: a demod that can't be built for this channel (e.g. symbol_sync needs sps>1,
+        # so the rate exceeds ~sample_rate/2) must NOT crash the engine or cost us the IQ
+        # recording — skip it and keep the others.
+        try:
+            sink, soft = modem.build_demod(
+                kind,
+                tb,
+                demod_src,
+                sample_rate,
+                float(rate or 0.0),
+                differential=differential,
+                channel_bw_hz=channel_bw_hz,
+                collect_hard=collect_hard,
+            )
+        except Exception as e:  # noqa: BLE001 — one bad demod must not sink the rest/recording
+            _log.warning("fallback demod %s@%s failed to build (%s); skipping", kind, rate, e)
+            continue
+        if sink is None and soft is None:
+            _log.warning("fallback demod %s@%s not implemented; skipping", kind, rate)
+            continue
+        native_sink = sink
         if (
             native_for_demod
             and native_profile is not None
@@ -465,15 +479,16 @@ def _build_fallbacks(
 
                 native_sink = SoftSymbolSink()
                 tb.connect(soft, native_sink)
-        out.append(
-            _FallbackDemod(
-                f"{kind}{int(rate or 0)}",
-                native_sink,
-                framing,
-                framing_parameters=framing_parameters,
-                native_enabled=native_for_demod,
+        if native_sink is not None:
+            out.append(
+                _FallbackDemod(
+                    f"{kind}{int(rate or 0)}",
+                    native_sink,
+                    framing,
+                    framing_parameters=framing_parameters,
+                    native_enabled=native_for_demod,
+                )
             )
-        )
         if soft is not None:
             soft_tap = soft
     return out, soft_tap
