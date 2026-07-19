@@ -20,6 +20,10 @@ from native_framing.sample_clock import select_channel_rate
 # comfortable margin for GFSK/PSK timing recovery.
 CHANNEL_OVERSAMPLE = 4.0
 
+# Maximum live scheduler-handoff drain interval. The symbol queues also have an
+# item bound, so this is intentionally much shorter than a frame/report cadence.
+LIVE_DECODE_DRAIN_PERIOD_S = 0.05
+
 # The symbol rate reaches a flowgraph under different key names depending on the source:
 # gs-client's codec renames the SatNOGS ``baud`` field to ``symbol_rate_hz``, but a raw rfLink, a
 # hand-written params.json, or a future/other backend may carry ``baud``/``baudrate`` verbatim.
@@ -76,6 +80,22 @@ def channel_rate_for(sample_rate: float, symbol_rate_hz: float, sdr_rate: float)
     )
 
 
+def should_build_demod(
+    *,
+    mode: tuple[str, float] | None,
+    local_deframer_enabled: bool,
+    grsat_live: bool,
+) -> bool:
+    """Return whether a live demodulator has an enabled downstream decoder.
+
+    Recorder-only passes must not construct a terminal symbol queue. GNU Radio
+    would continue filling that queue even though nothing can turn its symbols
+    into frames, eventually overflowing it and terminating the recorder.
+    """
+
+    return mode is not None and (local_deframer_enabled or grsat_live)
+
+
 def no_decode_reason(
     *,
     has_decode_consumer: bool,
@@ -83,6 +103,8 @@ def no_decode_reason(
     grsat_live: bool,
     framing: str | None = None,
     deframer_available: bool = True,
+    native_deframer_available: bool = False,
+    native_live: bool = False,
 ) -> str:
     """R2-02: why (if at all) this graph ended up with NO decoder.
 
@@ -121,6 +143,17 @@ def no_decode_reason(
                 " and GS_GRSAT_LIVE is unset, so gr-satellites could not supply one either"
             )
         return why
+    if not deframer_available:
+        if native_deframer_available and not native_live:
+            return (
+                f"no enabled deframer: native framing {framing!r} exists but "
+                "GS_NATIVE_FRAMING_LIVE is unset, and gr-satellites is gated off "
+                "(GS_GRSAT_LIVE unset); recorder-only mode remains active"
+            )
+        return (
+            f"no enabled deframer for framing {framing!r}; gr-satellites is gated off "
+            "(GS_GRSAT_LIVE unset), so recorder-only mode remains active"
+        )
     return (
         f"no decoder built: the demod chain for {mode[0]}@{mode[1]:.0f} "
         f"(framing={framing or 'auto'}) failed to construct"

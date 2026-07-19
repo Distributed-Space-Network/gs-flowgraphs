@@ -14,7 +14,9 @@ def test_gnuradio_live_path_is_explicitly_gated_and_streaming() -> None:
     assert "self._native_decoder.push(fresh)" in source
     assert "self._native_decoder.flush()" in source
     assert "def flush_frames(self) -> list[_DecodedFrame]" in source
-    assert "native_live and native_profile is not None" in source
+    assert "native_live and native_profile_available" in source
+    assert "local_deframer_enabled = native_pairing_available" in source
+    assert "should_build_demod(" in source
     assert "plan_native_rx_pairing(" in source
     assert "native_pairing_available" in source
     assert "SoftSymbolSink" in source

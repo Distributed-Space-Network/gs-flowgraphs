@@ -39,6 +39,7 @@ from _fallback_select import (  # pure, testable, no GNU Radio
     CHANNEL_OVERSAMPLE,
     channel_rate_for,
     no_decode_reason,
+    should_build_demod,
     symbol_rate_hz_of,
 )
 from _recorder import PassRecorder
@@ -708,6 +709,25 @@ def build_satellites_rx(
             "native framing live path enabled for bench/shadow evaluation; exact raw-sample UTC "
             "mapping remains unavailable"
         )
+    native_profile = resolve_profile(framing) if framing else None
+    native_profile_available = bool(
+        native_profile is not None and native_profile.decoder_available
+    )
+    native_pairing_available = False
+    if native_live and native_profile_available and mode is not None:
+        native_pairing_available = plan_native_rx_pairing(
+            framing,
+            mode[0],
+            sample_rate_hz=channel_rate,
+            symbol_rate_hz=mode[1],
+            capture_rate_hz=channel_rate,
+            execution=RxExecution.LIVE,
+            evaluation=True,
+        ).accepted
+    legacy_deframer_available = (
+        framings.normalize_framing(framing) is not None if framing else True
+    )
+    local_deframer_enabled = native_pairing_available or legacy_deframer_available
     # The monolithic flowgraph (own demod on raw IQ, deadlock-prone) is ONLY for the no-mode
     # catalogued case — with demod params we use the decoupled deframers below instead.
     fg = None
@@ -720,7 +740,11 @@ def build_satellites_rx(
         demod_tap = blocks.conjugate_cc()
         tb.connect(chan, demod_tap)
         _log.info("spectral inversion: conjugating the decode tap (recorder stays raw)")
-    if mode:
+    if should_build_demod(
+        mode=mode,
+        local_deframer_enabled=local_deframer_enabled,
+        grsat_live=grsat_live,
+    ):
         # Our demod ONCE → (numpy-deframer fallbacks, FSK float soft tap).
         fallbacks, soft = _build_fallbacks(
             tb,
@@ -784,10 +808,9 @@ def build_satellites_rx(
     else:
         _log.error(
             "NO DECODER BUILT for %r — this pass is RECORDER-ONLY and will produce ZERO "
-            "frames. Cause: the backend sent no usable demod params (a transmitter with a "
-            "null/zero baud yields no modulation+symbol_rate) and GS_GRSAT_LIVE is unset, so "
-            "gr-satellites could not supply one either. The .cf32 is still captured — decode "
-            "it offline (iq_decode.py) — but the pass must not be read as a successful decode.",
+            "frames. No enabled decoder consumes the requested mode/framing. The .cf32 is "
+            "still captured — decode it offline (iq_decode.py) — but the pass must not be "
+            "read as a successful decode.",
             satellite,
         )
     # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
@@ -815,18 +838,6 @@ def build_satellites_rx(
     # outside our local vocabulary (AX.100 / USP / Mobitex / CCSDS Concatenated…) is
     # deframable only by gr-satellites, so with it gated off every drain returns
     # nothing while the graph looks perfectly healthy.
-    native_profile = resolve_profile(framing) if framing else None
-    native_pairing_available = False
-    if native_live and native_profile is not None and mode is not None:
-        native_pairing_available = plan_native_rx_pairing(
-            framing,
-            mode[0],
-            sample_rate_hz=channel_rate,
-            symbol_rate_hz=mode[1],
-            capture_rate_hz=channel_rate,
-            execution=RxExecution.LIVE,
-            evaluation=True,
-        ).accepted
     deframer_available = (
         bool(grsat_deframers)
         or fg is not None
@@ -841,6 +852,8 @@ def build_satellites_rx(
         grsat_live=grsat_live,
         framing=framing,
         deframer_available=deframer_available,
+        native_deframer_available=native_profile_available,
+        native_live=native_live,
     )
     # Decoupled model: both decode libraries run off our one demod, so there are no valves to gate
     # (valve_ours/valve_grsat stay None → drain_frames just collects + dedups; the race_winner

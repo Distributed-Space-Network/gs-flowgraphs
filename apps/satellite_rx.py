@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 from _doppler import NullDopplerSource, make_doppler_source, run_doppler_poll
+from _fallback_select import LIVE_DECODE_DRAIN_PERIOD_S
 from _recorder import first_sample_probe
 from _soapy import merge_sdr_params, readback_soapy_settings, sdr_ready_fields
 from _spawn_contract import (
@@ -42,7 +43,10 @@ from _spawn_contract import (
 )
 
 VERSION = "0.1.0"
-_DECODE_PERIOD_S = 2.0
+# Drain scheduler handoff queues frequently. Waiting two seconds allowed a
+# low-rate 2400-baud stream with tiny GNU Radio work chunks to exhaust the
+# queue's chunk bound before its first drain. Loss detection remains strict.
+_DECODE_PERIOD_S = LIVE_DECODE_DRAIN_PERIOD_S
 _DEFAULT_SAMPLE_RATE = 2_000_000
 # R-11: how long the started stream gets to deliver its FIRST samples before
 # the pass fails closed (supervisor ready timeout is 30 s; leave room for the

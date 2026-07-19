@@ -9,6 +9,12 @@ import flowgraph_runtime_check as runtime_check
 def _module(name: str) -> ModuleType:
     module = ModuleType(name)
     module.__file__ = f"/opt/gs-flowgraphs/bin/{name.replace('.', '/')}.py"
+    if name == "_fallback_select":
+        module.LIVE_DECODE_DRAIN_PERIOD_S = 0.05  # type: ignore[attr-defined]
+        module.should_build_demod = (  # type: ignore[attr-defined]
+            lambda *, mode, local_deframer_enabled, grsat_live: mode is not None
+            and (local_deframer_enabled or grsat_live)
+        )
     return module
 
 
@@ -76,6 +82,14 @@ def test_runtime_check_constructs_priority_deframers() -> None:
     assert result["ok"] is True
     assert built == list(labels)
     assert [check["count"] for check in result["checks"] if "count" in check] == [1] * 4
+    assert {
+        check["check"]: check["ok"]
+        for check in result["checks"]
+        if str(check["check"]).startswith("safety:")
+    } == {
+        "safety:recorder-only-no-demod": True,
+        "safety:decode-drain-period": True,
+    }
 
 
 def test_runtime_check_classifies_missing_pip_dependency_without_installing(

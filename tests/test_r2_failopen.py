@@ -19,7 +19,30 @@ from pathlib import Path
 _APPS = Path(__file__).resolve().parents[1] / "apps"
 sys.path.insert(0, str(_APPS))
 
-from _fallback_select import no_decode_reason  # noqa: E402
+from _fallback_select import no_decode_reason, should_build_demod  # noqa: E402
+
+
+class TestRecorderOnlyDoesNotBuildAnUndrainedDemod:
+    def test_native_usp_with_both_live_gates_off_has_no_demod_queue(self) -> None:
+        assert not should_build_demod(
+            mode=("gmsk", 2400.0),
+            local_deframer_enabled=False,
+            grsat_live=False,
+        )
+
+    def test_an_enabled_native_or_grsat_decoder_builds_the_demod(self) -> None:
+        mode = ("gmsk", 2400.0)
+        assert should_build_demod(
+            mode=mode, local_deframer_enabled=True, grsat_live=False
+        )
+        assert should_build_demod(
+            mode=mode, local_deframer_enabled=False, grsat_live=True
+        )
+
+    def test_active_symbol_queues_are_drained_every_50_ms(self) -> None:
+        import satellite_rx
+
+        assert satellite_rx._DECODE_PERIOD_S <= 0.05
 
 
 class TestADemodWithNoDeframerIsDecodeDead:
@@ -49,6 +72,19 @@ class TestADemodWithNoDeframerIsDecodeDead:
             framing="ax25",
             deframer_available=True,
         ) == ""
+
+    def test_gated_native_deframer_is_reported_truthfully(self) -> None:
+        why = no_decode_reason(
+            has_decode_consumer=False,
+            mode=("gmsk", 2400.0),
+            grsat_live=False,
+            framing="USP",
+            deframer_available=False,
+            native_deframer_available=True,
+            native_live=False,
+        )
+        assert "GS_NATIVE_FRAMING_LIVE" in why
+        assert "recorder-only" in why
 
     def test_deframer_available_defaults_true_for_older_callers(self) -> None:
         assert no_decode_reason(

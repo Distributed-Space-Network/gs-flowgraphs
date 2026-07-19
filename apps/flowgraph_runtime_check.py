@@ -180,6 +180,42 @@ def _check_import(name: str, importer: Callable[[str], ModuleType]) -> dict[str,
     }
 
 
+def _check_recorder_safety(importer: Callable[[str], ModuleType]) -> list[dict[str, object]]:
+    """Verify the installed checkout contains the recorder-overflow fix."""
+
+    try:
+        safety = importer("_fallback_select")
+        selector = safety.should_build_demod
+        period_s = float(safety.LIVE_DECODE_DRAIN_PERIOD_S)
+        recorder_only_safe = not selector(
+            mode=("gmsk", 2400.0),
+            local_deframer_enabled=False,
+            grsat_live=False,
+        )
+        active_decode_built = selector(
+            mode=("gmsk", 2400.0),
+            local_deframer_enabled=True,
+            grsat_live=False,
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return [
+            {"check": "safety:recorder-only-no-demod", "ok": False, "error": error},
+            {"check": "safety:decode-drain-period", "ok": False, "error": error},
+        ]
+    return [
+        {
+            "check": "safety:recorder-only-no-demod",
+            "ok": bool(recorder_only_safe and active_decode_built),
+        },
+        {
+            "check": "safety:decode-drain-period",
+            "ok": bool(0.0 < period_s <= 0.05),
+            "period_s": period_s,
+        },
+    ]
+
+
 def check_runtime(
     *,
     importer: Callable[[str], ModuleType] = importlib.import_module,
@@ -199,6 +235,7 @@ def check_runtime(
         )
     checks = [_check_import(name, importer) for name in required_modules]
     actions = _annotate_import_checks(checks, contract, system_python=system_python)
+    checks.extend(_check_recorder_safety(importer))
     engine: ModuleType | None = None
     try:
         engine = importer("gnuradio_satellites")
