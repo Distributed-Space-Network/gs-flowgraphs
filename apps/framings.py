@@ -143,7 +143,19 @@ def normalize_framing(label) -> str | None:
 # its synthetic constructor would throw. It plans + records as record-only, never synthesizable.
 # The qualified labels have a distinct lowercase key ("ccsds concatenated" …) and pass verbatim.
 _GRSAT_LABEL = {"ax25": "AX.25"}
-_NO_GRSAT = frozenset({"endurosat", "airmac", "ccsds_tm", "ccsds", "kiss"})
+_NO_GRSAT = frozenset(
+    {
+        "endurosat",
+        "airmac",
+        "ccsds_tm",
+        "ccsds",
+        "kiss",
+        "argos pmt-a3",
+        "argos ptt-a2",
+        "pmt-a3",
+        "ptt-a2",
+    }
+)
 
 
 def to_grsatellites_framing(label) -> str | None:

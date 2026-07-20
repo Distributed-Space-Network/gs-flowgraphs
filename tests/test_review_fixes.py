@@ -29,7 +29,7 @@ from gfsk_ax25.reedsolomon import RSCodec
         ("ccsds_tm", "ccsds_tm"),
         # bare "CCSDS" = unknown coding (spec birds use dual-basis RS/concatenated we don't
         # implement locally) -> upstream; argos = placeholder sync -> record-only until benched
-        ("CCSDS", None), ("Argos PTT-A2", None),
+        ("CCSDS", None), ("Argos PTT-A2", None), ("Argos PMT-A3", None),
         # NOT local: AX.100 is not AX.25; FX.25 needs its RS layer; coded CCSDS variants;
         # gr-satellites-only vocabularies; garbage.
         ("AX100 ASM+Golay", None), ("FX.25 NRZI", None), ("CCSDS Concatenated", None),
@@ -68,6 +68,7 @@ def test_can_synthesize_accepts_satyaml_vocabulary_and_rejects_local_tokens():
     # local-ONLY / unbuildable tokens are NOT synthesizable gr-satellites vocabulary
     assert not grsat_synth.can_synthesize("gfsk", 9600, "endurosat")
     assert not grsat_synth.can_synthesize("gfsk", 9600, "airmac")
+    assert not grsat_synth.can_synthesize("bpsk", 800, "Argos PMT-A3")
     assert not grsat_synth.can_synthesize("gfsk", 9600, None)
     # modulation/baud gates unchanged
     assert not grsat_synth.can_synthesize("qam16", 9600, "USP")
@@ -78,6 +79,21 @@ def test_can_synthesize_accepts_satyaml_vocabulary_and_rejects_local_tokens():
 def test_plan_decode_survives_non_string_framing():
     plan = compose.plan_decode({"modulation": "gfsk", "symbol_rate_hz": 9600, "framing": 123})
     assert not plan.our_framing  # "123" normalizes to nothing; no AttributeError
+
+
+def test_pmt_a3_is_explicitly_record_only_until_real_sync_is_qualified():
+    plan = compose.plan_decode(
+        {
+            "modulation": "bpsk",
+            "symbol_rate_hz": 800,
+            "framing": "Argos PMT-A3",
+        }
+    )
+    assert plan.our_modem
+    assert not plan.our_framing
+    assert not plan.grsat_synthesizable
+    assert not plan.decodable
+    assert "none(record-only)" in plan.describe()
 
 
 # ── P2-16: KISS/SLIP tolerate an arbitrary bit phase ─────────────────────────────────────────
