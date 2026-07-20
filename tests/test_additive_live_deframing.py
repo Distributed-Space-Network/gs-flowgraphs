@@ -97,3 +97,45 @@ def test_additive_legacy_decoder_state_is_independent_across_drains(monkeypatch)
     assert [(result.canonical_framing, result.payload) for result in results] == [
         ("endurosat", b"split")
     ]
+
+
+def test_usp_and_endurosat_share_one_demod_with_soft_and_hard_consumers(monkeypatch) -> None:
+    runtime = _load_runtime_module(monkeypatch)
+    hard_sink = _OneShotSink(np.empty(0, dtype=np.uint8))
+    soft_tap = object()
+    build_calls: list[tuple] = []
+
+    modem = ModuleType("modem")
+
+    def build_demod(*args, **kwargs):
+        build_calls.append((*args, kwargs))
+        return hard_sink, soft_tap
+
+    modem.build_demod = build_demod  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "modem", modem)
+
+    class _SoftSymbolSink:
+        pass
+
+    gnuradio_gfsk = ModuleType("gnuradio_gfsk")
+    gnuradio_gfsk.SoftSymbolSink = _SoftSymbolSink  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "gnuradio_gfsk", gnuradio_gfsk)
+
+    connections: list[tuple[object, object]] = []
+    top_block = SimpleNamespace(connect=lambda source, sink: connections.append((source, sink)))
+    fallbacks, returned_soft_tap = runtime._build_fallbacks(
+        top_block,
+        object(),
+        48_000,
+        modes=[("gmsk", 9_600)],
+        framing="USP",
+        framings_list=("USP", "EnduroSat"),
+        native_enabled=True,
+    )
+
+    assert len(build_calls) == 1
+    assert returned_soft_tap is soft_tap
+    assert len(fallbacks) == 2
+    assert fallbacks[0]._legacy_framings == ("EnduroSat",)
+    assert [label for label, _profile, _decoder in fallbacks[1]._native_decoders] == ["USP"]
+    assert connections == [(soft_tap, fallbacks[1]._sink)]
