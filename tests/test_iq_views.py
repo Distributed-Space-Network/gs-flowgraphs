@@ -187,7 +187,16 @@ def test_resampler_is_chunk_size_invariant() -> None:
         np.testing.assert_array_equal(got, ref, err_msg=f"chunk={chunk}")
 
 
-def test_resampler_preserves_a_tone_and_rejects_exotic_rates() -> None:
+def test_resampler_supports_parked_capture_rate_50_ksps() -> None:
+    """A +/-25 kHz parked capture commonly records at 50 ksample/s; 48 kHz audio is 24/25."""
+    r = iq_views._StreamingResampler(50_000, 48_000)
+    assert (r.up, r.down) == (24, 25)
+    x = np.zeros(50_000, dtype=np.float32)
+    out = np.concatenate([r.process(x), r.flush()])
+    assert abs(len(out) - 48_000) < 500
+
+
+def test_resampler_preserves_a_tone_and_accepts_noncanonical_rates() -> None:
     fs_in = 96_000
     t = np.arange(fs_in)
     tone = np.sin(2 * np.pi * 1_000 * t / fs_in).astype(np.float32)
@@ -196,8 +205,8 @@ def test_resampler_preserves_a_tone_and_rejects_exotic_rates() -> None:
     assert abs(len(out) - 48_000) < 500  # ~1 s at 48 kHz (FIR flush adds a hair)
     spec = np.abs(np.fft.rfft(out[:48_000]))
     assert abs(int(np.argmax(spec[10:])) + 10 - 1_000) <= 2  # 1 kHz bin survives
-    with pytest.raises(ValueError, match="unsupported capture rate"):
-        iq_views._StreamingResampler(48_001, 48_000)  # upsample factor 48000 — refuse
+    unusual = iq_views._StreamingResampler(50_500, 48_000)  # exact 96/101; old cap rejected it
+    assert (unusual.up, unusual.down) == (96, 101)
 
 
 @pytest.mark.parametrize("channels", [1, 2])
@@ -219,6 +228,19 @@ def test_ogg_real_encode_atomic_and_decodable(tmp_path: Path, channels: int) -> 
         data, _rate = sf.read(str(ogg))
         # stereo is the SAME mono signal duplicated — deterministic, no fake width
         np.testing.assert_allclose(data[:, 0], data[:, 1], atol=1e-6)
+
+
+def test_ogg_real_encode_at_parked_capture_rate_50_ksps(tmp_path: Path) -> None:
+    cf32 = tmp_path / "parked.cf32"
+    _capture(cf32, n=50_000, fs=50_000.0)
+    written = derive_views(
+        cf32, center_hz=0.0, sample_rate_hz=50_000.0, formats=("ogg",), ogg_channels=1
+    )
+    ogg = cf32.with_suffix(".ogg")
+    assert ogg in written and ogg.stat().st_size > 0
+    info = sf.info(str(ogg))
+    assert info.samplerate == iq_views.OGG_SAMPLE_RATE_HZ
+    assert abs(info.frames / info.samplerate - 1.0) < 0.05
 
 
 def test_ogg_missing_soundfile_skips_with_no_artifact(
@@ -249,14 +271,14 @@ def test_invalid_ogg_channels_skips_encode(tmp_path: Path) -> None:
     assert not cf32.with_suffix(".ogg").exists()
 
 
-def test_unsupported_rate_skips_encode_with_no_artifact(tmp_path: Path) -> None:
+def test_noncanonical_rate_encodes_without_a_ratio_cutoff(tmp_path: Path) -> None:
     cf32 = tmp_path / "odd.cf32"
-    _capture(cf32, n=20_000)
+    _capture(cf32, n=50_500, fs=50_500.0)
     out = iq_views.write_discriminator_ogg(
-        cf32, np.fromfile(cf32, dtype=np.complex64), sample_rate_hz=48_001.0
+        cf32, np.fromfile(cf32, dtype=np.complex64), sample_rate_hz=50_500.0
     )
-    assert out is None
-    assert not cf32.with_suffix(".ogg").exists()
+    assert out == cf32.with_suffix(".ogg")
+    assert out.exists() and out.stat().st_size > 0
     assert not cf32.with_suffix(".ogg.tmp").exists()
 
 

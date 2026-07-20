@@ -47,9 +47,8 @@ class _StreamingResampler:
     across chunks, so the output is bit-identical for ANY chunking of the same input.
     scipy is already a runtime dependency (apps/_stream.py uses the same primitives)."""
 
-    MAX_UPSAMPLE = 16  # a larger L means an exotic capture rate; refuse honestly, never alias
-
     def __init__(self, in_rate: int, out_rate: int) -> None:
+        import math
         from fractions import Fraction
 
         from scipy.signal import firwin
@@ -59,12 +58,6 @@ class _StreamingResampler:
             raise ValueError(msg)
         ratio = Fraction(out_rate, in_rate)
         self.up, self.down = ratio.numerator, ratio.denominator
-        if self.up > self.MAX_UPSAMPLE:
-            msg = (
-                f"unsupported capture rate {in_rate} Hz for {out_rate} Hz audio "
-                f"(upsample factor {self.up} > {self.MAX_UPSAMPLE})"
-            )
-            raise ValueError(msg)
         if self.up == 1 and self.down == 1:
             # Identity rate (a 48 kHz capture): pure passthrough — no filter, no delay.
             self._h = np.ones(1, dtype=np.float32)
@@ -74,31 +67,61 @@ class _StreamingResampler:
         half = max(self.up, self.down)
         ntaps = 20 * half + 1  # resample_poly's default kaiser design (half_len = 10*half)
         self._h = (firwin(ntaps, 1.0 / half, window=("kaiser", 5.0)) * self.up).astype(np.float32)
-        self._zi = np.zeros(len(self._h) - 1, dtype=np.float32)
-        self._phase = 0  # upsampled-stream index (mod `down`) of the next chunk's first sample
+        # FIR history is bounded by the rate ratio, never capture duration or file size. Rounding
+        # to a multiple of ``down`` keeps every local upfirdn call on the global output phase.
+        history = math.ceil((len(self._h) - 1) / self.up)
+        self._history_len = math.ceil(history / self.down) * self.down
+        self._history = np.empty(0, dtype=np.float32)
+        self._pending = np.empty(0, dtype=np.float32)
+        self._processed = 0
+        self._next_output = 0
 
     def process(self, x: np.ndarray) -> np.ndarray:
-        from scipy.signal import lfilter
-
         x = np.asarray(x, dtype=np.float32)
         if x.size == 0:
             return np.empty(0, dtype=np.float32)
         if self.up == 1 and self.down == 1:
             return x
-        up = np.zeros(x.size * self.up, dtype=np.float32)
-        up[:: self.up] = x
-        y, self._zi = lfilter(self._h, 1.0, up, zi=self._zi)
-        first = (-self._phase) % self.down
-        out = y[first :: self.down]
-        self._phase = (self._phase + up.size) % self.down
-        return np.asarray(out, dtype=np.float32)
+        joined = np.concatenate((self._pending, x)) if self._pending.size else x
+        take = (joined.size // self.down) * self.down
+        if take == 0:
+            self._pending = np.array(joined, dtype=np.float32, copy=True)
+            return np.empty(0, dtype=np.float32)
+        block = np.asarray(joined[:take], dtype=np.float32)
+        self._pending = np.array(joined[take:], dtype=np.float32, copy=True)
+        return self._process_aligned(block, flush=False)
+
+    def _process_aligned(self, block: np.ndarray, *, flush: bool) -> np.ndarray:
+        """Run exact polyphase filtering without materializing zero-stuffed input."""
+        from scipy.signal import upfirdn
+
+        local_start = self._processed - self._history.size
+        source = np.concatenate((self._history, block)) if self._history.size else block
+        filtered = upfirdn(self._h, source, up=self.up, down=self.down)
+        new_total = self._processed + block.size
+        if flush:
+            max_output = ((new_total - 1) * self.up + len(self._h) - 1) // self.down
+        else:
+            max_output = (new_total * self.up - 1) // self.down
+        offset = local_start * self.up // self.down
+        first = self._next_output - offset
+        last = max_output - offset + 1
+        out = np.asarray(filtered[first:last], dtype=np.float32)
+        self._processed = new_total
+        keep = min(self._history_len, new_total)
+        self._history = np.array(source[-keep:], dtype=np.float32, copy=True)
+        self._next_output = max_output + 1
+        return out
 
     def flush(self) -> np.ndarray:
         """Drain the FIR group delay so the audio tail is not truncated at stream end."""
         if self.up == 1 and self.down == 1:
             return np.empty(0, dtype=np.float32)  # passthrough has no delay to drain
-        tail_in = len(self._h) // (2 * self.up) + 1
-        return self.process(np.zeros(tail_in, dtype=np.float32))
+        if self._processed == 0 and self._pending.size == 0:
+            return np.empty(0, dtype=np.float32)
+        block = self._pending
+        self._pending = np.empty(0, dtype=np.float32)
+        return self._process_aligned(block, flush=True)
 
 
 def _discriminator_chunk(
