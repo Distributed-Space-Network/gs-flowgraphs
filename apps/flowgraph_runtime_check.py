@@ -17,6 +17,7 @@ from pathlib import Path
 from types import ModuleType
 
 import tomllib
+from _fallback_select import grsat_live_enabled
 
 OPTIONAL_MODULES = frozenset({"dvbs2rx"})
 
@@ -27,6 +28,31 @@ BENCH_DEFRAMERS = (
     "AX100 ASM+Golay",
     "USP",
 )
+
+
+def supported_framings(*, environment: dict[str, str] | None = None) -> list[str]:
+    """Return decoder-backed local profiles plus live-enabled gr-sat constructors."""
+    registry = importlib.import_module("native_framing.registry")
+    advertised = registry.advertised_profiles()
+    labels = [
+        str(label)
+        for label, profile in advertised.items()
+        if getattr(profile, "decoder_factory", None) is not None
+    ]
+    if grsat_live_enabled(environment):
+        flowgraph = importlib.import_module(
+            "satellites.core.gr_satellites_flowgraph"
+        ).gr_satellites_flowgraph
+        hooks = getattr(flowgraph, "_deframer_hooks", None)
+        if not isinstance(hooks, dict) or not hooks:
+            raise RuntimeError("gr-satellites exposes no deframer constructor map")
+        labels.extend(hooks)
+    unique: dict[str, str] = {}
+    for raw in labels:
+        label = raw.strip()
+        if label:
+            unique.setdefault(label.casefold(), label)
+    return sorted(unique.values(), key=str.casefold)
 
 
 def discover_external_imports(
@@ -312,6 +338,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compact", action="store_true", help="emit one-line JSON")
     parser.add_argument(
+        "--supported-framings",
+        action="store_true",
+        help="emit the runtime-supported framing labels and exit",
+    )
+    parser.add_argument(
         "--apps-root",
         type=Path,
         default=Path(__file__).resolve().parent,
@@ -329,6 +360,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="existing station interpreter used only for read-only OS import probes",
     )
     args = parser.parse_args(argv)
+    if args.supported_framings:
+        print(json.dumps(supported_framings(), separators=(",", ":"), sort_keys=True))
+        return 0
     result = check_runtime(
         apps_root=args.apps_root,
         client_pyproject=args.client_pyproject,
@@ -348,4 +382,5 @@ __all__ = [
     "check_runtime",
     "discover_external_imports",
     "main",
+    "supported_framings",
 ]

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import flowgraph_runtime_check as runtime_check
+import pytest
 
 
 def _module(name: str) -> ModuleType:
@@ -95,6 +96,40 @@ def test_runtime_check_constructs_priority_deframers() -> None:
         "safety:decode-drain-period": True,
         "safety:soft-only-no-hard-queue": True,
     }
+
+
+def test_supported_framings_add_grsatellites_only_for_exact_live_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imported: list[str] = []
+
+    def importer(name: str):
+        imported.append(name)
+        if name == "native_framing.registry":
+            return SimpleNamespace(advertised_profiles=lambda: {
+                "AX.25": SimpleNamespace(decoder_factory=object()),
+                "USP": SimpleNamespace(decoder_factory=object()),
+                "Planned": SimpleNamespace(decoder_factory=None),
+            })
+        if name == "satellites.core.gr_satellites_flowgraph":
+            return SimpleNamespace(gr_satellites_flowgraph=SimpleNamespace(
+                _deframer_hooks={"Light-1": object(), "USP": object()}
+            ))
+        raise AssertionError(name)
+
+    monkeypatch.setattr(runtime_check.importlib, "import_module", importer)
+    assert runtime_check.supported_framings(environment={}) == ["AX.25", "USP"]
+    assert runtime_check.supported_framings(environment={"GS_GRSAT_LIVE": "true"}) == [
+        "AX.25",
+        "USP",
+    ]
+    assert imported.count("satellites.core.gr_satellites_flowgraph") == 0
+    assert runtime_check.supported_framings(environment={"GS_GRSAT_LIVE": "1"}) == [
+        "AX.25",
+        "Light-1",
+        "USP",
+    ]
+    assert imported.count("satellites.core.gr_satellites_flowgraph") == 1
 
 
 def test_runtime_check_classifies_missing_pip_dependency_without_installing(

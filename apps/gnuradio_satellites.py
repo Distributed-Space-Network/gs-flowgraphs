@@ -38,6 +38,7 @@ import pmt  # PMT is a standalone top-level module in GNU Radio 3.10 (NOT gr.pmt
 from _fallback_select import (  # pure, testable, no GNU Radio
     CHANNEL_OVERSAMPLE,
     channel_rate_for,
+    grsat_live_enabled,
     no_decode_reason,
     requested_framings,
     should_build_demod,
@@ -748,7 +749,7 @@ def build_satellites_rx(
     if not isinstance(differential, bool):
         differential = None  # absent/garbage → PSK demod keeps its robust default
     mode = _backend_mode(params)  # (modulation, symbol_rate) when both present
-    grsat_live = os.environ.get("GS_GRSAT_LIVE", "").strip().lower() in ("1", "true", "yes", "on")
+    grsat_live = grsat_live_enabled()
     native_live = os.environ.get("GS_NATIVE_FRAMING_LIVE", "").strip().lower() in (
         "1",
         "true",

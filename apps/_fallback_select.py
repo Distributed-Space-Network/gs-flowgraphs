@@ -12,6 +12,7 @@ License: GPLv3 (see ../COPYING).
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 from native_framing.sample_clock import select_channel_rate
@@ -24,6 +25,12 @@ CHANNEL_OVERSAMPLE = 4.0
 # item bound, so this is intentionally much shorter than a frame/report cadence.
 LIVE_DECODE_DRAIN_PERIOD_S = 0.05
 MAX_ADDITIVE_FRAMINGS = 32
+
+
+def grsat_live_enabled(environment: dict[str, str] | None = None) -> bool:
+    """The single station contract for enabling and advertising live gr-satellites."""
+    env = os.environ if environment is None else environment
+    return str(env.get("GS_GRSAT_LIVE", "")).strip() == "1"
 
 # The symbol rate reaches a flowgraph under different key names depending on the source:
 # gs-client's codec renames the SatNOGS ``baud`` field to ``symbol_rate_hz``, but a raw rfLink, a
