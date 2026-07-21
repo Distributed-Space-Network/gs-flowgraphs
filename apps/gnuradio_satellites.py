@@ -414,6 +414,7 @@ def _build_fallbacks(
     framing=None,
     framings_list: tuple[str, ...] = (),
     differential=None,
+    mod_index=None,
     channel_bw_hz=None,
     framing_parameters=None,
     native_enabled=False,
@@ -481,6 +482,7 @@ def _build_fallbacks(
                 sample_rate,
                 float(rate or 0.0),
                 differential=differential,
+                mod_index=mod_index,
                 channel_bw_hz=channel_bw_hz,
                 collect_hard=collect_hard,
             )
@@ -817,6 +819,7 @@ def build_satellites_rx(
             framing=framing,
             framings_list=framing_labels,
             differential=differential,
+            mod_index=(params or {}).get("mod_index"),
             channel_bw_hz=float(args.bandwidth_hz or 0) or None,
             framing_parameters=params,
             native_enabled=native_live,

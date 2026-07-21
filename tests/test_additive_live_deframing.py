@@ -130,10 +130,12 @@ def test_usp_and_endurosat_share_one_demod_with_soft_and_hard_consumers(monkeypa
         modes=[("gmsk", 9_600)],
         framing="USP",
         framings_list=("USP", "EnduroSat"),
+        mod_index=0.75,
         native_enabled=True,
     )
 
     assert len(build_calls) == 1
+    assert build_calls[0][-1]["mod_index"] == 0.75
     assert returned_soft_tap is soft_tap
     assert len(fallbacks) == 2
     assert fallbacks[0]._legacy_framings == ("EnduroSat",)

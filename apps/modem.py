@@ -16,6 +16,7 @@ higher-order modem / gr-dvbs2rx later.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # ── Taxonomy (pure) ──────────────────────────────────────────────────────────────────────────
@@ -133,6 +134,7 @@ def build_demod(
     symbol_rate: float,
     *,
     differential: bool | None = None,
+    mod_index: float | None = None,
     channel_bw_hz: float | None = None,
     collect_hard: bool = True,
 ):
@@ -153,6 +155,10 @@ def build_demod(
     ``collect_hard=False`` is for an FSK soft-only consumer such as native USP or a decoupled
     gr-satellites deframer. The slicer is terminated without constructing a Python queue. Other
     modem families have no soft tap, so they return no chain when hard symbols are not requested.
+
+    ``mod_index`` is the optional per-transmitter binary-FSK modulation index. It sets peak
+    deviation to ``mod_index * symbol_rate / 2``. An omitted value keeps the family default;
+    an explicit invalid value fails closed instead of silently selecting another receive filter.
     """
     import logging  # noqa: PLC0415
 
@@ -166,19 +172,29 @@ def build_demod(
     if spec.tier == 3:
         return _build_tier3_demod(spec, tb, src, sample_rate), None
 
+    mod_index_value = None
+    if spec.family == "fsk":
+        from gfsk_ax25 import endurosat  # noqa: PLC0415
+
+        default_mod_index = (
+            0.5
+            if spec.kind in ("gmsk", "msk", "cpfsk", "cpm")
+            else endurosat.LinkProfile().mod_index
+        )
+        mod_index_value = default_mod_index if mod_index is None else float(mod_index)
+        if not math.isfinite(mod_index_value) or not 0.0 < mod_index_value <= 10.0:
+            raise ValueError("mod_index must be finite and within (0, 10]")
+
     from gnuradio_gfsk import (  # noqa: PLC0415 — GNU Radio only; keeps this module import-safe
         connect_afsk_demod,
         connect_gfsk_demod,
         connect_psk_demod,
     )
 
-    from gfsk_ax25 import endurosat  # noqa: PLC0415
-
     if spec.family == "fsk":
-        mod_index = 0.5 if spec.kind in ("gmsk", "msk", "cpfsk", "cpm") \
-            else endurosat.LinkProfile().mod_index
+        assert mod_index_value is not None
         profile = endurosat.LinkProfile(
-            symbol_rate_hz=symbol_rate or 9600.0, mod_index=mod_index)
+            symbol_rate_hz=symbol_rate or 9600.0, mod_index=mod_index_value)
         # (bit_sink, soft_tap): the caller feeds bits to our numpy deframers and the soft tap to
         # the gr-satellites deframers (docs/12 §L.7 Phase 3).
         return connect_gfsk_demod(

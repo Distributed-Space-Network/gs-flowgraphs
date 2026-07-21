@@ -608,6 +608,7 @@ def decode_capture_gnuradio(
         float(sample_rate_hz),
         float(symbol_rate_hz),
         differential=parameters.get("differential"),
+        mod_index=parameters.get("mod_index"),
         channel_bw_hz=parameters.get("bandwidth_hz"),
         collect_hard=False,
     )

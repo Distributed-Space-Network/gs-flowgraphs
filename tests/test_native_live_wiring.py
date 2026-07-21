@@ -98,6 +98,7 @@ def test_installed_iq_replay_reuses_exact_live_demod_and_both_deframers() -> Non
     assert "from gnuradio_satellites import" in function
     assert "make_grsat_deframers," in function
     assert "_unused_hard, soft = modem.build_demod(" in function
+    assert 'mod_index=parameters.get("mod_index")' in function
     assert "upstream_deframers = make_grsat_deframers(labels)" in function
     assert "blocks.throttle(" in function
     assert "class _NativeReplaySink(gr.sync_block):" in function

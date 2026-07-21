@@ -6,6 +6,9 @@ SELECTS the chain: family, constellation order, differential/offset, and Tier. I
 """
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import modem
 import pytest
 
@@ -88,3 +91,29 @@ def test_soft_only_non_fsk_build_does_not_construct_an_unused_hard_queue():
     assert modem.build_demod(
         "bpsk", None, None, 48_000.0, 1_200.0, collect_hard=False
     ) == (None, None)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, 10.01, float("inf"), float("nan")])
+def test_explicit_fsk_modulation_index_fails_closed_before_graph_construction(value):
+    with pytest.raises(ValueError, match="mod_index"):
+        modem.build_demod(
+            "gmsk", None, None, 48_000.0, 2_400.0, mod_index=value
+        )
+
+
+def test_explicit_fsk_modulation_index_reaches_shared_demod_profile(monkeypatch):
+    captured = {}
+    frontend = ModuleType("gnuradio_gfsk")
+
+    def connect_gfsk_demod(_tb, _src, _sample_rate, profile, **_kwargs):
+        captured["profile"] = profile
+        return object(), object()
+
+    frontend.connect_gfsk_demod = connect_gfsk_demod
+    frontend.connect_afsk_demod = lambda *_args, **_kwargs: None
+    frontend.connect_psk_demod = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "gnuradio_gfsk", frontend)
+
+    modem.build_demod("gmsk", object(), object(), 48_000.0, 2_400.0, mod_index=0.75)
+
+    assert captured["profile"].mod_index == 0.75
