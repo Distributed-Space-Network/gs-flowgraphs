@@ -204,6 +204,43 @@ def test_postpass_adapts_hard_decisions_to_declared_symbol_convention() -> None:
     )
 
 
+def test_exact_live_replay_decodes_fast_symbol_chunks_without_symbol_queue() -> None:
+    class _Decoder:
+        def __init__(self) -> None:
+            self.symbols = 0
+
+        def push(self, symbols):
+            self.symbols += len(symbols)
+            return []
+
+        def flush(self):
+            return [
+                FrameResult(
+                    canonical_framing="usp",
+                    payload=b"complete-frame",
+                    integrity=IntegrityStatus.PASSED,
+                    source_start=10,
+                    source_end=20,
+                    polarity=Polarity.NORMAL,
+                )
+            ]
+
+    decoder = _Decoder()
+    fanout = iq_decode._ReplayDecoderFanout((("USP", decoder),))
+
+    # More than the old 256-item live handoff bound, with no control-thread drain between pushes.
+    # Symbols are consumed synchronously and therefore cannot overflow a symbol-chunk queue.
+    for _ in range(2_048):
+        fanout.push(np.ones(32, dtype=np.float32))
+
+    assert decoder.symbols == 65_536
+    assert fanout.drain_results() == []
+    flushed = fanout.flush_results()
+    assert len(flushed) == 1
+    assert flushed[0][0] == "USP"
+    assert flushed[0][1].payload == b"complete-frame"
+
+
 @pytest.mark.parametrize(
     "value",
     ([], [1_200.0], [1_200.0, 2_200.0, 3_200.0], [True, 2_200.0], "1200,2200"),

@@ -96,10 +96,16 @@ def test_installed_iq_replay_reuses_exact_live_demod_and_both_deframers() -> Non
     ]
 
     assert "from gnuradio_satellites import" in function
-    assert "_build_fallbacks," in function
     assert "make_grsat_deframers," in function
-    assert "fallbacks, soft = _build_fallbacks(" in function
+    assert "_unused_hard, soft = modem.build_demod(" in function
     assert "upstream_deframers = make_grsat_deframers(labels)" in function
     assert "blocks.throttle(" in function
+    assert "class _NativeReplaySink(gr.sync_block):" in function
+    assert "self._fanout.push(chunk)" in function
+    assert "class _ReplayDecoderFanout:" in source
+    assert "for result in decoder.push(symbols.copy()):" in source
+    assert "BoundedQueue[tuple[str, FrameResult]]" in source
+    assert "SoftSymbolSink" not in function
+    assert "_build_fallbacks(" not in function
     assert "while not completed.wait(_GNU_RADIO_DRAIN_PERIOD_S):" in function
-    assert "fallback.flush_frames()" in function
+    assert "native_sink.flush_results()" in function

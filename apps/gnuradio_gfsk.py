@@ -314,8 +314,9 @@ def connect_afsk_demod(
 ) -> _BitSink:
     """Connect a Bell-202 AFSK demod (mark/space audio tones FM-carried) onto ``src`` and
     return the bit sink. FM-demod the IQ to audio, frequency-shift the audio tone-centre to
-    baseband, then run the SatNOGS FSK demod on it — so AFSK inherits the FLL / baud-LPF /
-    dc-blocker / M&M chain for free. NRZI/HDLC is handled downstream by the deframer. The
+    baseband, then run the pinned gr-satellites FSK demodulator on it — so AFSK inherits its
+    deviation-aware filter/discriminator, square-pulse filter, DC block, and Gardner timing.
+    NRZI/HDLC is handled downstream by the deframer. The
     float soft-symbol tap is discarded here (AFSK gr-satellites deframers are bench-pending —
     AFSK is rare on 401 MHz UHF)."""
     af_carrier = (mark_hz + space_hz) / 2.0      # tone centre (Bell-202: 1700 Hz)
@@ -326,8 +327,8 @@ def connect_afsk_demod(
     xlate = gr_filter.freq_xlating_fir_filter_fcf(
         1, gr_filter.firdes.low_pass(1.0, sample_rate, 2.0 * af_dev, 0.1 * af_dev),
         af_carrier, sample_rate)
-    # 3) Reuse the SatNOGS FSK demod on the complex baseband (its dc_blocker_ff absorbs any
-    #    residual tone-centre error; the LPF is sized from the baud, so mod_index is unused here).
+    # 3) Reuse the pinned gr-satellites FSK demod on the complex baseband (its dc_blocker_ff
+    #    absorbs residual tone-centre error; mod_index declares the Bell-202 tone deviation).
     profile = endurosat.LinkProfile(symbol_rate_hz=baud, mod_index=2.0 * af_dev / baud)
     # Construct + wire the FSK chain BEFORE connecting anything to ``src`` (null_sink rule,
     # docs/10 A4/A5 class): if an FSK-chain constructor raises (absurd baud → sps < 1), the

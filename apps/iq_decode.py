@@ -58,6 +58,7 @@ from native_framing import (
 )
 from native_framing.modem_matrix import RxExecution, plan_native_rx_pairing
 from native_framing.output import utc_from_sample_offset
+from native_framing.runtime_queue import BoundedQueue, require_lossless
 
 from gfsk_ax25 import gfsk
 
@@ -481,6 +482,47 @@ def _record_gnuradio_upstream(frame) -> dict:
     }
 
 
+class _ReplayDecoderFanout:
+    """Synchronous symbol-to-frame fan-out for faster-than-real-time GNU Radio replay.
+
+    Symbols never wait in a Python queue: the scheduler callback pushes each chunk directly into
+    every bounded streaming decoder. Only complete frames cross the control-thread boundary.
+    """
+
+    def __init__(self, decoders) -> None:
+        self._decoders = tuple(decoders)
+        self._q = BoundedQueue[tuple[str, FrameResult]](
+            capacity_items=1_024,
+            capacity_units=16 * 1024 * 1024,
+        )
+        self._error: BaseException | None = None
+
+    def push(self, symbols: np.ndarray) -> None:
+        if self._error is not None:
+            return
+        try:
+            for label, decoder in self._decoders:
+                for result in decoder.push(symbols.copy()):
+                    self._q.offer((label, result), units=len(result.payload))
+        except BaseException as exc:  # noqa: BLE001 - surface scheduler callback failure
+            self._error = exc
+
+    def drain_results(self) -> list[tuple[str, FrameResult]]:
+        if self._error is not None:
+            raise RuntimeError("native replay decoder failed") from self._error
+        stats = self._q.stats()
+        require_lossless(stats, label="native replay frame", unit_name="bytes")
+        return self._q.drain()
+
+    def flush_results(self) -> list[tuple[str, FrameResult]]:
+        if self._error is not None:
+            raise RuntimeError("native replay decoder failed") from self._error
+        for label, decoder in self._decoders:
+            for result in decoder.flush():
+                self._q.offer((label, result), units=len(result.payload))
+        return self.drain_results()
+
+
 def decode_capture_gnuradio(
     cf32: str | Path,
     *,
@@ -538,9 +580,8 @@ def decode_capture_gnuradio(
 
     # Imports stay inside the explicit engine so normal source-tree tests and numpy replay remain
     # safe on machines without GNU Radio, PMT, or gr-satellites.
-    from gnuradio import blocks, gr  # noqa: PLC0415
+    from gnuradio import blocks, digital, gr  # noqa: PLC0415
     from gnuradio_satellites import (  # noqa: PLC0415
-        _build_fallbacks,
         _FrameSink,
         make_grsat_deframers,
     )
@@ -557,18 +598,84 @@ def decode_capture_gnuradio(
         tb.connect(demod_source, conjugate)
         demod_source = conjugate
 
-    fallbacks, soft = _build_fallbacks(
+    modulation_spec = modem.modulation_spec(modulation_value)
+    if modulation_spec is None or modulation_spec.family != "fsk":
+        raise ValueError("gnuradio-live replay currently requires an FSK/GFSK/GMSK modulation")
+    _unused_hard, soft = modem.build_demod(
+        modulation_value,
         tb,
         demod_source,
         float(sample_rate_hz),
-        modes=[(modulation_value, float(symbol_rate_hz))],
-        framing=labels[0],
-        framings_list=labels,
+        float(symbol_rate_hz),
         differential=parameters.get("differential"),
         channel_bw_hz=parameters.get("bandwidth_hz"),
-        framing_parameters=parameters,
-        native_enabled=native_evaluation,
+        collect_hard=False,
     )
+    if soft is None:
+        raise RuntimeError("the exact live FSK demodulator failed to construct")
+
+    # Offline replay must not hand every recovered symbol through the live scheduler queue. At
+    # faster-than-real-time rates a Python producer can fill that queue before the control thread
+    # gets the GIL to drain it (cmd_148 replay dropped 43,131 symbols at 8x). Decode synchronously
+    # in the GNU Radio work callback instead: retained protocol state stays bounded, complete
+    # frames cross a separate bounded queue, and the live station queue limits remain unchanged.
+    class _NativeReplaySink(gr.sync_block):
+        def __init__(self, name: str, input_type, decoders) -> None:
+            gr.sync_block.__init__(self, name=name, in_sig=[input_type], out_sig=None)
+            self._fanout = _ReplayDecoderFanout(decoders)
+
+        def work(self, input_items, output_items):  # type: ignore[no-untyped-def]
+            chunk = np.array(input_items[0], copy=True)
+            self._fanout.push(chunk)
+            return len(input_items[0])
+
+        def drain_results(self) -> list[tuple[str, FrameResult]]:
+            return self._fanout.drain_results()
+
+        def flush_results(self) -> list[tuple[str, FrameResult]]:
+            return self._fanout.flush_results()
+
+    native_soft = []
+    native_hard = []
+    if native_evaluation:
+        for label in labels:
+            profile = resolve_profile(label)
+            if profile is None or not profile.decoder_available:
+                continue
+            pairing = plan_native_rx_pairing(
+                label,
+                modulation_spec.kind,
+                sample_rate_hz=sample_rate_hz,
+                symbol_rate_hz=symbol_rate_hz,
+                capture_rate_hz=sample_rate_hz,
+                execution=RxExecution.LIVE,
+                evaluation=True,
+            )
+            if not pairing.accepted:
+                log.warning(
+                    "iq_decode: native live pairing rejected for %s: %s",
+                    label,
+                    pairing.reason,
+                )
+                continue
+            decoder = build_decoder(label, _decoder_parameters(profile, parameters))
+            target = (
+                native_soft
+                if profile.symbol_input is SymbolInput.SOFT_SYMBOLS
+                else native_hard
+            )
+            target.append((label, decoder))
+
+    native_sinks = []
+    if native_soft:
+        native_soft_sink = _NativeReplaySink("native_soft_replay", np.float32, native_soft)
+        native_sinks.append(("soft", native_soft_sink))
+        tb.connect(soft, native_soft_sink)
+    if native_hard:
+        slicer = digital.binary_slicer_fb()
+        native_hard_sink = _NativeReplaySink("native_hard_replay", np.uint8, native_hard)
+        native_sinks.append(("hard", native_hard_sink))
+        tb.connect(soft, slicer, native_hard_sink)
     upstream_sink = _FrameSink()
     upstream_deframers = make_grsat_deframers(labels) if use_grsatellites and soft else []
     upstream_sinks = []
@@ -577,7 +684,7 @@ def decode_capture_gnuradio(
         upstream_sinks.append(tagged_sink)  # retain Python ownership for the graph lifetime
         tb.connect(soft, blocks.copy(gr.sizeof_float), decoder)
         tb.msg_connect(decoder, "out", tagged_sink, "in")
-    if not fallbacks and not upstream_deframers:
+    if not native_sinks and not upstream_deframers:
         raise RuntimeError(
             "the exact live chain built no deframer; enable --native-evaluation and/or "
             "leave --grsatellites enabled for the requested framing"
@@ -589,11 +696,11 @@ def decode_capture_gnuradio(
         # Deduplicate only within one drain. Repeated identical beacons in later drains remain
         # distinct, while a native/upstream parity hit from the same burst becomes one record.
         batch: dict[tuple[str, str], dict] = {}
-        for fallback in fallbacks:
-            for result in fallback.drain_frames():
+        for symbol_kind, native_sink in native_sinks:
+            for label, result in native_sink.drain_results():
                 record = _record_gnuradio_native(
                     result,
-                    decoder=f"native:{fallback.name}",
+                    decoder=f"native:{modulation_spec.kind}{int(symbol_rate_hz)}-{symbol_kind}:{label}",
                     sample_rate_hz=sample_rate_hz,
                     symbol_rate_hz=symbol_rate_hz,
                     capture_start_unix_s=capture_start_unix_s,
@@ -628,12 +735,15 @@ def decode_capture_gnuradio(
             drain_once()
         worker.join()
         drain_once()
-        for fallback in fallbacks:
-            for result in fallback.flush_frames():
+        for symbol_kind, native_sink in native_sinks:
+            for label, result in native_sink.flush_results():
                 records.append(
                     _record_gnuradio_native(
                         result,
-                        decoder=f"native:{fallback.name}",
+                        decoder=(
+                            f"native:{modulation_spec.kind}{int(symbol_rate_hz)}-"
+                            f"{symbol_kind}:{label}"
+                        ),
                         sample_rate_hz=sample_rate_hz,
                         symbol_rate_hz=symbol_rate_hz,
                         capture_start_unix_s=capture_start_unix_s,
