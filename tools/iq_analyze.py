@@ -1231,6 +1231,11 @@ def grind_inband_snr_db(iq: np.ndarray, fs: float, carrier_hz: float, half_bw_hz
     return 10.0 * np.log10(max(float(p[inband].mean()) - nf, 1e-30) / nf)
 
 
+def grind_inband_half_bw_hz(channel_bw_hz: float) -> float:
+    """Convert the CLI's full channel bandwidth to the SNR estimator's half-width."""
+    return float(channel_bw_hz) / 2.0 if channel_bw_hz > 0 else GRIND_INBAND_HALF_HZ
+
+
 def _longest_identical_run(a: np.ndarray, b: np.ndarray, *, min_overlap: int = 32) -> int:
     """Longest run of consecutive identical bits between two hard-decision streams, over all lags.
 
@@ -1272,6 +1277,7 @@ def grind_pass(
     t, snr, car = grind_burst_map(iq, fs)
     bursts = grind_detect_bursts(t, snr, car)
     baud_list = tuple(bauds) if bauds else (symbol_rate,)
+    inband_half_bw_hz = grind_inband_half_bw_hz(channel_bw_hz)
     print(f"grind: {len(bursts)} near-DC burst(s) (time-resolved peak SNR over a clean noise "
           "floor; in-band SNR = decodability):")
     guard = int(fs * 0.05)
@@ -1281,7 +1287,7 @@ def grind_pass(
         lo = max(0, int((t0) * fs) - guard)
         hi = min(len(iq), int((t1) * fs) + guard)
         seg = np.asarray(iq[lo:hi])
-        inband = grind_inband_snr_db(seg, fs, carrier, GRIND_INBAND_HALF_HZ)
+        inband = grind_inband_snr_db(seg, fs, carrier, inband_half_bw_hz)
         best: tuple[int, int, np.ndarray | None] = (-1, int(symbol_rate), None)
         for baud in baud_list:
             ch = channel_bw_hz if channel_bw_hz > 0 else 2.0 * baud
@@ -1346,7 +1352,7 @@ def grind_pass(
         inbands = [
             grind_inband_snr_db(
                 np.asarray(iq[max(0, int(t0 * fs) - guard) : min(len(iq), int(t1 * fs) + guard)]),
-                fs, carrier, GRIND_INBAND_HALF_HZ,
+                fs, carrier, inband_half_bw_hz,
             )
             for (t0, t1, carrier, _psnr) in bursts
         ]
@@ -1409,7 +1415,12 @@ def analyze_file(
         # bursts beside a drifting carrier.  Detect on time-resolved SNR; report in-band SNR.
         grind_pass(
             cap.iq, cap.fs, symbol_rate=symbol_rate,
-            bauds=_usable_sweep_bauds(cap.fs, symbol_rate), channel_bw_hz=channel_bw_hz,
+            bauds=(
+                _usable_sweep_bauds(cap.fs, symbol_rate)
+                if sweep_baud
+                else (float(symbol_rate),)
+            ),
+            channel_bw_hz=channel_bw_hz,
             mod_index=mod_index, bt=bt, target_sps=target_sps, correct_cfo=correct_cfo,
             recover_timing=recover_timing, raw_bits_dir=raw_bits_dir,
         )

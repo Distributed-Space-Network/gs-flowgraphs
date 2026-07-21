@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import iq_analyze
 import numpy as np
 import pytest
 from iq_analyze import ax25_sweep, load_capture, load_cf32, spectrum_summary
@@ -42,6 +43,54 @@ def test_load_capture_dispatches_and_requires_rate(tmp_path: Path) -> None:
         load_capture(cf)
     cap = load_capture(cf, sample_rate_hz=48000.0)
     assert cap.fs == 48000.0
+
+
+@pytest.mark.parametrize(
+    ("sweep_baud", "expected"),
+    [(False, (2400.0,)), (True, iq_analyze.DEFAULT_SWEEP_BAUDS)],
+)
+def test_grind_honors_baud_sweep_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    sweep_baud: bool,
+    expected: tuple[float, ...],
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        iq_analyze,
+        "load_capture",
+        lambda _path, _sample_rate: iq_analyze.Capture(
+            iq=np.zeros(16, dtype=np.complex64),
+            fs=48_000.0,
+            center_hz=401_175_000.0,
+            meta={},
+        ),
+    )
+    monkeypatch.setattr(
+        iq_analyze,
+        "grind_pass",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    iq_analyze.analyze_file(
+        "capture.cf32",
+        symbol_rate=2400.0,
+        sample_rate_hz=48_000.0,
+        sweep_baud=sweep_baud,
+        want_grind=True,
+    )
+
+    assert captured["bauds"] == expected
+
+
+@pytest.mark.parametrize(
+    ("channel_bw_hz", "expected_half_bw_hz"),
+    [(0.0, iq_analyze.GRIND_INBAND_HALF_HZ), (4800.0, 2400.0)],
+)
+def test_grind_snr_band_honors_explicit_full_channel_bandwidth(
+    channel_bw_hz: float,
+    expected_half_bw_hz: float,
+) -> None:
+    assert iq_analyze.grind_inband_half_bw_hz(channel_bw_hz) == expected_half_bw_hz
 
 
 # ── spectrum_summary: the carrier-presence check (weak/continuous, not just bursts) ───────────
