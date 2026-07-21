@@ -29,6 +29,16 @@ def test_modem_advertises_the_tier1_and_tier2_families():
 
 def test_framing_registry_lists_local_and_grsatellites_layers():
     assert framings.local_framings() == ("ax25", "endurosat", "ccsds_tm", "kiss")
+    assert framings.advertised_local_framings() == (
+        "AX.25",
+        "EnduroSat",
+        "ccsds_tm",
+        "KISS",
+    )
+    assert tuple(
+        framings.normalize_framing(label)
+        for label in framings.advertised_local_framings()
+    ) == framings.local_framings()
     known = framings.known_framings()
     assert "ax25" in known and "ccsds_tm" in known and "kiss" in known
     assert "argos" not in known  # placeholder sync -> not advertised until bench-confirmed

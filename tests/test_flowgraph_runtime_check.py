@@ -135,6 +135,10 @@ def test_supported_framings_add_grsatellites_only_for_exact_live_gate(
 
     def importer(name: str):
         imported.append(name)
+        if name == "framings":
+            return SimpleNamespace(advertised_local_framings=lambda: (
+                "AX.25", "EnduroSat", "ccsds_tm", "KISS"
+            ))
         if name == "native_framing.registry":
             return SimpleNamespace(advertised_profiles=lambda: {
                 "AX.25": SimpleNamespace(decoder_factory=object()),
@@ -148,14 +152,21 @@ def test_supported_framings_add_grsatellites_only_for_exact_live_gate(
         raise AssertionError(name)
 
     monkeypatch.setattr(runtime_check.importlib, "import_module", importer)
-    assert runtime_check.supported_framings(environment={}) == ["AX.25", "USP"]
+    expected_local = ["AX.25", "ccsds_tm", "EnduroSat", "KISS", "USP"]
+    assert runtime_check.supported_framings(environment={}) == expected_local
     assert runtime_check.supported_framings(environment={"GS_GRSAT_LIVE": "true"}) == [
         "AX.25",
+        "ccsds_tm",
+        "EnduroSat",
+        "KISS",
         "USP",
     ]
     assert imported.count("satellites.core.gr_satellites_flowgraph") == 0
     assert runtime_check.supported_framings(environment={"GS_GRSAT_LIVE": "1"}) == [
         "AX.25",
+        "ccsds_tm",
+        "EnduroSat",
+        "KISS",
         "Light-1",
         "USP",
     ]

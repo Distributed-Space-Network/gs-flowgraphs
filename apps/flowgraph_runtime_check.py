@@ -31,14 +31,16 @@ BENCH_DEFRAMERS = (
 
 
 def supported_framings(*, environment: dict[str, str] | None = None) -> list[str]:
-    """Return decoder-backed local profiles plus live-enabled gr-sat constructors."""
+    """Return local deframers, native profiles, and live-enabled gr-sat constructors."""
+    local_registry = importlib.import_module("framings")
     registry = importlib.import_module("native_framing.registry")
     advertised = registry.advertised_profiles()
-    labels = [
+    labels = list(local_registry.advertised_local_framings())
+    labels.extend(
         str(label)
         for label, profile in advertised.items()
         if getattr(profile, "decoder_factory", None) is not None
-    ]
+    )
     if grsat_live_enabled(environment):
         flowgraph = importlib.import_module(
             "satellites.core.gr_satellites_flowgraph"

@@ -29,7 +29,13 @@ import numpy as np
 # ``slip`` is NOT here either: with no checksum AND no type byte, strict gating still passes
 # ~30 garbage frames per noise drain — unusable on a demodulated bitstream. The codec
 # (gfsk_ax25.kiss.slip_*) remains for its real use, byte-exact TNC/serial pipes (uplink/relay).
-_LOCAL = ("ax25", "endurosat", "ccsds_tm", "kiss")
+_LOCAL_ADVERTISED = {
+    "ax25": "AX.25",
+    "endurosat": "EnduroSat",
+    "ccsds_tm": "ccsds_tm",
+    "kiss": "KISS",
+}
+_LOCAL = tuple(_LOCAL_ADVERTISED)
 _LOCAL_AUTODETECT = ("ax25", "endurosat")
 
 # Local framings whose deframer verifies a REAL integrity check (AX.25 FCS, EnduroSat CRC-16,
@@ -64,6 +70,11 @@ GRSATELLITES_FRAMINGS = (
 def local_framings() -> tuple[str, ...]:
     """Framings deframed in-process by :func:`deframe` (numpy)."""
     return _LOCAL
+
+
+def advertised_local_framings() -> tuple[str, ...]:
+    """Backend-facing names for every operational in-process deframer."""
+    return tuple(_LOCAL_ADVERTISED.values())
 
 
 def grsatellites_framings() -> tuple[str, ...]:
