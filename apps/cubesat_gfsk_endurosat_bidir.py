@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Persistent bidirectional EnduroSat 2-GFSK flowgraph — split-freq, half-duplex uplink + downlink.
+"""Persistent bidirectional AX.25/EnduroSat 2-GFSK flowgraph.
 
 ONE process owns the XTRX for the whole pass. It runs a **continuous RX demod** on the downlink
-(emitting one ``frame_received`` per decoded EnduroSat chip packet, plus periodic ``signal`` RSSI),
+(emitting one ``frame_received`` per decoded frame, plus periodic ``signal`` RSSI),
 and on command it **bursts** the uplink on the TX stream. Uplink and downlink are different
 frequencies; the single antenna is half-duplex behind a T/R switch.
 
@@ -28,12 +28,13 @@ Division of responsibility (Document A / docs/13):
   baseband and demodulates the downlink. During a TX burst the RX stream is paused inside the I/O
   layer (the antenna is on the PA path anyway, so RX would be garbage).
 
-**Uplink TX is RAW (Rev A):** the uplink file is ALREADY a complete EnduroSat packet train
+**EnduroSat uplink TX is RAW (Rev A):** the uplink file is ALREADY a complete packet train
 (``[AA×5][7E]…[CRC]`` per packet, several concatenated, zero-byte-padded) — the framing is implicit
 in the file. So the TX path modulates the bytes **VERBATIM** (raw MSB-first 2-GFSK via
 ``gfsk.modulate_bytes``), NOT re-wrapping them; long ``0x00`` pad runs can optionally become silence
 gaps (``uplink_zero_gap_bytes``). The **RX/downlink** path is unchanged — it still deframes
-EnduroSat via the proven ``gfsk_ax25.endurosat_link`` StreamDecoder. dsp engine only (no gr-soapy).
+EnduroSat via the proven ``gfsk_ax25.endurosat_link`` StreamDecoder. AX.25 payloads are wrapped as
+UI frames and use the proven G3RUH/NRZI framing path. dsp engine only (no gr-soapy).
 
 License: GPLv3 (see ../COPYING).
 """
@@ -76,11 +77,13 @@ from _stream import (
     require_sample_rate,
     upsample_burst,
 )
+from _uplink_frame import UnknownFraming, normalize_framing
 
-from gfsk_ax25 import endurosat_link, gfsk
+from gfsk_ax25 import ax25, endurosat, endurosat_link, gfsk
+from gfsk_ax25 import framing as ax25_framing
 
-VERSION = "0.1.0"
-_DEFAULT_SAMPLE_RATE = 96_000  # multiple of 9600 → integer samples/symbol (endurosat_link requires)
+VERSION = "0.2.0"
+_DEFAULT_SAMPLE_RATE = 124_800  # integer sps for both 9600 and 12480 baud defaults
 _DECODE_PERIOD_S = 2.0  # how often the RX decoder is drained
 _SIGNAL_PERIOD_S = 1.0  # how often an RSSI signal event is emitted
 _READ_CHUNK = 4096
@@ -155,18 +158,97 @@ class UplinkRejected(ValueError):
 
 
 # ----------------------------------------------------------------------
-# EnduroSat modem parameters + frame build/demod (pure — unit-testable)
+# AX.25/EnduroSat modem parameters + frame build/demod (pure — unit-testable)
 # ----------------------------------------------------------------------
 
 
-def _decoder_kwargs(params: dict[str, object]) -> dict[str, float]:
-    """The 2-GFSK modem parameters, from params with endurosat_link defaults (baud / baudrate /
-    symbol_rate_hz are interchangeable — see symbol_rate_hz_of)."""
+def _selected_framings(params: dict[str, object]) -> tuple[str, ...]:
+    """Ordered RX framings; the first framing is also used for TX."""
+    raw: list[object] = []
+    primary = params.get("framing")
+    if isinstance(primary, str) and primary.strip():
+        raw.append(primary)
+    additional = params.get("framings")
+    if additional is not None:
+        if not isinstance(additional, list):
+            raise UnknownFraming("framings must be a list of framing labels")
+        raw.extend(additional)
+    if not raw:
+        raw.append("endurosat")
+    selected: list[str] = []
+    for label in raw:
+        if not isinstance(label, str):
+            raise UnknownFraming("framings entries must be strings")
+        canonical = normalize_framing(label)
+        if canonical not in selected:
+            selected.append(canonical)
+    return tuple(selected)
+
+
+def _tx_framing(params: dict[str, object]) -> str:
+    return _selected_framings(params)[0]
+
+
+def _decoder_kwargs(
+    params: dict[str, object], framing_name: str | None = None
+) -> dict[str, float]:
+    """The 2-GFSK modem parameters for one selected framing."""
+    framing_name = framing_name or _tx_framing(params)
+    default_rate = (
+        endurosat.SYMBOL_RATE_HZ
+        if framing_name == "ax25"
+        else endurosat_link.DEFAULT_SYMBOL_RATE_HZ
+    )
     return {
-        "symbol_rate_hz": symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ),
+        "symbol_rate_hz": symbol_rate_hz_of(params, default=default_rate),
         "mod_index": float(params.get("mod_index", endurosat_link.DEFAULT_MOD_INDEX)),
         "bt": float(params.get("bt", endurosat_link.DEFAULT_BT)),
     }
+
+
+def _ax25_profile(params: dict[str, object]) -> endurosat.LinkProfile:
+    kw = _decoder_kwargs(params, "ax25")
+    return endurosat.LinkProfile(
+        scramble=bool(params.get("scramble", True)),
+        nrzi=bool(params.get("nrzi", True)),
+        mod_index=kw["mod_index"],
+        bt=kw["bt"],
+        symbol_rate_hz=kw["symbol_rate_hz"],
+    )
+
+
+def _ax25_bits(payload: bytes, params: dict[str, object]) -> np.ndarray:
+    if len(payload) > endurosat.AX25_INFO_MAX_BYTES:
+        raise UplinkRejected(
+            "payload-too-large",
+            f"AX.25 UI info {len(payload)} B exceeds the {endurosat.AX25_INFO_MAX_BYTES} B cap",
+        )
+    try:
+        body = ax25.encode_ui(
+            dest=str(params.get("dest", "CQ")),
+            src=str(params.get("src", "DSN")),
+            dest_ssid=int(params.get("dest_ssid", 0) or 0),
+            src_ssid=int(params.get("src_ssid", 0) or 0),
+            info=payload,
+        )
+    except (UnicodeEncodeError, TypeError, ValueError) as exc:
+        raise UplinkRejected("ax25-address-unusable", str(exc)) from exc
+    profile = _ax25_profile(params)
+    return ax25_framing.encode(body, scramble=profile.scramble, nrzi=profile.nrzi)
+
+
+def _tx_bit_count(payload: bytes, params: dict[str, object]) -> int:
+    if _tx_framing(params) == "ax25":
+        return int(_ax25_bits(payload, params).size)
+    return len(payload) * 8
+
+
+def _build_rx_decoder(framing_name: str, sample_rate: float, params: dict[str, object]):
+    if framing_name == "ax25":
+        return endurosat.StreamDecoder(sample_rate, profile=_ax25_profile(params))
+    return endurosat_link.StreamDecoder(
+        sample_rate, **_decoder_kwargs(params, "endurosat")
+    )
 
 
 def resolve_sample_rate(args, params: dict[str, object]) -> float:
@@ -178,7 +260,7 @@ def resolve_sample_rate(args, params: dict[str, object]) -> float:
     control loop (no transmit_complete → orchestrator stalls). RX (the capture-rate-robust
     StreamDecoder) is unaffected by the snap. TX and RX share one rate (one XTRX)."""
     requested = float(args.sample_rate or 0) or float(_DEFAULT_SAMPLE_RATE)
-    sym = symbol_rate_hz_of(params, default=endurosat_link.DEFAULT_SYMBOL_RATE_HZ)
+    sym = _decoder_kwargs(params)["symbol_rate_hz"]
     sps = max(1, round(requested / sym))
     return float(sps) * sym  # exact integer samples/symbol
 
@@ -225,7 +307,8 @@ def validate_uplink(
                 )
             break
 
-    kw = _decoder_kwargs(params)
+    framing_name = _tx_framing(params)
+    kw = _decoder_kwargs(params, framing_name)
     sym = float(kw["symbol_rate_hz"])
     mod_index = float(kw["mod_index"])
     bt = float(kw["bt"])
@@ -266,7 +349,8 @@ def validate_uplink(
     # sample rate — duration = payload_bits / baud — and it is the real cap on air time and on the
     # post-key hardware-rate upsample. A burst that passes the sps/sample caps can still be minutes
     # of RF at a low baud; this refuses it while the station is still cold.
-    duration_s = (len(payload) * 8) / sym
+    bit_count = _tx_bit_count(payload, params)
+    duration_s = bit_count / sym
     if duration_s > _MAX_BURST_SECONDS:
         raise UplinkRejected(
             "burst-too-long",
@@ -276,7 +360,7 @@ def validate_uplink(
         )
 
     # The modulator emits one symbol per BIT (2-GFSK), each repeated sps times.
-    samples = len(payload) * 8 * sps
+    samples = bit_count * sps
     if samples > _MAX_IQ_SAMPLES:
         raise UplinkRejected(
             "iq-too-large",
@@ -300,24 +384,25 @@ def validate_uplink(
 
 
 def build_uplink_iq(payload: bytes, sample_rate: float, params: dict[str, object]) -> np.ndarray:
-    """The uplink file → 2-GFSK IQ, modulated VERBATIM (raw, MSB-first).
+    """Build 2-GFSK IQ for the primary selected framing.
 
-    The uplink file is ALREADY a complete EnduroSat packet train — ``[AA×5][7E]…[CRC]`` per packet,
-    several concatenated, zero-byte-padded between them (the framing is implicit in the file). So we
-    do NOT wrap it (no extra preamble/sync/len/CRC) and do NOT truncate — the bytes go on the air
-    exactly as received. ``params["uplink_zero_gap_bytes"]`` (default 0 = off) optionally turns runs
-    of that many ``0x00`` pad bytes into zero-amplitude silence gaps between packets (helps the
-    receiver re-lock per packet) instead of full-power FSK ``0`` symbols."""
+    EnduroSat input is already a complete packet train and is modulated verbatim. AX.25 input is
+    the UI information field and is wrapped with addresses, FCS, HDLC flags, bit stuffing, NRZI and
+    G3RUH scrambling before modulation. ``uplink_zero_gap_bytes`` applies only to EnduroSat.
+    """
     if len(payload) > _UPLINK_MAX_BYTES:
         msg = f"uplink payload {len(payload)} B exceeds the {_UPLINK_MAX_BYTES} B sanity cap"
         raise ValueError(msg)
-    kw = _decoder_kwargs(params)
+    framing_name = _tx_framing(params)
+    kw = _decoder_kwargs(params, framing_name)
     gp = gfsk.GfskParams(
         sample_rate_hz=sample_rate,
         symbol_rate_hz=kw["symbol_rate_hz"],
         mod_index=kw["mod_index"],
         bt=kw["bt"],
     )
+    if framing_name == "ax25":
+        return gfsk.modulate(_ax25_bits(payload, params), gp)
     gap = int(params.get("uplink_zero_gap_bytes", 0) or 0)
     return gfsk.modulate_bytes_zero_gaps(payload, gp, bitorder="big", min_gap_bytes=max(0, gap))
 
@@ -371,9 +456,8 @@ def apply_nco(iq: np.ndarray, freq_hz: float, sample_rate: float) -> np.ndarray:
 
 
 def demod_capture(iq: np.ndarray, sample_rate: float, params: dict[str, object]) -> list[bytes]:
-    """Decode every EnduroSat frame in a complete IQ array (push-all + flush). Used by the tests and
-    available for offline analysis; the live RX path streams the same StreamDecoder chunkwise."""
-    decoder = endurosat_link.StreamDecoder(sample_rate, **_decoder_kwargs(params))
+    """Decode the primary selected framing from a complete IQ array."""
+    decoder = _build_rx_decoder(_tx_framing(params), sample_rate, params)
     decoder.push(np.asarray(iq, dtype=np.complex64))
     frames = list(decoder.decode_new())
     frames.extend(decoder.flush())
@@ -486,9 +570,8 @@ class FileBidirIo:
 # ----------------------------------------------------------------------
 
 
-async def emit_frame(sockets, body: bytes) -> None:
-    """One ``frame_received`` status event + the raw frame bytes on the data socket. For endurosat
-    the body is the opaque (encrypted AirMAC) payload — no AX.25 parse here.
+async def emit_frame(sockets, body: bytes, *, framing_name: str = "endurosat") -> None:
+    """One ``frame_received`` status event + the raw frame bytes on the data socket.
 
     Both writes suppress a dead-peer error: a broken status/data socket must never propagate up and
     kill the RX loop (or, worse, leave the reader parked on a full queue → teardown deadlock)."""
@@ -497,7 +580,7 @@ async def emit_frame(sockets, body: bytes) -> None:
         # deframer is CRC-16 gated) so the orchestrator counts the frame valid.
         await send_event(
             sockets.status_writer,
-            frame_received_event(body, crc_ok=True, framing="endurosat"),
+            frame_received_event(body, crc_ok=True, framing=framing_name),
         )
     with contextlib.suppress(ConnectionResetError, BrokenPipeError):
         sockets.data_writer.write(body)
@@ -832,11 +915,12 @@ async def run_rx(
     # withholds `ready` until this fires, bounded.
     first_sample: asyncio.Event | None = None,
 ) -> None:
-    """Continuous downlink demod: reader thread → queue → StreamDecoder, a decode loop draining
-    frames, and periodic RSSI. Mirrors the RX app's dsp engine but endurosat-only. RX pauses while a
-    TX burst is in flight (shared antenna/device)."""
+    """Continuous downlink demod with every requested framing sharing one IQ stream."""
     sample_rate = resolve_sample_rate(args, params)
-    decoder = endurosat_link.StreamDecoder(sample_rate, **_decoder_kwargs(params))
+    decoders = [
+        (framing_name, _build_rx_decoder(framing_name, sample_rate, params))
+        for framing_name in _selected_framings(params)
+    ]
     recorder = StreamRecorder.maybe_start(args, sample_rate_hz=sample_rate)
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[np.ndarray | None] = asyncio.Queue(maxsize=64)
@@ -891,15 +975,20 @@ async def run_rx(
                 await asyncio.wait_for(rx_teardown.wait(), _DECODE_PERIOD_S)
             if rx_teardown.is_set():
                 break
-            try:
-                bodies = await asyncio.to_thread(decoder.decode_new)
-            except Exception:  # noqa: BLE001 — a decoder bug must not end live decode (docs/J HIGH-1)
-                errors += 1
-                if errors <= 3 or errors % 50 == 0:
-                    _log.exception("bidir RX: decode_new failed (#%d); continuing", errors)
-                continue
-            for body in bodies:
-                await emit_frame(sockets, body)
+            for framing_name, decoder in decoders:
+                try:
+                    bodies = await asyncio.to_thread(decoder.decode_new)
+                except Exception:  # noqa: BLE001 — one decoder must not end live decode
+                    errors += 1
+                    if errors <= 3 or errors % 50 == 0:
+                        _log.exception(
+                            "bidir RX: %s decode_new failed (#%d); continuing",
+                            framing_name,
+                            errors,
+                        )
+                    continue
+                for body in bodies:
+                    await emit_frame(sockets, body, framing_name=framing_name)
 
     decode_task = asyncio.create_task(_decode_loop(), name="bidir-decode")
     try:
@@ -923,7 +1012,8 @@ async def run_rx(
             if now - last_signal >= _SIGNAL_PERIOD_S:
                 last_signal = now
                 await emit_signal(sockets, _rssi_dbm(chunk))
-            decoder.push(chunk)
+            for _framing_name, decoder in decoders:
+                decoder.push(chunk)
     finally:
         # CA-FLOW-001: tear down the INTERNAL machinery only. Setting the shared
         # stop_requested here made a normal engine end indistinguishable from a
@@ -938,13 +1028,17 @@ async def run_rx(
             with contextlib.suppress(Exception):
                 _request_stop()
         await asyncio.gather(reader_task, decode_task, return_exceptions=True)
-        try:
-            leftovers = await asyncio.to_thread(decoder.flush)
-        except Exception:  # noqa: BLE001 — never die invisibly at teardown (docs/J HIGH-1)
-            _log.exception("bidir RX: final flush failed; last-window frames not emitted")
-            leftovers = []
-        for body in leftovers:
-            await emit_frame(sockets, body)
+        for framing_name, decoder in decoders:
+            try:
+                leftovers = await asyncio.to_thread(decoder.flush)
+            except Exception:  # noqa: BLE001 — never die invisibly at teardown
+                _log.exception(
+                    "bidir RX: %s final flush failed; last-window frames not emitted",
+                    framing_name,
+                )
+                leftovers = []
+            for body in leftovers:
+                await emit_frame(sockets, body, framing_name=framing_name)
     # The reader's death must NOT look like a clean EOF. It used to: the except logged and
     # the finally pushed the SAME `None` terminator an exhausted stream uses, so run_rx
     # returned normally after the SDR failed and the pass completed with zero frames — a
@@ -1331,6 +1425,7 @@ class _SoapyBidirIo:  # pragma: no cover (needs hardware/SoapySDR)
 
 async def amain(args) -> int:
     params = load_params(args)
+    selected_framings = _selected_framings(params)
     sample_rate = resolve_sample_rate(args, params)  # integer samples/symbol (shared by RX + TX)
     io = _open_bidir_io(args, params)
     sockets = await connect_spawn_sockets(args)
@@ -1403,7 +1498,8 @@ async def amain(args) -> int:
             "sample_rate": int(sample_rate),
             "symbol_rate": int(_decoder_kwargs(params)["symbol_rate_hz"]),
             "engine": "dsp",
-            "framing": "endurosat",
+            "framing": selected_framings[0],
+            "framings": list(selected_framings),
             "direction": "bidirectional",
             "flowgraph_version": VERSION,
             # ROUND 10: `ready` means the DOWNLINK is live. It does NOT mean any uplink is flyable —
@@ -1545,7 +1641,7 @@ async def amain(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_argparser(
         prog="cubesat_gfsk_endurosat_bidir",
-        description="Bidirectional EnduroSat 2-GFSK (9k6): downlink demod + uplink burst.",
+        description="Bidirectional AX.25/EnduroSat 2-GFSK: downlink demod + uplink burst.",
     )
     args = parser.parse_args(argv)
     if args.version:

@@ -17,6 +17,7 @@ import cubesat_gfsk_endurosat_bidir as bidir
 import numpy as np
 import pytest
 
+from gfsk_ax25 import ax25, endurosat
 from gfsk_ax25 import endurosat_link as el
 
 _SR = 96_000.0  # multiple of 9600 → 10 samples/symbol
@@ -63,6 +64,40 @@ def test_build_uplink_iq_raw_verbatim_decodes():
     inner = b"AIRMAC-uplink-command-blob"
     iq = _guard(bidir.build_uplink_iq(el.frame_bytes(inner), _SR, {}))
     assert inner in el.receive(iq, _SR)
+
+
+def test_build_uplink_iq_ax25_frames_payload_and_decodes():
+    params = {
+        "framing": "AX.25 G3RUH",
+        "symbol_rate_hz": 9600,
+        "dest": "CQ",
+        "src": "DSN",
+    }
+    payload = b"ax25-uplink-command"
+    iq = _guard(bidir.build_uplink_iq(payload, _SR, params))
+    profile = bidir._ax25_profile(params)
+    bodies = endurosat.receive(iq, _SR, profile=profile)
+    decoded = [ax25.decode_ui(body) for body in bodies]
+    assert any(frame is not None and frame.info == payload for frame in decoded)
+
+
+def test_selected_framings_are_additive_and_primary_controls_tx():
+    params = {"framing": "AX.25", "framings": ["AX.25", "EnduroSat"]}
+    assert bidir._selected_framings(params) == ("ax25", "endurosat")
+    assert bidir._tx_framing(params) == "ax25"
+    assert bidir._selected_framings({}) == ("endurosat",)
+
+
+def test_unknown_explicit_framing_fails_closed():
+    with pytest.raises(bidir.UnknownFraming):
+        bidir.build_uplink_iq(b"command", _SR, {"framing": "USP"})
+
+
+def test_ax25_payload_over_ui_limit_is_rejected_before_modulation():
+    params = {"framing": "AX.25", "symbol_rate_hz": 9600}
+    with pytest.raises(bidir.UplinkRejected) as exc:
+        bidir.validate_uplink(b"x" * (endurosat.AX25_INFO_MAX_BYTES + 1), _SR, params)
+    assert exc.value.code == "payload-too-large"
 
 
 def test_build_uplink_iq_no_wrap_no_truncate():
@@ -181,7 +216,7 @@ def test_resolve_sample_rate_snaps_to_integer_sps():
     assert r % el.DEFAULT_SYMBOL_RATE_HZ == 0
     assert abs(r - 2_000_000) < el.DEFAULT_SYMBOL_RATE_HZ  # nearest multiple
     assert bidir.resolve_sample_rate(argparse.Namespace(sample_rate=96_000), {}) == 96_000
-    assert bidir.resolve_sample_rate(argparse.Namespace(sample_rate=0), {}) == 96_000  # unset
+    assert bidir.resolve_sample_rate(argparse.Namespace(sample_rate=0), {}) == 124_800  # unset
     assert bidir.resolve_sample_rate(a2m, {"baud": 4800}) % 4800 == 0  # custom symbol rate
     # the resolved rate is actually modulatable (the whole point) — must not raise:
     assert len(bidir.build_uplink_iq(b"cmd", r, {})) > 0
@@ -325,6 +360,75 @@ def test_run_rx_emits_frame_from_downlink_file(tmp_path):
     assert any(base64.b64decode(f["frame"]["bytes_b64"]) == payload for f in frames)
     assert payload in bytes(socks.data_writer.buf)  # raw frame on the data socket
     assert any(e["event"] == "signal" for e in evs)  # at least one RSSI hint
+
+
+def test_run_rx_emits_ax25_frame_from_downlink_file(tmp_path):
+    cap = tmp_path / "ax25-downlink.cf32"
+    payload = b"ax25-downlink-telemetry"
+    params = {"framing": "AX.25 G3RUH", "symbol_rate_hz": 9600}
+    body = ax25.encode_ui(dest="CQ", src="SAT", info=payload)
+    iq = _guard(endurosat.transmit(body, _SR, profile=bidir._ax25_profile(params)))
+    cap.write_bytes(iq.astype(np.complex64).tobytes())
+    io = bidir.FileBidirIo(str(cap), None)
+    socks = _FakeSockets()
+    tx = bidir._TxController(io, sample_rate=_SR)
+    asyncio.run(
+        bidir.run_rx(
+            _rx_args(tmp_path),
+            socks,
+            params,
+            io,
+            stop_requested=asyncio.Event(),
+            doppler={"hz": 0.0},
+            tx=tx,
+        )
+    )
+    frames = [event for event in _events(socks) if event["event"] == "frame_received"]
+    assert any(event["framing"] == "ax25" for event in frames)
+    decoded = [ax25.decode_ui(base64.b64decode(event["frame"]["bytes_b64"])) for event in frames]
+    assert any(frame is not None and frame.info == payload for frame in decoded)
+
+
+def test_run_rx_additively_emits_ax25_and_endurosat(tmp_path):
+    cap = tmp_path / "additive-downlink.cf32"
+    params = {
+        "framing": "AX.25",
+        "framings": ["AX.25", "EnduroSat"],
+        "symbol_rate_hz": 9600,
+    }
+    ax_payload = b"ax25-additive"
+    enduro_payload = b"enduro-additive"
+    ax_body = ax25.encode_ui(dest="CQ", src="SAT", info=ax_payload)
+    ax_iq = endurosat.transmit(ax_body, _SR, profile=bidir._ax25_profile(params))
+    enduro_iq = el.transmit(enduro_payload, _SR, symbol_rate_hz=9600)
+    capture = np.concatenate([_guard(ax_iq), np.zeros(4000, np.complex64), _guard(enduro_iq)])
+    cap.write_bytes(capture.astype(np.complex64).tobytes())
+    io = bidir.FileBidirIo(str(cap), None)
+    socks = _FakeSockets()
+    tx = bidir._TxController(io, sample_rate=_SR)
+    asyncio.run(
+        bidir.run_rx(
+            _rx_args(tmp_path),
+            socks,
+            params,
+            io,
+            stop_requested=asyncio.Event(),
+            doppler={"hz": 0.0},
+            tx=tx,
+        )
+    )
+    frames = [event for event in _events(socks) if event["event"] == "frame_received"]
+    assert any(
+        event["framing"] == "endurosat"
+        and base64.b64decode(event["frame"]["bytes_b64"]) == enduro_payload
+        for event in frames
+    )
+    ax_frames = [
+        ax25.decode_ui(base64.b64decode(event["frame"]["bytes_b64"]))
+        for event in frames
+        if event["framing"] == "ax25"
+    ]
+    assert any(frame is not None and frame.info == ax_payload for frame in ax_frames)
 
 
 def test_run_rx_survives_dead_status_socket(tmp_path):
