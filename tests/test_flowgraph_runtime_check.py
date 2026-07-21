@@ -10,6 +10,8 @@ import pytest
 def _module(name: str) -> ModuleType:
     module = ModuleType(name)
     module.__file__ = f"/opt/gs-flowgraphs/bin/{name.replace('.', '/')}.py"
+    if name == "satellites.components.demodulators":
+        module.fsk_demodulator = lambda *args, **kwargs: object()  # type: ignore[attr-defined]
     if name == "_fallback_select":
         module.LIVE_DECODE_DRAIN_PERIOD_S = 0.05  # type: ignore[attr-defined]
         module.should_build_demod = (  # type: ignore[attr-defined]
@@ -96,6 +98,34 @@ def test_runtime_check_constructs_priority_deframers() -> None:
         "safety:decode-drain-period": True,
         "safety:soft-only-no-hard-queue": True,
     }
+    assert next(
+        check for check in result["checks"] if check["check"] == "demodulator:GMSK@2400"
+    )["ok"] is True
+
+
+def test_runtime_check_fails_when_pinned_fsk_component_cannot_construct() -> None:
+    def importer(name: str) -> ModuleType:
+        module = _module(name)
+        if name == "satellites.components.demodulators":
+            def fail(*args, **kwargs):
+                raise TypeError("unexpected constructor drift")
+
+            module.fsk_demodulator = fail  # type: ignore[attr-defined]
+        if name == "gnuradio_satellites":
+            module.make_grsat_deframers = lambda _label: [object()]  # type: ignore[attr-defined]
+        return module
+
+    result = runtime_check.check_runtime(
+        importer=importer,
+        required_modules=("scipy",),
+        deframer_labels=("USP",),
+    )
+
+    assert result["ok"] is False
+    failed = next(
+        check for check in result["checks"] if check["check"] == "demodulator:GMSK@2400"
+    )
+    assert failed["error"] == "TypeError: unexpected constructor drift"
 
 
 def test_supported_framings_add_grsatellites_only_for_exact_live_gate(

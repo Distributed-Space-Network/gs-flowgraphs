@@ -36,6 +36,7 @@ import argparse
 import json
 import logging
 import sys
+import threading
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,7 @@ from native_framing import (
     AfskConfig,
     BpskConfig,
     FrameResult,
+    IntegrityStatus,
     SampleClock,
     SymbolInput,
     build_decoder,
@@ -62,6 +64,7 @@ from gfsk_ax25 import gfsk
 log = logging.getLogger("iq_decode")
 _DEFAULT_SYMBOL_RATE_HZ = 9600.0
 _DEFAULT_WINDOW_S = 1.0  # short enough that any residual offset is ~constant across the window
+_GNU_RADIO_DRAIN_PERIOD_S = 0.02
 
 
 def _optional_bool(
@@ -416,6 +419,246 @@ def decode_capture(
     return records
 
 
+def _record_gnuradio_native(
+    result: FrameResult,
+    *,
+    decoder: str,
+    sample_rate_hz: float,
+    symbol_rate_hz: float,
+    capture_start_unix_s: float,
+) -> dict:
+    """Convert one streaming decoder result into the ordinary post-pass record schema."""
+
+    offsets_available = bool(result.metadata.get("source_offsets_available", True))
+    record: dict[str, object] = {
+        "framing": result.canonical_framing,
+        "len": len(result.payload),
+        "crc_ok": result.integrity is IntegrityStatus.PASSED,
+        "payload_hex": result.payload.hex(),
+        "post_pass": True,
+        "decoder": decoder,
+        "integrity": result.integrity.value,
+        "polarity": result.polarity.value,
+        "sync_distance": result.sync_distance,
+        "corrected_symbols": result.corrected_symbols,
+        "metadata": dict(result.metadata),
+    }
+    if offsets_available:
+        start = int(round(result.source_start * sample_rate_hz / symbol_rate_hz))
+        end = int(round(result.source_end * sample_rate_hz / symbol_rate_hz))
+        record.update(
+            {
+                "source_start": result.source_start,
+                "source_end": result.source_end,
+                "source_sample_offset": start,
+                "source_sample_end_offset": end,
+                "source_offset_kind": "demodulated_symbol_estimate",
+            }
+        )
+        if capture_start_unix_s > 0:
+            pass_start = datetime.fromtimestamp(capture_start_unix_s, tz=timezone.utc)
+            frame_time = utc_from_sample_offset(pass_start, start, sample_rate_hz)
+            record["ts"] = round(frame_time.timestamp(), 3)
+            record["timestamp"] = frame_time.isoformat().replace("+00:00", "Z")
+    else:
+        record["source_offset_kind"] = "unavailable"
+    return record
+
+
+def _record_gnuradio_upstream(frame) -> dict:
+    """Convert one gr-satellites component PDU into the post-pass record schema."""
+
+    return {
+        "framing": frame.framing or "gr-satellites",
+        "len": len(frame.payload),
+        # Component deframers emit only protocol-valid frames. They do not expose source offsets.
+        "crc_ok": True,
+        "payload_hex": frame.payload.hex(),
+        "post_pass": True,
+        "decoder": "gr-satellites",
+        "integrity": "passed",
+        "source_offset_kind": "unavailable",
+    }
+
+
+def decode_capture_gnuradio(
+    cf32: str | Path,
+    *,
+    sample_rate_hz: float,
+    symbol_rate_hz: float,
+    framings_to_try: tuple[str, ...],
+    framing_parameters: Mapping[str, object] | None = None,
+    modulation: str | None = None,
+    capture_start_unix_s: float = 0.0,
+    native_evaluation: bool = False,
+    use_grsatellites: bool = True,
+    replay_speed: float = 8.0,
+    append_frames: bool = False,
+) -> list[dict]:
+    """Replay recorded channel IQ through the exact live GNU Radio modem.
+
+    This is deliberately a second engine, not another numpy approximation. It instantiates the
+    same :func:`gnuradio_satellites._build_fallbacks` path used by ``satellite_rx.py``; that path
+    uses gr-satellites' own FSK demodulator. Native streaming deframers and, by default,
+    gr-satellites component deframers consume the one recovered symbol stream in parallel.
+
+    Station GNU Radio recordings are already downstream of the live LO/Doppler rotator. Therefore
+    this engine consumes the stored channel IQ verbatim and must not apply a Doppler track again.
+    A throttle bounds scheduler handoff queues while allowing faster-than-real-time replay.
+    """
+
+    path = Path(cf32)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if sample_rate_hz <= 0 or symbol_rate_hz <= 0:
+        raise ValueError("sample and symbol rates must be positive")
+    if not 0.1 <= replay_speed <= 32.0:
+        raise ValueError("replay_speed must be between 0.1 and 32")
+    labels = tuple(label.strip() for label in framings_to_try if label.strip())
+    if not labels:
+        return []
+
+    meta = path.with_name(path.name + ".json")
+    if meta.exists():
+        try:
+            sample_rate_hz = float(
+                json.loads(meta.read_text(encoding="utf-8")).get(
+                    "sample_rate_hz", sample_rate_hz
+                )
+            )
+        except (OSError, ValueError, TypeError):
+            log.warning("iq_decode: ignoring unreadable sidecar %s", meta.name)
+
+    parameters = dict(framing_parameters or {})
+    modulation_value = modulation if modulation is not None else parameters.get(
+        "modulation", "gfsk"
+    )
+    if not isinstance(modulation_value, str) or not modulation_value.strip():
+        raise ValueError("modulation must be a non-empty string")
+
+    # Imports stay inside the explicit engine so normal source-tree tests and numpy replay remain
+    # safe on machines without GNU Radio, PMT, or gr-satellites.
+    from gnuradio import blocks, gr  # noqa: PLC0415
+    from gnuradio_satellites import (  # noqa: PLC0415
+        _build_fallbacks,
+        _FrameSink,
+        make_grsat_deframers,
+    )
+
+    tb = gr.top_block("gs_iq_live_chain_replay")
+    source = blocks.file_source(gr.sizeof_gr_complex, str(path), False)
+    throttle = blocks.throttle(
+        gr.sizeof_gr_complex, float(sample_rate_hz) * replay_speed, True
+    )
+    tb.connect(source, throttle)
+    demod_source = throttle
+    if parameters.get("invert") is True:
+        conjugate = blocks.conjugate_cc()
+        tb.connect(demod_source, conjugate)
+        demod_source = conjugate
+
+    fallbacks, soft = _build_fallbacks(
+        tb,
+        demod_source,
+        float(sample_rate_hz),
+        modes=[(modulation_value, float(symbol_rate_hz))],
+        framing=labels[0],
+        framings_list=labels,
+        differential=parameters.get("differential"),
+        channel_bw_hz=parameters.get("bandwidth_hz"),
+        framing_parameters=parameters,
+        native_enabled=native_evaluation,
+    )
+    upstream_sink = _FrameSink()
+    upstream_deframers = make_grsat_deframers(labels) if use_grsatellites and soft else []
+    upstream_sinks = []
+    for label, decoder in upstream_deframers:
+        tagged_sink = _FrameSink(label, upstream_sink._q)
+        upstream_sinks.append(tagged_sink)  # retain Python ownership for the graph lifetime
+        tb.connect(soft, blocks.copy(gr.sizeof_float), decoder)
+        tb.msg_connect(decoder, "out", tagged_sink, "in")
+    if not fallbacks and not upstream_deframers:
+        raise RuntimeError(
+            "the exact live chain built no deframer; enable --native-evaluation and/or "
+            "leave --grsatellites enabled for the requested framing"
+        )
+
+    records: list[dict] = []
+
+    def drain_once() -> None:
+        # Deduplicate only within one drain. Repeated identical beacons in later drains remain
+        # distinct, while a native/upstream parity hit from the same burst becomes one record.
+        batch: dict[tuple[str, str], dict] = {}
+        for fallback in fallbacks:
+            for result in fallback.drain_frames():
+                record = _record_gnuradio_native(
+                    result,
+                    decoder=f"native:{fallback.name}",
+                    sample_rate_hz=sample_rate_hz,
+                    symbol_rate_hz=symbol_rate_hz,
+                    capture_start_unix_s=capture_start_unix_s,
+                )
+                key = (str(record["framing"]).lower(), str(record["payload_hex"]))
+                batch[key] = record
+        for frame in upstream_sink.drain():
+            record = _record_gnuradio_upstream(frame)
+            key = (str(record["framing"]).lower(), str(record["payload_hex"]))
+            prior = batch.get(key)
+            if prior is None:
+                batch[key] = record
+            else:
+                prior["decoder"] = f"{prior['decoder']}+gr-satellites"
+        records.extend(batch.values())
+
+    completed = threading.Event()
+    failure: list[BaseException] = []
+
+    def run_graph() -> None:
+        try:
+            tb.run()
+        except BaseException as exc:  # noqa: BLE001 - propagate scheduler failure to caller
+            failure.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=run_graph, name="iq-live-chain-replay", daemon=True)
+    worker.start()
+    try:
+        while not completed.wait(_GNU_RADIO_DRAIN_PERIOD_S):
+            drain_once()
+        worker.join()
+        drain_once()
+        for fallback in fallbacks:
+            for result in fallback.flush_frames():
+                records.append(
+                    _record_gnuradio_native(
+                        result,
+                        decoder=f"native:{fallback.name}",
+                        sample_rate_hz=sample_rate_hz,
+                        symbol_rate_hz=symbol_rate_hz,
+                        capture_start_unix_s=capture_start_unix_s,
+                    )
+                )
+    except BaseException:
+        tb.stop()
+        worker.join(timeout=5.0)
+        raise
+    if failure:
+        raise RuntimeError("GNU Radio replay failed") from failure[0]
+    if records and append_frames:
+        _append_frames(path, records)
+    log.info(
+        "iq_decode: %d frame(s) through exact live GNU Radio chain from %s "
+        "(framings=%s, native=%s, gr-satellites=%s)",
+        len(records),
+        path.name,
+        ",".join(labels),
+        native_evaluation,
+        bool(upstream_deframers),
+    )
+    return records
+
+
 def _append_frames(cf32: Path, records: list[dict]) -> None:
     """Append post-pass frames to the pass's ``frames.jsonl`` (the decoded-frames product), each
     tagged ``post_pass=True``. Runs after the flowgraph exited, so there is no race with the live
@@ -519,27 +762,85 @@ def main(argv: list[str] | None = None) -> int:
             "post-pass production gate is open"
         ),
     )
+    p.add_argument(
+        "--engine",
+        choices=("numpy", "gnuradio-live"),
+        default="numpy",
+        help=(
+            "numpy for the bounded portable replay; gnuradio-live for the exact station modem "
+            "using gr-satellites' FSK demodulator"
+        ),
+    )
+    p.add_argument(
+        "--grsatellites",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with gnuradio-live, also run gr-satellites component deframers (default: enabled)",
+    )
+    p.add_argument(
+        "--replay-speed",
+        type=float,
+        default=8.0,
+        help="gnuradio-live throttle multiplier, 0.1..32 (default: 8)",
+    )
+    p.add_argument(
+        "--append-frames",
+        action="store_true",
+        help=(
+            "persist gnuradio-live replay hits to the pass frames.jsonl; default prints them "
+            "without modifying pass evidence"
+        ),
+    )
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     fmts = tuple(f.strip().lower() for f in args.framings.split(",") if f.strip())
     try:
         framing_parameters = _load_framing_parameters(args.framing_parameters_json)
-        decode_capture(
-            args.input,
-            sample_rate_hz=args.sample_rate,
-            symbol_rate_hz=args.symbol_rate,
-            framings_to_try=fmts,
-            doppler_track=_load_track(args.doppler_track) or None,
-            capture_start_unix_s=args.capture_start_unix_s,
-            window_s=args.window_s,
-            framing_parameters=framing_parameters,
-            modulation=args.modulation,
-            differential=args.differential,
-            manchester=args.manchester,
-            mod_index=args.mod_index,
-            bt=args.bt,
-            native_evaluation=args.native_evaluation,
-        )
+        if args.engine == "gnuradio-live":
+            if args.doppler_track:
+                raise ValueError(
+                    "--doppler-track cannot be combined with --engine gnuradio-live; station "
+                    "GNU Radio recordings are already downstream of the live Doppler rotator"
+                )
+            parameters = dict(framing_parameters)
+            if args.differential is not None:
+                parameters["differential"] = args.differential
+            if args.mod_index is not None:
+                parameters["mod_index"] = args.mod_index
+            if args.bt is not None:
+                parameters["bt"] = args.bt
+            records = decode_capture_gnuradio(
+                args.input,
+                sample_rate_hz=args.sample_rate,
+                symbol_rate_hz=args.symbol_rate,
+                framings_to_try=fmts,
+                framing_parameters=parameters,
+                modulation=args.modulation,
+                capture_start_unix_s=args.capture_start_unix_s,
+                native_evaluation=args.native_evaluation,
+                use_grsatellites=args.grsatellites,
+                replay_speed=args.replay_speed,
+                append_frames=args.append_frames,
+            )
+            for record in records:
+                print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+        else:
+            decode_capture(
+                args.input,
+                sample_rate_hz=args.sample_rate,
+                symbol_rate_hz=args.symbol_rate,
+                framings_to_try=fmts,
+                doppler_track=_load_track(args.doppler_track) or None,
+                capture_start_unix_s=args.capture_start_unix_s,
+                window_s=args.window_s,
+                framing_parameters=framing_parameters,
+                modulation=args.modulation,
+                differential=args.differential,
+                manchester=args.manchester,
+                mod_index=args.mod_index,
+                bt=args.bt,
+                native_evaluation=args.native_evaluation,
+            )
     except Exception:
         log.exception("iq_decode: failed on %s", args.input)
         return 1

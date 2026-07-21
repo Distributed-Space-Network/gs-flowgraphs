@@ -61,3 +61,45 @@ def test_live_scheduler_handoffs_are_bounded_counted_and_fail_closed() -> None:
     assert "_FRAME_QUEUE_CAPACITY_BYTES" in satellites
     assert 'require_lossless(stats, label="gr-satellites frame"' in satellites
     assert "def queue_stats(self) -> QueueStats" in satellites
+
+
+def test_live_fsk_uses_pinned_deviation_aware_gardner_chain() -> None:
+    source = (_APPS / "gnuradio_gfsk.py").read_text(encoding="utf-8")
+    function = source[
+        source.index("def connect_gfsk_demod(") : source.index("def connect_psk_demod(")
+    ]
+
+    assert "deviation = float(profile.mod_index) * baud / 2.0" in function
+    assert "from satellites.components.demodulators import" in function
+    assert "fsk_demodulator," in function
+    assert "soft = fsk_demodulator(" in function
+    assert "iq=True" in function
+    assert "deviation=deviation" in function
+    assert "dc_block=dc_block" in function
+    assert "clock_recovery_mm_ff" not in function
+    assert "fll_band_edge_cc" not in function
+    assert "analog.quadrature_demod_cf" not in function
+
+
+def test_runtime_log_distinguishes_active_graph_from_capability_plan() -> None:
+    source = (_APPS / "gnuradio_satellites.py").read_text(encoding="utf-8")
+
+    assert '"active decode graph: local=%s grsat_components=%d grsat_monolithic=%s"' in source
+    assert '"capability-only decode plan (not the active graph): %s"' in source
+    assert '_log.info("decode plan: %s"' not in source
+
+
+def test_installed_iq_replay_reuses_exact_live_demod_and_both_deframers() -> None:
+    source = (_APPS / "iq_decode.py").read_text(encoding="utf-8")
+    function = source[
+        source.index("def decode_capture_gnuradio(") : source.index("def _append_frames(")
+    ]
+
+    assert "from gnuradio_satellites import" in function
+    assert "_build_fallbacks," in function
+    assert "make_grsat_deframers," in function
+    assert "fallbacks, soft = _build_fallbacks(" in function
+    assert "upstream_deframers = make_grsat_deframers(labels)" in function
+    assert "blocks.throttle(" in function
+    assert "while not completed.wait(_GNU_RADIO_DRAIN_PERIOD_S):" in function
+    assert "fallback.flush_frames()" in function

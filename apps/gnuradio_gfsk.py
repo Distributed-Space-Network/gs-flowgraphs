@@ -183,64 +183,52 @@ def connect_gfsk_demod(
     the hard-bit sink (``drain()`` → bits, fed to our numpy deframers) and the FLOAT soft-symbol
     tap (post clock-recovery, PRE-slicer) that gr-satellites deframer components consume.
 
-    Stock-GNU-Radio port of SatNOGS' proven ``satnogs_fsk.py`` (GPL-3.0) demod tail — NEVER the
-    AGPL gr-satnogs hier-blocks, and never the monolithic ``gr_satellites_flowgraph`` (which fed
-    raw IQ, did demod+deframe+resample internally, and buffer-deadlocked while starving the
-    recorder — docs/12). Chain:
+    Uses the pinned gr-satellites ``fsk_demodulator`` component (GPL-3.0) directly — never the
+    monolithic ``gr_satellites_flowgraph`` (which fed raw IQ, did demod+deframe+resample internally,
+    and buffer-deadlocked while starving the recorder — docs/12). Its chain is:
 
-        [SDR→channel decimator] → FLL band-edge → LPF(0.625·baud, decimate to ~2 sps)
-        → quad demod(1.2) → [dc_blocker_ff(1024)] → M&M clock recovery(2 sps) ──soft──►
-        → binary slicer → _BitSink.
+        [SDR→channel decimator] → Carson-width IQ LPF → deviation-normalized quad demod
+        → one-symbol square-pulse filter/decimator → [32-symbol DC blocker]
+        → Gardner symbol sync ──soft──► binary slicer → _BitSink.
 
     Doppler is applied UPSTREAM at the source (the LO-offset rotator, gs-orbitd), NOT here. The
     bit sink is a terminal queue and the deframers on the soft tap emit messages, so nothing here
     can backpressure the recorder that taps the same channel stream. ``channel_bw_hz`` is accepted
-    for call-compat but IGNORED — SatNOGS sizes the pre-discriminator LPF from the baud, never a
-    provisioned width. ``dc_block`` gates the (SatNOGS-default-on) discriminator dc_blocker_ff.
+    for call compatibility but does not override the modem's deviation-derived Carson width.
+    ``dc_block`` gates the pinned 32-symbol discriminator DC blocker.
     When ``collect_hard`` is false, the slicer terminates in a GNU Radio null sink instead of an
     undrained Python queue; the soft tap remains available to its actual consumer.
     """
-    _ = channel_bw_hz  # accepted for call-compat; SatNOGS sizes the LPF from baud, not bandwidth
+    _ = channel_bw_hz
     baud = float(profile.symbol_rate_hz)
-    sps_in = sample_rate / baud                        # samples/symbol at the channel rate
-    # Decimate the demod stream to ~2 sps in the LPF, exactly like SatNOGS' fir_filter_ccf with
-    # decimation = (baud·decim)//2. FLOOR (not round): flooring the decimation guarantees
-    # out_sps = sps_in/floor(sps_in/2) ≥ 2.0 for every baud, so M&M never runs sub-Nyquist. (For
-    # the common 48 kHz bauds — 40/20/10/5 sps — floor and round agree; they diverge only for odd
-    # sps_in, where round-half-even could pick a decim that drops out_sps below 2.) Clamp ≥1.
-    lpf_decim = max(1, int(sps_in / 2.0))
-    out_sps = sps_in / lpf_decim                        # ≥ 2.0
+    deviation = float(profile.mod_index) * baud / 2.0
+    if not math.isfinite(deviation) or deviation <= 0.0:
+        raise ValueError("FSK deviation must be a finite positive number")
+    if sample_rate / baud <= 1.0:
+        raise ValueError("FSK timing recovery requires more than one sample per symbol")
 
-    # Construct EVERY block first, connect LAST — a constructor raise leaves the graph untouched.
-    blocks_list: list = []
-    if decimate:                                        # SDR capture-rate → channel-rate first
-        blocks_list.append(make_decimator(sdr_rate, float(sample_rate)))
-    # 1) FLL band-edge: coarse carrier-frequency lock (SatNOGS: sps, rolloff 0.5, size 2·sps+1,
-    #    bw = 2π/sps/100). Residual offset after the upstream Doppler/LO rotator is small.
-    fll_size = int(sps_in * 2.0 + 1.0) | 1             # odd
-    blocks_list.append(digital.fll_band_edge_cc(
-        sps_in, 0.5, fll_size, 2.0 * math.pi / sps_in / 100.0))
-    # 2) Pre-discriminator LPF sized from the BAUD (0.625·baud cutoff, baud/8 transition),
-    #    DECIMATING to ~2 sps. firdes default window = Hamming (== SatNOGS' WIN_HAMMING); omit the
-    #    window arg so the taps match without depending on the 3.8-vs-3.10 window-enum module path.
-    blocks_list.append(gr_filter.fir_filter_ccf(
-        lpf_decim, gr_filter.firdes.low_pass(1.0, sample_rate, 0.625 * baud, baud / 8.0)))
-    # 3) Quadrature (frequency) discriminator — SatNOGS' fixed empirical gain 1.2.
-    blocks_list.append(analog.quadrature_demod_cf(1.2))
-    # 4) DC blocker on the discriminator output — removes the residual carrier bias a bare slicer
-    #    mis-slices. SatNOGS uses a fixed 1024-tap long-form blocker; skipped (dc_block=False) for
-    #    short cubesat bursts where its settle would eat the frame start.
-    if dc_block:
-        blocks_list.append(gr_filter.dc_blocker_ff(1024, True))
-    # 5) Mueller & Müller symbol timing recovery at ~2 sps — SatNOGS' EXACT constants
-    #    (satnogs_fsk.py: clock_recovery_mm_ff(2, 2π/100, 0.5, 0.5/8, 0.01)). This float output is
-    #    the SOFT-SYMBOL TAP the gr-satellites deframers consume (fanned out by the caller).
-    soft = digital.clock_recovery_mm_ff(
-        out_sps, 2.0 * math.pi / 100.0, 0.5, 0.5 / 8.0, 0.01)
-    # 6) Slice to hard bits (one 0/1 per byte) for our numpy deframers.
+    # Import the proven modem component, not a local approximation. The containing application
+    # already requires the pinned gr-satellites runtime; native USP and the upstream USP deframer
+    # therefore receive the same recovered symbols as gr-satellites itself.
+    from satellites.components.demodulators import (  # noqa: PLC0415 - station dependency
+        fsk_demodulator,
+    )
+    soft = fsk_demodulator(
+        baud,
+        float(sample_rate),
+        iq=True,
+        deviation=deviation,
+        dc_block=dc_block,
+        options=None,
+    )
+
+    # Slice to hard bits (one 0/1 per byte) only for local hard-input deframers.
     slicer = digital.binary_slicer_fb()
     hard_consumer = _BitSink() if collect_hard else blocks.null_sink(gr.sizeof_char)
-    tb.connect(src, *blocks_list, soft, slicer, hard_consumer)
+    prefix = [make_decimator(sdr_rate, float(sample_rate))] if decimate else []
+    # Construct every block before connecting so an import/API/constructor failure leaves the
+    # graph untouched and the caller can retain recorder-only operation safely.
+    tb.connect(src, *prefix, soft, slicer, hard_consumer)
     return (hard_consumer if collect_hard else None), soft
 
 

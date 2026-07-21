@@ -272,6 +272,27 @@ def check_runtime(
     checks = [_check_import(name, importer) for name in required_modules]
     actions = _annotate_import_checks(checks, contract, system_python=system_python)
     checks.extend(_check_recorder_safety(importer))
+    try:
+        demodulators = importer("satellites.components.demodulators")
+        builder = demodulators.fsk_demodulator
+        builder(
+            2_400.0,
+            48_000.0,
+            True,
+            deviation=600.0,
+            dc_block=True,
+            options=None,
+        )
+    except Exception as exc:
+        checks.append(
+            {
+                "check": "demodulator:GMSK@2400",
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    else:
+        checks.append({"check": "demodulator:GMSK@2400", "ok": True})
     engine: ModuleType | None = None
     try:
         engine = importer("gnuradio_satellites")

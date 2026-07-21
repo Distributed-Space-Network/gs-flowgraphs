@@ -315,6 +315,71 @@ def test_main_threads_directive_parameter_json_into_decode_capture(tmp_path, mon
     assert received["native_evaluation"] is True
 
 
+def test_main_routes_exact_live_gnuradio_replay_without_doppler(tmp_path, monkeypatch) -> None:
+    cap = _write_cf32(tmp_path, np.zeros(1, dtype=np.complex64))
+    received: dict[str, object] = {}
+
+    def _decode(*args, **kwargs):
+        received.update(kwargs)
+        return []
+
+    monkeypatch.setattr(iq_decode, "decode_capture_gnuradio", _decode)
+    monkeypatch.setattr(
+        iq_decode,
+        "decode_capture",
+        lambda *args, **kwargs: pytest.fail("portable numpy engine was selected"),
+    )
+    rc = iq_decode.main([
+        "--input", str(cap),
+        "--sample-rate", "48000",
+        "--symbol-rate", "2400",
+        "--framings", "USP",
+        "--modulation", "gmsk",
+        "--engine", "gnuradio-live",
+        "--native-evaluation",
+        "--replay-speed", "4",
+    ])
+
+    assert rc == 0
+    assert received == {
+        "sample_rate_hz": 48_000.0,
+        "symbol_rate_hz": 2_400.0,
+        "framings_to_try": ("usp",),
+        "framing_parameters": {},
+        "modulation": "gmsk",
+        "capture_start_unix_s": 0.0,
+        "native_evaluation": True,
+        "use_grsatellites": True,
+        "replay_speed": 4.0,
+        "append_frames": False,
+    }
+
+
+def test_main_rejects_doppler_track_with_exact_live_replay(tmp_path, monkeypatch) -> None:
+    cap = _write_cf32(tmp_path, np.zeros(1, dtype=np.complex64))
+    track = tmp_path / "doppler.json"
+    track.write_text("[[0,0]]", encoding="utf-8")
+    called = False
+
+    def _decode(*args, **kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(iq_decode, "decode_capture_gnuradio", _decode)
+    rc = iq_decode.main([
+        "--input", str(cap),
+        "--sample-rate", "48000",
+        "--symbol-rate", "2400",
+        "--framings", "USP",
+        "--engine", "gnuradio-live",
+        "--doppler-track", str(track),
+    ])
+
+    assert rc == 1
+    assert called is False
+
+
 def test_main_rejects_non_object_framing_parameter_json(tmp_path, monkeypatch) -> None:
     cap = _write_cf32(tmp_path, np.zeros(1, dtype=np.complex64))
     called = False

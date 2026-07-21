@@ -879,11 +879,27 @@ def build_satellites_rx(
             "read as a successful decode.",
             satellite,
         )
-    # Compose the registries into a decode plan (docs/08 Phase 4) for observability — which path(s)
-    # the backend rfLink implies. Construction above drives the graph; the plan is the explanation.
+    # Report the graph that was ACTUALLY constructed.  The registry composer describes theoretical
+    # capability and previously logged gr-satellites(synthetic) even when GS_GRSAT_LIVE was off and
+    # only the native USP decoder existed.  Keep that capability view at debug level so operators
+    # cannot mistake it for an active decoder.
+    local_paths = []
+    for fallback in fallbacks:
+        labels = [label for label, _profile, _decoder in fallback._native_decoders]
+        labels.extend(str(label or "auto") for label in fallback._legacy_framings)
+        local_paths.append(f"{fallback.name}[{','.join(labels) or 'symbols-only'}]")
+    _log.info(
+        "active decode graph: local=%s grsat_components=%d grsat_monolithic=%s",
+        ",".join(local_paths) or "none",
+        len(grsat_deframers),
+        "on" if fg is not None else "off",
+    )
     try:
         catalogued = fg is not None or bool(grsat_deframers)
-        _log.info("decode plan: %s", compose.plan_decode(params, catalogued=catalogued).describe())
+        _log.debug(
+            "capability-only decode plan (not the active graph): %s",
+            compose.plan_decode(params, catalogued=catalogued).describe(),
+        )
     except Exception as e:  # noqa: BLE001 — planning must never block decoding
         _log.debug("decode-plan compose failed (non-fatal): %s", e)
     # GNU Radio validates ALL stream ports at start(); a consumer-less tap would abort the whole
