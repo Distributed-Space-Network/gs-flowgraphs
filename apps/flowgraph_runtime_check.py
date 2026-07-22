@@ -215,6 +215,8 @@ def _check_recorder_safety(importer: Callable[[str], ModuleType]) -> list[dict[s
         safety = importer("_fallback_select")
         selector = safety.should_build_demod
         period_s = float(safety.LIVE_DECODE_DRAIN_PERIOD_S)
+        symbol_queue_items = int(safety.LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS)
+        symbol_queue_symbols = int(safety.LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS)
         recorder_only_safe = not selector(
             mode=("gmsk", 2400.0),
             local_deframer_enabled=False,
@@ -230,12 +232,20 @@ def _check_recorder_safety(importer: Callable[[str], ModuleType]) -> list[dict[s
             legacy_hard_enabled=False,
             native_hard_enabled=False,
         )
+        # cmd_176_176 produced about ten symbols per GNU Radio work item.
+        # Scheduler fragmentation must not trip the item bound while the actual
+        # symbol/resource occupancy remains tiny.
+        scheduler_fragmentation_safe = (
+            symbol_queue_items >= 4096
+            and symbol_queue_symbols >= 1 << 20
+        )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         return [
             {"check": "safety:recorder-only-no-demod", "ok": False, "error": error},
             {"check": "safety:decode-drain-period", "ok": False, "error": error},
             {"check": "safety:soft-only-no-hard-queue", "ok": False, "error": error},
+            {"check": "safety:symbol-queue-fragmentation", "ok": False, "error": error},
         ]
     return [
         {
@@ -250,6 +260,12 @@ def _check_recorder_safety(importer: Callable[[str], ModuleType]) -> list[dict[s
         {
             "check": "safety:soft-only-no-hard-queue",
             "ok": bool(soft_only_safe),
+        },
+        {
+            "check": "safety:symbol-queue-fragmentation",
+            "ok": bool(scheduler_fragmentation_safe),
+            "capacity_items": symbol_queue_items,
+            "capacity_symbols": symbol_queue_symbols,
         },
     ]
 

@@ -21,9 +21,20 @@ from native_framing.sample_clock import select_channel_rate
 # comfortable margin for GFSK/PSK timing recovery.
 CHANNEL_OVERSAMPLE = 4.0
 
-# Maximum live scheduler-handoff drain interval. The symbol queues also have an
-# item bound, so this is intentionally much shorter than a frame/report cadence.
+# Maximum live scheduler-handoff drain interval. The symbol queues also have
+# explicit item and symbol bounds, so this is intentionally much shorter than a
+# frame/report cadence.
 LIVE_DECODE_DRAIN_PERIOD_S = 0.05
+
+# GNU Radio decides how many symbols it presents to a sink in each scheduler
+# work item. That chunking is not a resource unit and can legitimately shrink to
+# roughly ten symbols per item on a live graph. Keep a finite item bound for
+# Python-object overhead, but make it large enough that the 1 Mi-symbol resource
+# bound (or a genuinely stalled decoder) is what normally fails closed. The old
+# 256-item limit killed cmd_176_176 after dropping only 343 symbols in 34 tiny
+# chunks, despite the queue being far below its symbol/memory budget.
+LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS = 1 << 16
+LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS = 1 << 20
 MAX_ADDITIVE_FRAMINGS = 32
 
 

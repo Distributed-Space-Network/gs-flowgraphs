@@ -23,6 +23,10 @@ import logging
 import math
 
 import numpy as np
+from _fallback_select import (
+    LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS,
+    LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
+)
 from _recorder import PassRecorder
 from _soapy import (
     DEFAULT_LO_OFFSET_HZ,
@@ -47,10 +51,6 @@ from gfsk_ax25 import endurosat
 
 _log = logging.getLogger("gnuradio_gfsk")
 
-_SYMBOL_QUEUE_CAPACITY_CHUNKS = 256
-_SYMBOL_QUEUE_CAPACITY_SYMBOLS = 1 << 20
-
-
 def _drain_symbol_queue(
     handoff: BoundedQueue[np.ndarray], *, dtype: type[np.generic], label: str
 ) -> np.ndarray:
@@ -66,8 +66,8 @@ class _BitSink(gr.sync_block):
     def __init__(self) -> None:
         gr.sync_block.__init__(self, name="bit_sink", in_sig=[np.uint8], out_sig=None)
         self._q = BoundedQueue[np.ndarray](
-            capacity_items=_SYMBOL_QUEUE_CAPACITY_CHUNKS,
-            capacity_units=_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
+            capacity_items=LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS,
+            capacity_units=LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
         )
 
     def work(self, input_items, output_items):  # type: ignore[no-untyped-def]
@@ -89,8 +89,8 @@ class SoftSymbolSink(gr.sync_block):
     def __init__(self) -> None:
         gr.sync_block.__init__(self, name="soft_symbol_sink", in_sig=[np.float32], out_sig=None)
         self._q = BoundedQueue[np.ndarray](
-            capacity_items=_SYMBOL_QUEUE_CAPACITY_CHUNKS,
-            capacity_units=_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
+            capacity_items=LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS,
+            capacity_units=LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS,
         )
 
     def work(self, input_items, output_items):  # type: ignore[no-untyped-def]

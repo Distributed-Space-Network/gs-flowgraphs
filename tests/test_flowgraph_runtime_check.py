@@ -14,6 +14,8 @@ def _module(name: str) -> ModuleType:
         module.fsk_demodulator = lambda *args, **kwargs: object()  # type: ignore[attr-defined]
     if name == "_fallback_select":
         module.LIVE_DECODE_DRAIN_PERIOD_S = 0.05  # type: ignore[attr-defined]
+        module.LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS = 1 << 16  # type: ignore[attr-defined]
+        module.LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS = 1 << 20  # type: ignore[attr-defined]
         module.should_build_demod = (  # type: ignore[attr-defined]
             lambda *, mode, local_deframer_enabled, grsat_live: mode is not None
             and (local_deframer_enabled or grsat_live)
@@ -105,6 +107,7 @@ def test_runtime_check_constructs_priority_deframers() -> None:
         "safety:recorder-only-no-demod": True,
         "safety:decode-drain-period": True,
         "safety:soft-only-no-hard-queue": True,
+        "safety:symbol-queue-fragmentation": True,
     }
     assert next(
         check for check in result["checks"] if check["check"] == "demodulator:GMSK@2400"

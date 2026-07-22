@@ -53,7 +53,8 @@ def test_live_scheduler_handoffs_are_bounded_counted_and_fail_closed() -> None:
     satellites = (_APPS / "gnuradio_satellites.py").read_text(encoding="utf-8")
 
     assert gfsk.count("BoundedQueue[np.ndarray]") >= 2
-    assert "_SYMBOL_QUEUE_CAPACITY_SYMBOLS" in gfsk
+    assert "LIVE_SYMBOL_QUEUE_CAPACITY_ITEMS" in gfsk
+    assert "LIVE_SYMBOL_QUEUE_CAPACITY_SYMBOLS" in gfsk
     assert "require_lossless(stats, label=label" in gfsk
     assert gfsk.count("def queue_stats(self) -> QueueStats") >= 2
 
