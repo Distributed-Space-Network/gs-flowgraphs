@@ -117,3 +117,46 @@ def test_explicit_fsk_modulation_index_reaches_shared_demod_profile(monkeypatch)
     modem.build_demod("gmsk", object(), object(), 48_000.0, 2_400.0, mod_index=0.75)
 
     assert captured["profile"].mod_index == 0.75
+
+
+@pytest.mark.parametrize("kind", ["fsk", "2fsk", "ffsk"])
+def test_plain_1k2_fsk_selects_satnogs_adaptive_frontend(monkeypatch, kind):
+    captured = {}
+    frontend = ModuleType("gnuradio_gfsk")
+
+    def connect_gfsk_demod(_tb, _src, _sample_rate, _profile, **kwargs):
+        captured.update(kwargs)
+        return object(), object()
+
+    frontend.connect_gfsk_demod = connect_gfsk_demod
+    frontend.connect_afsk_demod = lambda *_args, **_kwargs: None
+    frontend.connect_psk_demod = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "gnuradio_gfsk", frontend)
+
+    modem.build_demod(kind, object(), object(), 48_000.0, 1_200.0)
+
+    assert captured["adaptive_centering"] is True
+
+
+@pytest.mark.parametrize(
+    ("kind", "symbol_rate"),
+    [("gmsk", 1_200.0), ("msk", 1_200.0), ("gfsk", 1_200.0), ("fsk", 9_600.0)],
+)
+def test_continuous_phase_and_odd_ratio_fsk_retain_grsat_frontend(
+    monkeypatch, kind, symbol_rate
+):
+    captured = {}
+    frontend = ModuleType("gnuradio_gfsk")
+
+    def connect_gfsk_demod(_tb, _src, _sample_rate, _profile, **kwargs):
+        captured.update(kwargs)
+        return object(), object()
+
+    frontend.connect_gfsk_demod = connect_gfsk_demod
+    frontend.connect_afsk_demod = lambda *_args, **_kwargs: None
+    frontend.connect_psk_demod = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "gnuradio_gfsk", frontend)
+
+    modem.build_demod(kind, object(), object(), 48_000.0, symbol_rate)
+
+    assert captured["adaptive_centering"] is False

@@ -322,7 +322,7 @@ def test_encoder_is_absent_until_independently_declared():
 
 def test_pinned_evidence_manifest_is_complete_and_classified():
     artifacts = load_manifest(_FIXTURES / "MANIFEST.csv")
-    assert len(artifacts) == 106
+    assert len(artifacts) == 108
     assert {artifact.source_commit for artifact in artifacts} == {
         "b8b227d456a6c7e65a590dfb8f00e80e89d86a3c",
         "60d9902933d86a6133935586a0da4952a5803f9e",
@@ -335,8 +335,9 @@ def test_pinned_evidence_manifest_is_complete_and_classified():
         "b75e8c9d497fbbca5f5f518700f05ec6c897a2bd",
         "dfa5d131e2b41a02721cad0d4856b8ed2049f38f",
         "34a7d6adc46497d2431b0232b500a52958c6670b",
-        "0d85612ba2498d248c9a599b73ebd5dbcb4c04eb",
-    }
+            "0d85612ba2498d248c9a599b73ebd5dbcb4c04eb",
+            "ac12b77974a4478fb4f24ae8b41bf74b808fb03a",
+        }
     assert {artifact.license for artifact in artifacts} == {
         "AGPL-3.0-or-later",
         "GPL-3.0-only",

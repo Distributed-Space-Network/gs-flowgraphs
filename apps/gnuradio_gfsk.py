@@ -177,7 +177,7 @@ class _RxContext:
 def connect_gfsk_demod(
     tb, src, sample_rate: float, profile: endurosat.LinkProfile, *,
     decimate: bool, sdr_rate: float, dc_block: bool = True, channel_bw_hz: float | None = None,
-    collect_hard: bool = True,
+    collect_hard: bool = True, adaptive_centering: bool = False,
 ) -> tuple[_BitSink | None, object]:
     """Connect a 2-GFSK/FSK/GMSK/MSK demod chain onto ``src`` and return ``(bit_sink, soft_tap)``:
     the hard-bit sink (``drain()`` → bits, fed to our numpy deframers) and the FLOAT soft-symbol
@@ -207,6 +207,70 @@ def connect_gfsk_demod(
     if sample_rate / baud <= 1.0:
         raise ValueError("FSK timing recovery requires more than one sample per symbol")
 
+    hard_consumer = _BitSink() if collect_hard else blocks.null_sink(gr.sizeof_char)
+    slicer = digital.binary_slicer_fb()
+    prefix = make_decimator(sdr_rate, float(sample_rate)) if decimate else None
+
+    if adaptive_centering:
+        ratio = float(sample_rate) / baud
+        rounded_ratio = int(round(ratio))
+        if (
+            rounded_ratio < 4
+            or rounded_ratio % 2
+            or not math.isclose(ratio, rounded_ratio, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            raise ValueError(
+                "SatNOGS adaptive FSK frontend requires an even integral input samples/symbol "
+                "ratio of at least four"
+            )
+
+        # Direct, attributed adaptation of the current SatNOGS FSK receive hierarchy:
+        # satnogs-flowgraphs@ac12b77974a4478fb4f24ae8b41bf74b808fb03a,
+        # hierarchical/fsk_hier.grc, Copyright 2025-2026 Libre Space Foundation,
+        # GPL-3.0-only. Carrier correction is derived only from the signal discriminator's
+        # moving average; it never uses expected payload bytes or protocol outcomes.
+        relaxed = gr_filter.fir_filter_ccf(
+            1,
+            gr_filter.firdes.low_pass(
+                1.0, float(sample_rate), 1.25 * baud, 0.5 * baud,
+            ),
+        )
+        center_demod = analog.quadrature_demod_cf(1.0)
+        center_average = blocks.moving_average_ff(1024, 1.0 / 1024.0, 4096, 1)
+        center_vco = blocks.vco_c(float(sample_rate), -float(sample_rate), 1.0)
+        delayed = blocks.delay(gr.sizeof_gr_complex, 1024 // 2)
+        centered = blocks.multiply_cc()
+        data_decimation = rounded_ratio // 2
+        data_filter = gr_filter.fir_filter_ccf(
+            data_decimation,
+            gr_filter.firdes.low_pass(
+                1.0, float(sample_rate), 0.625 * baud, baud / 8.0,
+            ),
+        )
+        data_demod = analog.quadrature_demod_cf(1.2)
+        blocker = gr_filter.dc_blocker_ff(1024, True) if dc_block else None
+        soft = digital.clock_recovery_mm_ff(
+            2.0, 2.0 * math.pi / 100.0, 0.5, 0.5 / 8.0, 0.01,
+        )
+
+        demod_src = prefix if prefix is not None else src
+        if prefix is not None:
+            tb.connect(src, prefix)
+        tb.connect(demod_src, delayed, (centered, 0))
+        tb.connect(demod_src, relaxed, center_demod, center_average, center_vco, (centered, 1))
+        tb.connect(centered, data_filter, data_demod)
+        if blocker is not None:
+            tb.connect(data_demod, blocker, soft)
+        else:
+            tb.connect(data_demod, soft)
+        tb.connect(soft, slicer, hard_consumer)
+        _log.info(
+            "plain FSK frontend: SatNOGS adaptive centering at %.0f baud (%d input sps)",
+            baud,
+            rounded_ratio,
+        )
+        return (hard_consumer if collect_hard else None), soft
+
     # Import the proven modem component, not a local approximation. The containing application
     # already requires the pinned gr-satellites runtime; native USP and the upstream USP deframer
     # therefore receive the same recovered symbols as gr-satellites itself.
@@ -223,12 +287,10 @@ def connect_gfsk_demod(
     )
 
     # Slice to hard bits (one 0/1 per byte) only for local hard-input deframers.
-    slicer = digital.binary_slicer_fb()
-    hard_consumer = _BitSink() if collect_hard else blocks.null_sink(gr.sizeof_char)
-    prefix = [make_decimator(sdr_rate, float(sample_rate))] if decimate else []
+    chain_prefix = [prefix] if prefix is not None else []
     # Construct every block before connecting so an import/API/constructor failure leaves the
     # graph untouched and the caller can retain recorder-only operation safely.
-    tb.connect(src, *prefix, soft, slicer, hard_consumer)
+    tb.connect(src, *chain_prefix, soft, slicer, hard_consumer)
     return (hard_consumer if collect_hard else None), soft
 
 

@@ -22,6 +22,14 @@ def _module(name: str) -> ModuleType:
             lambda *, legacy_hard_enabled, native_hard_enabled: legacy_hard_enabled
             or native_hard_enabled
         )
+    if name == "modem":
+        module.build_demod = (  # type: ignore[attr-defined]
+            lambda *_args, **_kwargs: (None, object())
+        )
+    if name == "gnuradio.blocks":
+        module.vector_source_c = lambda *_args, **_kwargs: object()  # type: ignore[attr-defined]
+    if name == "gnuradio.gr":
+        module.top_block = lambda *_args, **_kwargs: object()  # type: ignore[attr-defined]
     return module
 
 
@@ -101,6 +109,38 @@ def test_runtime_check_constructs_priority_deframers() -> None:
     assert next(
         check for check in result["checks"] if check["check"] == "demodulator:GMSK@2400"
     )["ok"] is True
+    assert next(
+        check
+        for check in result["checks"]
+        if check["check"] == "demodulator:FSK@1200-adaptive"
+    )["ok"] is True
+
+
+def test_runtime_check_fails_when_adaptive_fsk_frontend_cannot_construct() -> None:
+    def importer(name: str) -> ModuleType:
+        module = _module(name)
+        if name == "modem":
+            def fail(*_args, **_kwargs):
+                raise TypeError("adaptive constructor drift")
+
+            module.build_demod = fail  # type: ignore[attr-defined]
+        if name == "gnuradio_satellites":
+            module.make_grsat_deframers = lambda _label: [object()]  # type: ignore[attr-defined]
+        return module
+
+    result = runtime_check.check_runtime(
+        importer=importer,
+        required_modules=("scipy",),
+        deframer_labels=("AX100 Mode 5",),
+    )
+
+    assert result["ok"] is False
+    failed = next(
+        check
+        for check in result["checks"]
+        if check["check"] == "demodulator:FSK@1200-adaptive"
+    )
+    assert failed["error"] == "TypeError: adaptive constructor drift"
 
 
 def test_runtime_check_fails_when_pinned_fsk_component_cannot_construct() -> None:

@@ -63,7 +63,7 @@ def test_live_scheduler_handoffs_are_bounded_counted_and_fail_closed() -> None:
     assert "def queue_stats(self) -> QueueStats" in satellites
 
 
-def test_live_fsk_uses_pinned_deviation_aware_gardner_chain() -> None:
+def test_live_fsk_has_pinned_grsat_and_satnogs_adaptive_paths() -> None:
     source = (_APPS / "gnuradio_gfsk.py").read_text(encoding="utf-8")
     function = source[
         source.index("def connect_gfsk_demod(") : source.index("def connect_psk_demod(")
@@ -76,9 +76,13 @@ def test_live_fsk_uses_pinned_deviation_aware_gardner_chain() -> None:
     assert "iq=True" in function
     assert "deviation=deviation" in function
     assert "dc_block=dc_block" in function
-    assert "clock_recovery_mm_ff" not in function
+    assert "if adaptive_centering:" in function
+    assert "blocks.moving_average_ff(1024, 1.0 / 1024.0, 4096, 1)" in function
+    assert "blocks.vco_c(float(sample_rate), -float(sample_rate), 1.0)" in function
+    assert "0.625 * baud" in function
+    assert "digital.clock_recovery_mm_ff(" in function
+    assert "2.0 * math.pi / 100.0" in function
     assert "fll_band_edge_cc" not in function
-    assert "analog.quadrature_demod_cf" not in function
 
 
 def test_runtime_log_distinguishes_active_graph_from_capability_plan() -> None:

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 # (G)MSK and CPFSK are h≈0.5 continuous-phase FSK; 2-FSK/GFSK differ only in the TX pulse shape,
 # which the RX matched filter handles identically.
 _FSK_2LEVEL = ("fsk", "2fsk", "gfsk", "gmsk", "msk", "cpfsk", "cpm", "ffsk")
+_PLAIN_FSK = frozenset({"fsk", "2fsk", "ffsk"})
 # M-ary FSK — needs an M-level frequency slicer (build-pending on the bench).
 _MFSK = {"4fsk": 4, "mfsk": 4, "gfsk4": 4, "8fsk": 8}
 # PSK family → constellation order.
@@ -106,6 +107,23 @@ def modulation_spec(kind: str) -> ModSpec | None:
     if k in _ANALOG:
         return ModSpec(k, _ANALOG[k], order=0, tier=3)
     return None
+
+
+def _use_satnogs_plain_fsk_frontend(kind: str, sample_rate: float, symbol_rate: float) -> bool:
+    """Use the proven adaptive plain-FSK chain only with its exact two-sps decimation.
+
+    Continuous-phase modes and non-integral/odd channel-rate ratios retain the pinned
+    gr-satellites deviation-aware component instead of silently changing their clock model.
+    """
+    if kind not in _PLAIN_FSK or symbol_rate <= 0.0:
+        return False
+    ratio = float(sample_rate) / float(symbol_rate)
+    rounded = int(round(ratio))
+    return (
+        rounded >= 4
+        and rounded % 2 == 0
+        and math.isclose(ratio, rounded, rel_tol=0.0, abs_tol=1e-9)
+    )
 
 
 _TIER2_KEYS = set(_QAM_ORDER) | set(_APSK_ORDER) | set(_OFDM) | set(_DVBS2)
@@ -199,7 +217,11 @@ def build_demod(
         # the gr-satellites deframers (docs/12 §L.7 Phase 3).
         return connect_gfsk_demod(
             tb, src, sample_rate, profile, decimate=False, sdr_rate=sample_rate,
-            channel_bw_hz=channel_bw_hz, collect_hard=collect_hard)
+            channel_bw_hz=channel_bw_hz, collect_hard=collect_hard,
+            adaptive_centering=_use_satnogs_plain_fsk_frontend(
+                spec.kind, sample_rate, profile.symbol_rate_hz,
+            ),
+        )
     if spec.family == "psk":
         if spec.manchester:
             logging.getLogger("modem").info(

@@ -295,6 +295,32 @@ def check_runtime(
         )
     else:
         checks.append({"check": "demodulator:GMSK@2400", "ok": True})
+    try:
+        modem = importer("modem")
+        gr_blocks = importer("gnuradio.blocks")
+        gr_runtime = importer("gnuradio.gr")
+        top_block = gr_runtime.top_block("runtime_check_fsk_1200")
+        source = gr_blocks.vector_source_c([0j], False)
+        _hard, soft = modem.build_demod(
+            "fsk",
+            top_block,
+            source,
+            48_000.0,
+            1_200.0,
+            collect_hard=False,
+        )
+        if soft is None:
+            raise RuntimeError("adaptive FSK frontend returned no soft-symbol tap")
+    except Exception as exc:
+        checks.append(
+            {
+                "check": "demodulator:FSK@1200-adaptive",
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    else:
+        checks.append({"check": "demodulator:FSK@1200-adaptive", "ok": True})
     engine: ModuleType | None = None
     try:
         engine = importer("gnuradio_satellites")
